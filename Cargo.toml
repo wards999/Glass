@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["core", "app-win", "tools/losssim"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[profile.release]
+debug = 1

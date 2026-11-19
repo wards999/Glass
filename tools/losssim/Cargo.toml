@@ -1,0 +1,10 @@
+[package]
+name = "losssim"
+description = "Runs the Glass stream through simulated loss/jitter (M4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+glass-core = { path = "../../core" }

@@ -1,0 +1,5 @@
+/target/
+/app-mac/.build/
+/app-mac/.swiftpm/
+*.xcodeproj/xcuserdata/
+.DS_Store

@@ -1,0 +1,231 @@
+//! Windows-only host pieces: D3D11 device, Windows.Graphics.Capture, NVENC.
+
+mod capture;
+mod clock;
+mod d3d;
+mod encode;
+
+use glass_core::protocol::FLAG_IDR;
+use glass_core::recording::{
+    FrameMeta, RecordingHeader, RecordingWriter, CHROMA_420, CHROMA_444, CODEC_HEVC,
+};
+use glass_core::stats::{IntervalTracker, StatRing, Summary};
+use std::error::Error;
+
+pub type Res<T> = Result<T, Box<dyn Error>>;
+
+pub fn list() -> Res<()> {
+    d3d::init_process();
+    println!("Monitors:");
+    for (i, m) in capture::monitors()?.iter().enumerate() {
+        println!(
+            "  [{i}] {} {}x{} @ {} Hz{}",
+            m.name,
+            m.width,
+            m.height,
+            m.refresh_hz,
+            if m.primary { " (primary)" } else { "" }
+        );
+    }
+    println!("GPUs:");
+    for a in d3d::adapters()? {
+        println!("  {} (vendor {:04x})", a.name, a.vendor_id);
+    }
+    Ok(())
+}
+
+struct RecordArgs {
+    monitor: usize,
+    seconds: f64,
+    chroma444: bool,
+    mbps: u32,
+    out: String,
+}
+
+fn parse(args: &[String]) -> Res<RecordArgs> {
+    let mut a = RecordArgs {
+        monitor: 0,
+        seconds: 10.0,
+        chroma444: false,
+        mbps: 80,
+        out: String::new(),
+    };
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        let mut val = || it.next().ok_or_else(|| format!("{arg} needs a value"));
+        match arg.as_str() {
+            "--monitor" => a.monitor = val()?.parse()?,
+            "--seconds" => a.seconds = val()?.parse()?,
+            "--mbps" => a.mbps = val()?.parse()?,
+            "--chroma" => {
+                a.chroma444 = match val()?.as_str() {
+                    "444" => true,
+                    "420" => false,
+                    v => return Err(format!("--chroma must be 420 or 444, got {v}").into()),
+                }
+            }
+            s if !s.starts_with("--") && a.out.is_empty() => a.out = s.to_string(),
+            s => return Err(format!("unknown argument {s}").into()),
+        }
+    }
+    if a.out.is_empty() {
+        return Err("missing output path".into());
+    }
+    Ok(a)
+}
+
+fn ms(us: u32) -> f64 {
+    us as f64 / 1000.0
+}
+
+fn line(name: &str, s: &Summary) {
+    println!(
+        "  {name:<18} p50 {:>7.2} ms  p99 {:>7.2} ms  max {:>7.2} ms  sd {:>6.2} ms  (n={})",
+        ms(s.p50_us),
+        ms(s.p99_us),
+        ms(s.max_us),
+        s.stddev_us / 1000.0,
+        s.count
+    );
+}
+
+pub fn record(args: &[String]) -> Res<()> {
+    let a = parse(args)?;
+    d3d::init_process();
+    let monitors = capture::monitors()?;
+    let mon = monitors
+        .get(a.monitor)
+        .ok_or_else(|| format!("no monitor {} (see `glass list`)", a.monitor))?;
+    let gpu = d3d::Gpu::new_nvidia()?;
+    println!(
+        "Recording monitor [{}] {} {}x{} @ {} Hz on {} | HEVC {} {} Mbps | {} s",
+        a.monitor,
+        mon.name,
+        mon.width,
+        mon.height,
+        mon.refresh_hz,
+        gpu.name,
+        if a.chroma444 { "4:4:4" } else { "4:2:0" },
+        a.mbps,
+        a.seconds
+    );
+
+    let mut cap = capture::Capture::start(&gpu, mon)?;
+    let (w, h) = cap.size();
+    let mut enc = encode::Encoder::new(
+        &gpu.device,
+        &encode::Config {
+            width: w,
+            height: h,
+            fps: mon.refresh_hz,
+            bitrate: a.mbps as i64 * 1_000_000,
+            chroma444: a.chroma444,
+        },
+    )?;
+
+    // Preallocate the whole recording so the loop does no I/O or reallocation.
+    let est = (a.seconds * a.mbps as f64 * 1e6 / 8.0 * 2.0) as usize + (64 << 20);
+    let header = RecordingHeader {
+        codec: CODEC_HEVC,
+        chroma: if a.chroma444 { CHROMA_444 } else { CHROMA_420 },
+        width: w,
+        height: h,
+        fps: mon.refresh_hz,
+    };
+    let mut writer = RecordingWriter::new(Vec::with_capacity(est), &header)?;
+
+    let mut encode_ring = StatRing::new(); // frame arrival -> packet out
+    let mut lead_ring = StatRing::new(); // frame arrival -> compositor (present-target) timestamp
+    let mut size_ring = StatRing::new(); // bytes per frame
+    let mut intervals = IntervalTracker::default(); // between captured frames
+    let mut frame_id = 0u32;
+    let mut skipped = 0u32;
+    let mut idr_bytes = 0usize;
+    let mut total_bytes = 0u64;
+
+    let t0 = clock::now_us();
+    let end = t0 + (a.seconds * 1e6) as u64;
+    while clock::now_us() < end {
+        cap.wait(50);
+        while let Some(frame) = cap.next_frame()? {
+            let arrival = clock::now_us();
+            if frame.size != (w, h) {
+                skipped += 1; // LATER(M7): handle resolution changes.
+                continue;
+            }
+            // SystemRelativeTime turns out to be the *target present* time and
+            // is usually ahead of arrival, so the arrival time is the capture
+            // timestamp; the compositor time is kept only for pacing stats.
+            lead_ring.push((frame.ts_us as i64 - arrival as i64).max(0) as u32);
+            intervals.tick(frame.ts_us);
+            let force_idr = frame_id == 0;
+            let mut wrote: Res<()> = Ok(());
+            enc.encode(
+                &frame.texture,
+                arrival as i64,
+                force_idr,
+                |data, key, pts| {
+                    let out = clock::now_us();
+                    let encode_us = out.saturating_sub(arrival) as u32;
+                    encode_ring.push(encode_us);
+                    size_ring.push(data.len() as u32);
+                    total_bytes += data.len() as u64;
+                    if key && idr_bytes == 0 {
+                        idr_bytes = data.len();
+                    }
+                    let meta = FrameMeta {
+                        frame_id,
+                        flags: if key { FLAG_IDR } else { 0 },
+                        capture_ts_us: pts as u64,
+                        encode_us,
+                        len: data.len() as u32,
+                    };
+                    if let Err(e) = writer.write_frame(&meta, data) {
+                        wrote = Err(e.into());
+                    }
+                },
+            )?;
+            wrote?;
+            frame_id += 1;
+        }
+    }
+    enc.flush(|data, key, pts| {
+        let meta = FrameMeta {
+            frame_id,
+            flags: if key { FLAG_IDR } else { 0 },
+            capture_ts_us: pts as u64,
+            encode_us: 0,
+            len: data.len() as u32,
+        };
+        let _ = writer.write_frame(&meta, data);
+    })?;
+    let elapsed = (clock::now_us() - t0) as f64 / 1e6;
+    let buf = writer.into_inner();
+    std::fs::write(&a.out, &buf)?;
+
+    println!(
+        "Wrote {} ({:.1} MB): {} frames in {:.1} s ({:.1} fps captured), {} skipped",
+        a.out,
+        buf.len() as f64 / 1e6,
+        frame_id,
+        elapsed,
+        frame_id as f64 / elapsed,
+        skipped
+    );
+    println!(
+        "  bitrate {:.1} Mbps avg | first IDR {:.0} KB",
+        total_bytes as f64 * 8.0 / elapsed / 1e6,
+        idr_bytes as f64 / 1e3
+    );
+    line("encode", &encode_ring.summary());
+    line("WGC ts lead", &lead_ring.summary());
+    line("capture interval", &intervals.intervals.summary());
+    let s = size_ring.summary();
+    println!(
+        "  frame size         p50 {:>6.1} KB  p99 {:>6.1} KB  max {:>6.1} KB",
+        s.p50_us as f64 / 1e3,
+        s.p99_us as f64 / 1e3,
+        s.max_us as f64 / 1e3
+    );
+    Ok(())
+}

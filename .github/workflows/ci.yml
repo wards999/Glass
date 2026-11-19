@@ -39,10 +39,26 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Cache FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg
+          key: ffmpeg-${{ hashFiles('scripts/fetch-ffmpeg.ps1') }}
+      - name: Fetch FFmpeg
+        run: ./scripts/fetch-ffmpeg.ps1
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build -p glass-win --release
-      - run: target/release/glass.exe
+      - name: Smoke test (no GPU/capture on runners)
+        shell: bash
+        run: |
+          target/release/glass.exe --version
+          for c in 420 444; do
+            f=app-mac/Tests/GlassKitTests/Fixtures/testsrc-$c.glsr
+            target/release/glass.exe dump $f t$c.h265
+            target/release/glass.exe pack t$c.h265 rt$c.glsr 320 192 60 $c
+            cmp $f rt$c.glsr
+          done
 
   app-mac:
     name: app-mac (macOS)
@@ -54,10 +70,13 @@ jobs:
       - run: cargo build -p glass-core --release
       - name: swift build
         working-directory: app-mac
-        run: swift build
+        run: swift build -c release
       - name: swift test
         working-directory: app-mac
         run: swift test
-      - name: run app
+      - name: decode bench (fixtures)
         working-directory: app-mac
-        run: swift run GlassMac
+        run: |
+          swift run -c release GlassMac
+          swift run -c release GlassMac play Tests/GlassKitTests/Fixtures/testsrc-420.glsr --bench
+          swift run -c release GlassMac play Tests/GlassKitTests/Fixtures/testsrc-444.glsr --bench

@@ -22,6 +22,10 @@ let package = Package(
             linkerSettings: [.unsafeFlags(["-L", coreLibDir])]
         ),
         .executableTarget(name: "GlassMac", dependencies: ["GlassKit"]),
-        .testTarget(name: "GlassKitTests", dependencies: ["GlassKit"]),
+        .testTarget(
+            name: "GlassKitTests",
+            dependencies: ["GlassKit"],
+            resources: [.copy("Fixtures")]
+        ),
     ]
 )

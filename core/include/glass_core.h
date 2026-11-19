@@ -9,6 +9,14 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#define GLASS_NAL_VPS 32
+
+#define GLASS_NAL_SPS 33
+
+#define GLASS_NAL_PPS 34
+
+#define GLASS_NAL_AUD 35
+
 /**
  * Protocol version. 0 = draft (pre-M2); nothing is on the wire yet.
  */
@@ -26,7 +34,95 @@
 
 #define GLASS_VideoPacketHeader_SIZE 24
 
+#define GLASS_FORMAT_VERSION 1
+
+#define GLASS_CODEC_HEVC 1
+
+#define GLASS_CHROMA_420 0
+
+#define GLASS_CHROMA_444 1
+
+/**
+ * Capacity of a [`StatRing`]: about 34 s at 120 fps.
+ */
+#define GLASS_RING_CAP 4096
+
 #define GLASS_Stage_COUNT 6
+
+/**
+ * Fixed-capacity ring of duration samples (µs). `push` is O(1) and never
+ * allocates; `summary` sorts a copy and is meant for reporting, off the hot path.
+ */
+typedef struct GLASS_StatRing GLASS_StatRing;
+
+typedef struct {
+  uint8_t codec;
+  uint8_t chroma;
+  uint32_t width;
+  uint32_t height;
+  /**
+   * Nominal capture rate in frames per second (display refresh).
+   */
+  uint32_t fps;
+} GLASS_RecordingHeader;
+#define GLASS_RecordingHeader_SIZE 20
+
+/**
+ * Per-frame metadata preceding each frame's bytes.
+ */
+typedef struct {
+  uint32_t frame_id;
+  /**
+   * `protocol::FLAG_*`.
+   */
+  uint8_t flags;
+  /**
+   * Host capture timestamp, microseconds.
+   */
+  uint64_t capture_ts_us;
+  /**
+   * Capture-arrival -> encoded packet out, microseconds.
+   */
+  uint32_t encode_us;
+  /**
+   * Length of the Annex-B payload that follows.
+   */
+  uint32_t len;
+} GLASS_FrameMeta;
+#define GLASS_FrameMeta_SIZE 24
+
+/**
+ * A borrowed byte range. `len == 0` means absent/empty.
+ */
+typedef struct {
+  const uint8_t *ptr;
+  size_t len;
+} GLASS_Bytes;
+
+typedef struct {
+  GLASS_Bytes vps;
+  GLASS_Bytes sps;
+  GLASS_Bytes pps;
+} GLASS_HevcParamSets;
+
+/**
+ * Percentiles in microseconds over the samples currently held.
+ */
+typedef struct {
+  /**
+   * Samples ever pushed (may exceed the ring capacity).
+   */
+  uint64_t total;
+  /**
+   * Samples summarised (≤ RING_CAP).
+   */
+  uint32_t count;
+  uint32_t p50_us;
+  uint32_t p99_us;
+  uint32_t max_us;
+  double mean_us;
+  double stddev_us;
+} GLASS_Summary;
 
 /**
  * NUL-terminated core version string, e.g. "0.0.1". Static; do not free.
@@ -37,5 +133,79 @@ const char *glass_core_version(void);
  * Wire protocol version (see docs/protocol.md).
  */
 uint8_t glass_protocol_version(void);
+
+/**
+ * Parses the `.glsr` file header. Returns 0 on success or a `RecordingError` code.
+ *
+ * # Safety
+ * `buf` must point to `len` readable bytes; `out` must be valid for writes.
+ */
+int32_t glass_recording_header(const uint8_t *buf, size_t len, GLASS_RecordingHeader *out);
+
+/**
+ * Reads the frame at `*offset` (start with `*offset = 0`), advances `*offset`,
+ * and points `data` into `buf`. Returns 0 on success, -1 at end of file, or a
+ * `RecordingError` code.
+ *
+ * # Safety
+ * `buf` must point to `len` readable bytes that outlive `data`; the out
+ * pointers must be valid for reads/writes.
+ */
+int32_t glass_recording_next_frame(const uint8_t *buf,
+                                   size_t len,
+                                   size_t *offset,
+                                   GLASS_FrameMeta *meta,
+                                   GLASS_Bytes *data);
+
+/**
+ * Finds VPS/SPS/PPS in an Annex-B access unit. Returns true if all three exist.
+ *
+ * # Safety
+ * `buf` must point to `len` readable bytes; `out` must be valid for writes.
+ */
+bool glass_hevc_param_sets(const uint8_t *buf, size_t len, GLASS_HevcParamSets *out);
+
+/**
+ * Output size needed by `glass_hevc_to_length_prefixed`.
+ *
+ * # Safety
+ * `buf` must point to `len` readable bytes.
+ */
+size_t glass_hevc_length_prefixed_len(const uint8_t *buf, size_t len);
+
+/**
+ * Converts an Annex-B access unit to 4-byte length-prefixed NALs (parameter
+ * sets and AUDs dropped). Returns bytes written, or -1 if `out_cap` is too small.
+ *
+ * # Safety
+ * `buf` must point to `len` readable bytes and `out` to `out_cap` writable bytes.
+ */
+ptrdiff_t glass_hevc_to_length_prefixed(const uint8_t *buf,
+                                        size_t len,
+                                        uint8_t *out,
+                                        size_t out_cap);
+
+/**
+ * Allocates a stats ring. Free with `glass_stats_free`.
+ */
+GLASS_StatRing *glass_stats_new(void);
+
+/**
+ * # Safety
+ * `ring` must come from `glass_stats_new` and not be used concurrently.
+ */
+void glass_stats_push(GLASS_StatRing *ring, uint32_t us);
+
+/**
+ * # Safety
+ * `ring` must come from `glass_stats_new`.
+ */
+GLASS_Summary glass_stats_summary(const GLASS_StatRing *ring);
+
+/**
+ * # Safety
+ * `ring` must come from `glass_stats_new` (or be null) and not be used afterwards.
+ */
+void glass_stats_free(GLASS_StatRing *ring);
 
 #endif  /* GLASS_CORE_H */

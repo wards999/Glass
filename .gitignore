@@ -3,3 +3,5 @@
 /app-mac/.swiftpm/
 *.xcodeproj/xcuserdata/
 .DS_Store
+/third_party/
+/recordings/

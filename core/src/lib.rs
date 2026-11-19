@@ -3,8 +3,10 @@
 //! No platform media APIs live here. `app-win` links this as an rlib; `app-mac`
 //! links it as a staticlib through the cbindgen header in `include/glass_core.h`.
 
+pub mod annexb;
 pub mod ffi;
 pub mod protocol;
+pub mod recording;
 pub mod stats;
 
 /// Crate version, e.g. "0.0.1".

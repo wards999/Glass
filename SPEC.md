@@ -8,8 +8,22 @@ Both use cases run **over home Wi-Fi** (§5d). If Glass doesn't beat the
 existing tools on the criteria below, there's no reason to build it, so every
 milestone reports against them.
 
-The setup: Windows PC with RTX 4070 and a 2560×1440 @ 165 Hz monitor; MacBook
-Air M4 with a 2940×1912 @ 60 Hz built-in display.
+The current test setup: Windows PC with an RTX 4070 and a 2560×1440 @ 165 Hz
+monitor; MacBook Air M4 with a 2940×1912 @ 60 Hz built-in display. The numbers
+in this spec use that setup as the example, but **nothing is hardwired to it**:
+
+- At every connection the viewer reports its display (pixel size, refresh
+  rate, scale, HDR later) and both sides report their capabilities (hardware
+  encoders/decoders, 4:4:4 encode/decode, max size and rate). The stream size,
+  shape, rate, codec and chroma are derived from that, never from constants.
+- If a display changes mid-session (a different monitor, a resolution or
+  refresh change, the viewer window moved to another screen, a lid closed),
+  the viewer re-reports it and the stream is re-negotiated without
+  reconnecting (same mechanism as §5e size changes).
+- New hardware on either side (another GPU vendor, a different Mac, a 4K or
+  ultrawide monitor, a 120 Hz ProMotion panel) should just work, with the best
+  mode it supports. Today's Windows host needs NVIDIA (NVENC); AMD AMF and
+  Intel QSV are planned (M8).
 
 ### A. Primary: the PC shows the Mac's desktop (Mac host → Windows viewer)
 Desktop work: reading and writing text, code, web, documents.

@@ -8,6 +8,7 @@ A **two-way** remote desktop tool between a Windows PC and a Mac on the same LAN
 
 - feels as **smooth** as StarDesk (even frame pacing, no micro-stutter),
 - keeps **text sharp** enough to read (desktop work, not just games),
+- is good enough to **play games on the PC from the Mac**: no micro-stutter, audio in sync, a game controller and mouse-look work (§5c),
 - shows **clean frames straight away on big screen changes** (minimise/restore, app switching),
 - stays at **very low latency**: about 8–15 ms glass-to-glass on wired gigabit at 120 Hz,
 - needs **no cloud account**: devices pair once and trust each other directly.
@@ -112,6 +113,40 @@ Why this split: networking, FEC and crypto must match exactly on both sides, so 
 - **UI:** full screen by default (borderless on the chosen monitor), with a toggle to a movable window; same stats overlay as the Mac client.
 - **Audio:** Opus → WASAPI (low-latency shared mode).
 
+## 5c. Gaming (PC host → Mac viewer first)
+
+Playing a PC game from the Mac is a first-class use case, and the strictest
+test of smoothness.
+
+- **Frame pacing target (measured, not felt):** with the host's capture rate
+  matched to the Mac's refresh, over a 5-minute wired session: **no more than
+  1 in 1000 refreshes without a new frame while the game is producing frames**
+  ("missed refresh"), present-interval stddev **< 1 ms**, p99 **< 1.5 refresh
+  periods**. Glass-to-glass and input → screen stay in the §8 budget. On Wi-Fi,
+  report the same numbers; the adaptive jitter buffer may add up to one frame.
+- **Host capture rate = viewer refresh rate** (60 or 120 Hz), aligned to the
+  viewer's vsync phase where possible, instead of the host's 165 Hz. The
+  viewer reports its refresh rate in `Hello`.
+- **Audio:** WASAPI loopback → Opus (10 ms frames, 48 kHz stereo) → UDP with
+  its own sequence numbers and FEC; the viewer plays it through CoreAudio with
+  a small adaptive buffer (target ≤ 20 ms). A/V sync: audio and video both
+  carry host capture timestamps; keep them within ±20 ms and correct drift by
+  resampling, never by dropping video frames.
+- **Game controller:** the Mac reads controllers with the GameController
+  framework (Xbox, PlayStation, MFi) and sends button/axis state over the input
+  channel (state-based like keys, at the controller's rate, ≥ 250 Hz). The
+  Windows host presents them as a virtual **Xbox 360 controller** through the
+  ViGEmBus driver (a one-time install with admin rights; detect it and guide
+  the user). Rumble goes back to the Mac controller.
+- **Relative mouse ("mouse-look"):** a toggle (and automatic when the host
+  hides and confines its pointer) that captures the Mac pointer
+  (`CGAssociateMouseAndMouseCursorPosition(false)`) and sends raw deltas;
+  the host injects relative `SendInput` moves.
+- **Game mode in the overlay:** frame-interval graph, missed-refresh count,
+  audio buffer depth and A/V offset.
+- Out of scope: anti-cheat that blocks injected input or virtual
+  controllers; HDR (later).
+
 ## 6. Transport protocol
 
 - **Control channel:** TCP + TLS 1.3 using mutual authentication against pinned certificates (rustls on the host, Network.framework or `core` on the client).
@@ -158,10 +193,11 @@ Build PC → Mac first through M3, then add the reverse direction (M3b) before h
 4. **M3 – Input:** mouse and keyboard back-channel, local cursor. Usable PC → Mac remote desktop.
 5. **M3b – Reverse direction:** Mac host (ScreenCaptureKit + VideoToolbox encode + CGEvent) and Windows client (D3D11VA decode + flip-model swap chain + Raw Input). Same protocol, with no changes to `core` beyond bug fixes. Role selection in both apps.
 6. **M4 – Robustness:** FEC, keyframe requests, packet-loss simulator in `/tools`.
-7. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation, frame-interval metrics. Compare against Moonlight and StarDesk.
+7. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation, capture rate matched to the viewer's refresh, frame-interval metrics against the §5c pacing target. Compare against Moonlight and StarDesk.
+   - **M5b – Gaming:** audio (Opus, A/V sync), game controller (GameController → ViGEmBus), relative mouse mode, game-mode overlay. Measured with a real game (§5c).
 8. **M6 – Security:** mDNS discovery, PIN pairing, pinned mutual TLS, encrypted UDP.
 9. **M7 – Clarity:** native-resolution negotiation, 4:4:4 path, scene-change burst, still-region refinement.
-10. **M8 – Extras:** audio, clipboard, virtual display driver integration, direct NVENC SDK path.
+10. **M8 – Extras:** clipboard, virtual display driver integration, direct NVENC SDK path, audio and controller for the Mac-host direction.
 
 Each milestone ends with a short written result in `docs/results/Mx.md` (what works, measured numbers, known issues).
 
@@ -174,4 +210,5 @@ Each milestone ends with a short written result in `docs/results/Mx.md` (what wo
 - Mac as host: Screen Recording + Accessibility permissions, no public virtual-display API, and VideoToolbox gives less rate-control precision than NVENC (check scene-change bursts work in M3b).
 - Key mapping between Windows and macOS (Ctrl/Cmd, Alt/Option, Win key) needs a clear, configurable rule.
 - Wi-Fi jitter: the adaptive buffer must handle it without hurting the wired case.
+- Gaming: ViGEmBus is a third-party driver that is no longer actively developed; if it stops installing, look at alternatives (e.g. a UMDF virtual HID device). Some games' anti-cheat rejects injected input or virtual pads. Games that change resolution or go exclusive-fullscreen can interrupt capture (M7's resolution handling).
 - Aspect mismatch: the Mac panel is 16:10 (2940×1912) and the PC monitor 16:9 (2560×1440). PC → Mac full screen shows bars top and bottom; Mac → PC shows bars at the sides, and the Mac's Retina image is scaled to ~75%, so text gets small. Bars-free, 1:1 needs the host to render at the client's shape: a virtual display (Windows IddCx driver, Mac `CGVirtualDisplay`) or a matching host mode (M7/M8).

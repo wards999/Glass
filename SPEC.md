@@ -2,6 +2,37 @@
 
 Working name: **Glass** (rename freely)
 
+## The two overriding rules
+
+Every design choice, default and trade-off in this spec serves these. When
+anything else conflicts with them, they win.
+
+1. **Sharp, never fuzzy.** Text and UI look like the host's own screen.
+   - Never scale when it can be avoided: render at the viewer's pixel size and
+     show it 1:1 (§4b, §5e). A lower size is only ever the user's explicit
+     choice (or Auto, which they turn on), and it is rendered at that size,
+     not shrunk.
+   - Full chroma for desktop content (4:4:4, or still-region refinement to
+     visually lossless within 150 ms, §0 A).
+   - When the link is short of capacity on a **desktop** stream, give up frame
+     rate before sharpness: fewer, sharp frames, never blurry ones. Bursts
+     for scrolling and scene changes are allowed (§2.2).
+2. **Never laggy.** Input reacts at once and the picture is never behind.
+   - The pointer is drawn locally on the viewer (zero network delay).
+   - Never queue frames to save them: drop stale frames, show the newest.
+     The jitter buffer is the only deliberate delay, capped (§5d) and
+     shrunk as soon as the link allows.
+   - Input is sent the moment it happens, ahead of video, with priority marking (§5d).
+   - For a **game** stream (use case B), smoothness and responsiveness come
+     before sharpness: the bitrate (and with Auto, the size) drops before
+     frames are delayed or stutter.
+
+Honest limit: over Wi-Fi, a bad moment on the link (interference, a
+microwave, walking out of range) can't be wished away. Glass's job is to
+recover within a frame or two, keep the still picture sharp, and **show** in
+the overlay that the link was the cause. Every result file reports how often
+and how long that happened.
+
 ## 0. Use cases and acceptance criteria (read first)
 
 Both use cases run **over home Wi-Fi** (§5d). If Glass doesn't beat the

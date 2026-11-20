@@ -2,6 +2,11 @@
 
 This repo builds **Glass**, a two-way low-latency remote desktop between a Windows PC and a Mac. Either machine can host, and either can connect to the other. `SPEC.md` is the design source of truth; read it before starting any milestone.
 
+## Overriding rules (SPEC "The two overriding rules")
+1. **Sharp, never fuzzy:** no avoidable scaling, full chroma for desktop, frame rate gives way before sharpness on desktop streams.
+2. **Never laggy:** local pointer, no frame queues (newest wins), input first; on game streams smoothness and responsiveness give way to nothing.
+Check every change against both; say in the results how a milestone moved them.
+
 ## How to work
 - Work **one milestone at a time** (SPEC.md §9). Don't start the next until the current one runs end-to-end and `docs/results/Mx.md` is written with measured numbers.
 - End each milestone (and each re-test) with a **test build**: push a tag `mN-testK` (e.g. `m2-test1`). CI publishes a prerelease with the Windows zip and Mac dmg (`docs/testing.md`). Put that milestone's test steps in the release notes and `docs/testing.md`; the user runs them and sends back the results.

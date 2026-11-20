@@ -19,6 +19,21 @@
 
 #define GLASS_ClockSync_WINDOW 16
 
+/**
+ * We paired with it as a viewer: it's a host we trust.
+ */
+#define GLASS_ROLE_HOST (1 << 0)
+
+/**
+ * It paired with us while we were hosting: it may view and control this machine.
+ */
+#define GLASS_ROLE_VIEWER (1 << 1)
+
+/**
+ * Longest device name, bytes.
+ */
+#define GLASS_NAME_MAX 63
+
 #define GLASS_MAX_EVENTS 16
 
 #define GLASS_MAX_KEYS 16
@@ -69,19 +84,20 @@
 
 #define GLASS_HID_RGUI 231
 
+
+
+#define GLASS_PIN_LIFETIME_US 120000000
+
+#define GLASS_WRONG_PER_PIN 3
+
+#define GLASS_WRONG_TOTAL 10
+
 /**
- * Whole UDP datagram, header included. Fits a 1500-byte Ethernet MTU with
- * room for IP/UDP (and, from M6, the AEAD tag).
+ * Protocol version. 4 = M6: the control connection is mutual TLS 1.3 with
+ * pinned certificates, PIN pairing messages, and every UDP datagram is
+ * AES-GCM sealed (`seal.rs`). v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_MAX_DATAGRAM 1400
-
-
-
-/**
- * Protocol version. 3 = M3 (test 2): v2 (input datagrams, cursor messages,
- * `FrameInfo::input_seq`) plus `HostNotice`.
- */
-#define GLASS_PROTOCOL_VERSION 3
+#define GLASS_PROTOCOL_VERSION 4
 
 /**
  * Default TCP control port; the host's UDP media socket uses the same number.
@@ -123,6 +139,47 @@
 #define GLASS_REJECT_BUSY 2
 
 /**
+ * The host doesn't know this viewer (never paired, or forgotten).
+ */
+#define GLASS_REJECT_NOT_PAIRED 3
+
+/**
+ * The host's user said no ("ask before each connection").
+ */
+#define GLASS_REJECT_DENIED 4
+
+/**
+ * Too many wrong PINs: pairing is off until the host restarts.
+ */
+#define GLASS_REJECT_PAIRING_LOCKED 5
+
+/**
+ * Wrong (or expired) PIN.
+ */
+#define GLASS_REJECT_WRONG_PIN 6
+
+/**
+ * Pairing messages (TLS control channel, before Hello; see `pairing.rs`).
+ * Viewer -> host: `name` (UTF-8, ≤ 63 bytes).
+ */
+#define GLASS_PAIR_START 11
+
+/**
+ * Host -> viewer: `name`; the host is now showing a PIN.
+ */
+#define GLASS_PAIR_READY 12
+
+/**
+ * Either way: SPAKE2 message (33 bytes).
+ */
+#define GLASS_PAIR_PAKE 13
+
+/**
+ * Either way: key-confirmation HMAC-SHA256 (32 bytes).
+ */
+#define GLASS_PAIR_CONFIRM 14
+
+/**
  * Largest encoded control message (including the 2-byte length).
  */
 #define GLASS_CONTROL_MAX 32
@@ -149,6 +206,17 @@
 #define GLASS_CHROMA_420 0
 
 #define GLASS_CHROMA_444 1
+
+/**
+ * Bytes added to each datagram: counter (8) + tag (16).
+ */
+#define GLASS_OVERHEAD (8 + 16)
+
+/**
+ * Largest datagram on the wire (fits a 1500-byte MTU with IP/UDP headers
+ * and room to spare for tunnels).
+ */
+#define GLASS_WIRE_MAX 1400
 
 /**
  * Capacity of a [`StatRing`]: about 34 s at 120 fps.
@@ -185,6 +253,26 @@ enum GLASS_ConnectError
    * Couldn't create the UDP socket.
    */
   GLASS_ConnectError_Socket = 5,
+  /**
+   * We haven't paired with this host (or it has forgotten us): pair first.
+   */
+  GLASS_ConnectError_NotPaired = 6,
+  /**
+   * The host refused (its user said no, or it's busy).
+   */
+  GLASS_ConnectError_Refused = 7,
+  /**
+   * Pairing: wrong or expired PIN.
+   */
+  GLASS_ConnectError_WrongPin = 8,
+  /**
+   * Pairing: too many wrong PINs; restart the host to pair.
+   */
+  GLASS_ConnectError_PairingLocked = 9,
+  /**
+   * This device's identity couldn't be loaded, created or saved.
+   */
+  GLASS_ConnectError_Identity = 10,
 };
 #if __STDC_VERSION__ >= 202311L
 typedef enum GLASS_ConnectError GLASS_ConnectError;
@@ -197,6 +285,16 @@ typedef int32_t GLASS_ConnectError;
  * Input methods may be called from any thread.
  */
 typedef struct GLASS_Client GLASS_Client;
+
+/**
+ * This machine's identity and paired devices (opaque).
+ */
+typedef struct GLASS_DeviceHandle GLASS_DeviceHandle;
+
+/**
+ * A pairing in progress: the host is showing a PIN.
+ */
+typedef struct GLASS_Pairing GLASS_Pairing;
 
 typedef struct GLASS_Replay GLASS_Replay;
 
@@ -378,6 +476,11 @@ typedef struct {
    * Latest `HostNotice` code (`protocol::NOTICE_*`), 0 = none.
    */
   uint8_t host_notice;
+  /**
+   * UDP datagrams that failed authentication / were replays.
+   */
+  uint64_t crypto_bad;
+  uint64_t crypto_replayed;
 } GLASS_ClientStats;
 
 /**
@@ -491,13 +594,120 @@ void glass_stats_reset(GLASS_StatRing *ring);
 uint64_t glass_clock_now_us(void);
 
 /**
- * Connects to a host. Returns null on failure and sets `*err` to a
- * `GLASS_ConnectError` value. Free with `glass_client_close`.
+ * Opens (creating on first run) this machine's identity in `dir`, or the
+ * default folder (`GLASS_HOME`, else ~/Library/Application Support/Glass)
+ * when `dir` is null. `name` is how other devices will see this one.
+ * Returns null on failure. Free with `glass_device_free`.
  *
  * # Safety
- * `host` must be a NUL-terminated string; `err` must be valid for writes or null.
+ * `dir` (or null) and `name` must be NUL-terminated strings.
  */
-GLASS_Client *glass_client_connect(const char *host, uint16_t port, int32_t *err);
+GLASS_DeviceHandle *glass_device_open(const char *dir, const char *name);
+
+/**
+ * # Safety
+ * `d` must come from `glass_device_open` (or be null) and not be used afterwards.
+ */
+void glass_device_free(GLASS_DeviceHandle *d);
+
+/**
+ * Writes this device's 32-byte certificate fingerprint to `out`.
+ *
+ * # Safety
+ * `d` from `glass_device_open`; `out` valid for 32 bytes.
+ */
+void glass_device_fingerprint(const GLASS_DeviceHandle *d, uint8_t *out);
+
+/**
+ * Number of paired devices (re-read from disk).
+ *
+ * # Safety
+ * `d` must come from `glass_device_open`.
+ */
+uint32_t glass_device_peer_count(const GLASS_DeviceHandle *d);
+
+/**
+ * Paired device `index`: writes its fingerprint (32 bytes) to `fp_out` and
+ * its name (NUL-terminated, truncated to `name_len`) to `name`. Returns its
+ * roles (`GLASS_ROLE_*` bits), or 0 if `index` is out of range.
+ *
+ * # Safety
+ * `d` from `glass_device_open`; `fp_out` valid for 32 bytes; `name` valid
+ * for `name_len` bytes (or null).
+ */
+uint8_t glass_device_peer(const GLASS_DeviceHandle *d,
+                          uint32_t index,
+                          uint8_t *fp_out,
+                          char *name,
+                          size_t name_len);
+
+/**
+ * Unpairs the device with this fingerprint. False if it wasn't paired.
+ *
+ * # Safety
+ * `d` from `glass_device_open`; `fp` valid for 32 bytes.
+ */
+bool glass_device_forget(const GLASS_DeviceHandle *d, const uint8_t *fp);
+
+/**
+ * Asks `host` to pair; on success the host is showing a PIN. Returns null
+ * and sets `*err` (`GLASS_ConnectError`) on failure. Finish with
+ * `glass_pair_finish` or cancel with `glass_pairing_cancel`.
+ *
+ * # Safety
+ * `d` from `glass_device_open`; `host` NUL-terminated; `err` valid or null.
+ */
+GLASS_Pairing *glass_pair_begin(const GLASS_DeviceHandle *d,
+                                const char *host,
+                                uint16_t port,
+                                int32_t *err);
+
+/**
+ * The host's name (NUL-terminated into `buf`); returns its full length.
+ *
+ * # Safety
+ * `p` from `glass_pair_begin`; `buf` valid for `len` bytes.
+ */
+size_t glass_pairing_host_name(const GLASS_Pairing *p, char *buf, size_t len);
+
+/**
+ * Runs the PIN exchange and frees `p`. True = paired (both sides stored
+ * each other); false sets `*err` (e.g. `GLASS_ConnectError_WrongPin`).
+ *
+ * # Safety
+ * `p` from `glass_pair_begin`, not used afterwards; `pin` NUL-terminated.
+ */
+bool glass_pair_finish(GLASS_Pairing *p, const char *pin, int32_t *err);
+
+/**
+ * Cancels a pairing (the host stops waiting) and frees `p`.
+ *
+ * # Safety
+ * `p` from `glass_pair_begin` (or null), not used afterwards.
+ */
+void glass_pairing_cancel(GLASS_Pairing *p);
+
+/**
+ * Connects to a paired host. Returns null on failure and sets `*err` to a
+ * `GLASS_ConnectError` value (`NotPaired`: pair first). Free with
+ * `glass_client_close`.
+ *
+ * # Safety
+ * `d` from `glass_device_open`; `host` must be a NUL-terminated string;
+ * `err` must be valid for writes or null.
+ */
+GLASS_Client *glass_client_connect(const GLASS_DeviceHandle *d,
+                                   const char *host,
+                                   uint16_t port,
+                                   int32_t *err);
+
+/**
+ * The connected host's paired name (NUL-terminated into `buf`).
+ *
+ * # Safety
+ * `c` from `glass_client_connect`; `buf` valid for `len` bytes.
+ */
+size_t glass_client_host_name(const GLASS_Client *c, char *buf, size_t len);
 
 /**
  * # Safety
@@ -625,12 +835,19 @@ void glass_client_close(GLASS_Client *c);
 
 /**
  * Serves a `.glsr` file (copied) as a live stream on `port` (0 = any free
- * port; the chosen one is written to `*out_port`). Returns null on error.
+ * port; the chosen one is written to `*out_port`), as a new in-memory host
+ * identity "Glass test host" that pairs with the fixed PIN `pin`. Returns
+ * null on error.
  *
  * # Safety
- * `buf` must point to `len` readable bytes; `out_port` valid for writes or null.
+ * `buf` must point to `len` readable bytes; `pin` NUL-terminated;
+ * `out_port` valid for writes or null.
  */
-GLASS_Replay *glass_replay_start(const uint8_t *buf, size_t len, uint16_t port, uint16_t *out_port);
+GLASS_Replay *glass_replay_start(const uint8_t *buf,
+                                 size_t len,
+                                 uint16_t port,
+                                 const char *pin,
+                                 uint16_t *out_port);
 
 /**
  * Input actions the replay host has received (all sessions, capped).

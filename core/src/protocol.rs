@@ -1,9 +1,10 @@
 //! Wire formats. `docs/protocol.md` is the source of truth; keep them in sync and
 //! bump [`PROTOCOL_VERSION`] on any change.
 
-/// Protocol version. 3 = M3 (test 2): v2 (input datagrams, cursor messages,
-/// `FrameInfo::input_seq`) plus `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 3;
+/// Protocol version. 4 = M6: the control connection is mutual TLS 1.3 with
+/// pinned certificates, PIN pairing messages, and every UDP datagram is
+/// AES-GCM sealed (`seal.rs`). v3 = M3: input, cursor, `HostNotice`.
+pub const PROTOCOL_VERSION: u8 = 4;
 
 /// Default TCP control port; the host's UDP media socket uses the same number.
 pub const DEFAULT_PORT: u16 = 47800;
@@ -163,6 +164,44 @@ pub const NOTICE_INPUT_BLOCKED_SECURE_DESKTOP: u8 = 2;
 /// Why a host refused a viewer.
 pub const REJECT_VERSION: u8 = 1;
 pub const REJECT_BUSY: u8 = 2;
+/// The host doesn't know this viewer (never paired, or forgotten).
+pub const REJECT_NOT_PAIRED: u8 = 3;
+/// The host's user said no ("ask before each connection").
+pub const REJECT_DENIED: u8 = 4;
+/// Too many wrong PINs: pairing is off until the host restarts.
+pub const REJECT_PAIRING_LOCKED: u8 = 5;
+/// Wrong (or expired) PIN.
+pub const REJECT_WRONG_PIN: u8 = 6;
+
+/// Pairing messages (TLS control channel, before Hello; see `pairing.rs`).
+/// Viewer -> host: `name` (UTF-8, ≤ 63 bytes).
+pub const PAIR_START: u8 = 11;
+/// Host -> viewer: `name`; the host is now showing a PIN.
+pub const PAIR_READY: u8 = 12;
+/// Either way: SPAKE2 message (33 bytes).
+pub const PAIR_PAKE: u8 = 13;
+/// Either way: key-confirmation HMAC-SHA256 (32 bytes).
+pub const PAIR_CONFIRM: u8 = 14;
+
+fn pair_body_ok(kind: u8, len: usize) -> bool {
+    match kind {
+        PAIR_START | PAIR_READY => len <= crate::identity::NAME_MAX,
+        PAIR_PAKE => len == 33,
+        PAIR_CONFIRM => len == 32,
+        _ => false,
+    }
+}
+
+/// Appends a pairing message frame to `out`. False if the body is invalid.
+pub fn encode_pair(kind: u8, body: &[u8], out: &mut Vec<u8>) -> bool {
+    if !pair_body_ok(kind, body.len()) {
+        return false;
+    }
+    out.extend_from_slice(&((body.len() + 1) as u16).to_be_bytes());
+    out.push(kind);
+    out.extend_from_slice(body);
+    true
+}
 
 /// Control-channel messages (TCP). Framing: `u16 length` (big-endian, covers
 /// type + body) then `u8 type` then the body.
@@ -432,6 +471,11 @@ impl<'a> CursorShape<'a> {
 pub enum Message<'a> {
     Control(Control),
     Cursor(CursorShape<'a>),
+    /// `PAIR_*` kind and its body.
+    Pair {
+        kind: u8,
+        body: &'a [u8],
+    },
 }
 
 impl<'a> Message<'a> {
@@ -439,6 +483,11 @@ impl<'a> Message<'a> {
         let (kind, b, used) = decode_frame(buf)?;
         let m = if kind == KIND_CURSOR_SHAPE {
             Message::Cursor(CursorShape::decode_body(b).ok_or(ControlError::Malformed)?)
+        } else if (PAIR_START..=PAIR_CONFIRM).contains(&kind) {
+            if !pair_body_ok(kind, b.len()) {
+                return Err(ControlError::Malformed);
+            }
+            Message::Pair { kind, body: b }
         } else {
             Message::Control(Control::decode_body(kind, b)?)
         };
@@ -554,6 +603,39 @@ mod tests {
         let big = CursorShape { width: 200, ..c };
         assert!(!big.encode(&mut Vec::new()));
         assert_eq!(Control::decode(&buf), Err(ControlError::Malformed));
+    }
+
+    #[test]
+    fn pair_messages_round_trip() {
+        let mut buf = Vec::new();
+        assert!(encode_pair(PAIR_START, b"Simon's Mac", &mut buf));
+        assert!(encode_pair(PAIR_PAKE, &[7; 33], &mut buf));
+        assert!(encode_pair(PAIR_CONFIRM, &[9; 32], &mut buf));
+        assert!(!encode_pair(PAIR_PAKE, &[7; 32], &mut buf));
+        assert!(!encode_pair(PAIR_READY, &[b'x'; 64], &mut buf));
+        let (m, n) = Message::decode(&buf).unwrap();
+        assert_eq!(
+            m,
+            Message::Pair {
+                kind: PAIR_START,
+                body: b"Simon's Mac"
+            }
+        );
+        let (m, n2) = Message::decode(&buf[n..]).unwrap();
+        assert!(matches!(m, Message::Pair { kind: PAIR_PAKE, body } if body == [7; 33]));
+        let (m, _) = Message::decode(&buf[n + n2..]).unwrap();
+        assert!(matches!(
+            m,
+            Message::Pair {
+                kind: PAIR_CONFIRM,
+                ..
+            }
+        ));
+        // Wrong length for the kind.
+        assert_eq!(
+            Message::decode(&[0, 3, PAIR_PAKE, 1, 2]),
+            Err(ControlError::Malformed)
+        );
     }
 
     #[test]

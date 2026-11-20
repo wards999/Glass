@@ -10,6 +10,27 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M6 (pairing and encryption)
+Use the zip and dmg from the same test build (v4 can't talk to older builds).
+1. Windows: run `host.cmd`. It prints this PC's name and id and says no device
+   is paired yet. Allow glass.exe through the firewall if asked.
+2. Mac: open Glass.app. The PC should appear under "PCs running Glass on this
+   network" (if it doesn't, type the address; say so in the results). Pick it,
+   click **Connect**. Glass asks to pair; click **Pair**.
+3. The host.cmd window shows a 6-digit PIN. First type a wrong PIN on the Mac:
+   it should say wrong PIN and offer Try Again (the PC says 2 tries left).
+   Then type the right one: the stream opens.
+4. Use the PC from the Mac for a minute as in M3, then ⌃⌥⌘W, **Copy
+   results**, and send them with the host.cmd text. Compare with M3: the
+   numbers should be the same (encryption costs about 0.3 µs per packet).
+5. Connect again: no PIN this time. The list should show "✓ paired".
+6. On the PC (a second Command Prompt in the Glass folder): `glass devices`
+   lists the Mac. Then `glass forget "<Mac name>"`, and connect from the Mac
+   again: it must ask to pair again (and the PC says it refused an unpaired
+   device). Pair again so you're left paired.
+7. Mac: Connection ▸ Paired Devices shows the PC; Forget works the same way
+   (then pair again).
+
 ## M3 (mouse and keyboard)
 Same as M2 (run `host.cmd` on the PC, connect from the Mac), then work the PC
 from the Mac for a few minutes:

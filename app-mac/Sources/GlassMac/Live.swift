@@ -116,7 +116,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
-        window.title = "Glass — \(client.host)"
+        window.title = "Glass — \(client.hostName)"
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.fullScreenPrimary]
         window.contentAspectRatio = NSSize(width: w, height: h)
@@ -135,7 +135,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         view.onResize = { [weak self] in self?.updateDrawableSize() }
         view.onMouse = { [weak self] e in self?.handleMouse(e) }
 
-        overlay = NSTextField(labelWithString: "Connected to \(client.host). Waiting for the first frame…")
+        overlay = NSTextField(labelWithString: "Connected to \(client.hostName) (\(client.host), encrypted). Waiting for the first frame…")
         overlay.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         overlay.textColor = .white
         overlay.drawsBackground = true
@@ -449,7 +449,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 ? String(format: "input → screen    p50 %.1f  p99 %.1f ms", Double(inp.p50_us) / 1e3, Double(inp.p99_us) / 1e3)
                 : "input → screen    (move or type to measure)"
             var lines = [
-                "Glass  \(client.host)  \(streamDesc)  [\(pcStyleModifiers ? "⌘→Win ⌃→Ctrl" : "⌘→Ctrl ⌃→Win")]",
+                "Glass  \(client.hostName) \(client.host)  \(streamDesc)  [\(pcStyleModifiers ? "⌘→Win ⌃→Ctrl" : "⌘→Ctrl ⌃→Win")]",
                 String(format: "shown %.0f fps  received %.0f fps  %.1f Mbps", Double(r.presented) / secs, Double(r.frames) / secs, Double(r.bytes) * 8 / secs / 1e6),
                 totalLine,
                 inputLine,
@@ -494,10 +494,10 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             let st = finalStats
             let s = session
             var out = [banner, systemInfo()]
-            out.append("Live: \(client.host):\(client.port)  \(streamDesc), \(String(format: "%.1f", secs)) s (ended: \(reason))")
+            out.append("Live: \(client.hostName) \(client.host):\(client.port) (paired, encrypted)  \(streamDesc), \(String(format: "%.1f", secs)) s (ended: \(reason))")
             out.append(String(format: "  received %ld frames (%.1f fps), submitted %ld, presented %ld (%.1f fps), superseded %ld, decode errors %ld",
                               s.frames, Double(s.frames) / secs, submittedCount, s.presented, Double(s.presented) / secs, superseded, decodeErrors))
-            out.append("  packets \(st.rx.packets) | lost frames \(st.rx.frames_lost) | skipped \(st.rx.frames_skipped) | late \(st.rx.late) | dup \(st.rx.duplicates) | bad \(st.rx.bad) | queue full \(st.queue_full) | keyframe requests \(st.keyframe_requests)")
+            out.append("  packets \(st.rx.packets) | lost frames \(st.rx.frames_lost) | skipped \(st.rx.frames_skipped) | late \(st.rx.late) | dup \(st.rx.duplicates) | bad \(st.rx.bad) | rejected \(st.crypto_bad + st.crypto_replayed) | queue full \(st.queue_full) | keyframe requests \(st.keyframe_requests)")
             out.append(String(format: "  bitrate %.1f Mbps avg | clock sync %@ (best RTT %.2f ms, last %.2f ms)",
                               Double(s.bytes) * 8 / secs / 1e6, st.clock_valid ? "ok" : "NOT SYNCED",
                               Double(st.clock_rtt_us) / 1e3, Double(st.last_rtt_us) / 1e3))

@@ -4,11 +4,14 @@ mod blocker;
 mod capture;
 mod cursor;
 mod d3d;
+pub mod dpapi;
 mod encode;
 mod inject;
+mod mdns;
 
 use glass_core::clock;
-use glass_core::net::{HostListener, HostSession};
+use glass_core::identity::fingerprint_short;
+use glass_core::net::{HostListener, HostOptions, HostSession};
 use glass_core::packet::OutFrame;
 use glass_core::protocol::{CursorShape, StreamInfo, DEFAULT_PORT, FLAG_IDR};
 use glass_core::recording::{
@@ -51,6 +54,8 @@ struct Args {
     log: Option<String>,
     /// Listen on 127.0.0.1 only (local tests; no firewall prompt).
     local: bool,
+    /// Ask on the console before each (paired) viewer connects.
+    ask: bool,
     out: String,
 }
 
@@ -63,6 +68,7 @@ fn parse(args: &[String]) -> Res<Args> {
         port: DEFAULT_PORT,
         log: None,
         local: false,
+        ask: false,
         out: String::new(),
     };
     let mut it = args.iter();
@@ -75,6 +81,7 @@ fn parse(args: &[String]) -> Res<Args> {
             "--port" => a.port = val()?.parse()?,
             "--log" => a.log = Some(val()?.to_string()),
             "--local" => a.local = true,
+            "--ask" => a.ask = true,
             "--chroma" => {
                 a.chroma444 = match val()?.as_str() {
                     "444" => true,
@@ -360,10 +367,27 @@ pub fn host(args: &[String]) -> Res<()> {
         .get(a.monitor)
         .ok_or_else(|| format!("no monitor {} (see `glass list`)", a.monitor))?;
     let gpu = d3d::Gpu::new_nvidia()?;
-    let listener = if a.local {
-        HostListener::bind_on(std::net::Ipv4Addr::LOCALHOST, a.port)?
+    let device = crate::device()?;
+    let ask: Option<glass_core::net::AskFn> = if a.ask {
+        Some(Box::new(|p| {
+            use std::io::BufRead;
+            println!("\nAllow \"{}\" to view and control this PC? [y/N]", p.name);
+            let mut line = String::new();
+            let _ = std::io::stdin().lock().read_line(&mut line);
+            matches!(line.trim(), "y" | "Y" | "yes")
+        }))
     } else {
-        HostListener::bind(a.port)?
+        None
+    };
+    let opts = HostOptions {
+        fixed_pin: None,
+        ask,
+        events: Box::new(crate::print_event),
+    };
+    let mut listener = if a.local {
+        HostListener::bind_on(std::net::Ipv4Addr::LOCALHOST, a.port, device.clone(), opts)?
+    } else {
+        HostListener::bind(a.port, device.clone(), opts)?
     };
     let mut head = String::new();
     let _ = writeln!(
@@ -381,10 +405,40 @@ pub fn host(args: &[String]) -> Res<()> {
         listener.port()
     );
     print!("{head}");
-    let ip = lan_ip().map_or("(unknown)".to_string(), |ip| ip.to_string());
-    println!("On the Mac, open Glass and connect to:  {ip}");
+    let lan = lan_ip();
+    let ip = lan.map_or("(unknown)".to_string(), |ip| ip.to_string());
+    let id = fingerprint_short(&device.fingerprint());
+    println!(
+        "This PC: \"{}\", id {id}. Only paired devices can connect; everything is encrypted.",
+        device.name
+    );
+    println!("On the Mac, open Glass and pick this PC (or type {ip}).");
+    let paired = device
+        .peers()
+        .iter()
+        .filter(|p| p.roles & glass_core::identity::ROLE_VIEWER != 0)
+        .count();
+    if paired == 0 {
+        println!(
+            "No device is paired yet: connecting from the Mac shows a PIN here to type there."
+        );
+    } else {
+        println!("{paired} paired device(s) (`glass devices` lists them, `glass forget NAME` removes one).");
+    }
+    if a.ask {
+        println!("You'll be asked before each connection (--ask).");
+    }
     println!("(Allow glass.exe through Windows Firewall on private networks if asked.)");
     println!("(To control programs running as administrator, run host.cmd as administrator.)");
+    if !a.local {
+        let v4 = match lan {
+            Some(std::net::IpAddr::V4(v4)) => Some(v4),
+            _ => None,
+        };
+        if let Err(e) = mdns::advertise(&device.name, listener.port(), v4, &id) {
+            println!("(Not listed on the network: {e}. Type the address on the Mac instead.)");
+        }
+    }
 
     loop {
         let mut cap = capture::Capture::start(&gpu, mon)?;
@@ -418,13 +472,21 @@ pub fn host(args: &[String]) -> Res<()> {
             }
         });
         let mut session = match listener.accept(info, sink) {
-            Ok(s) => s,
+            Ok(Some(s)) => s,
+            Ok(None) => continue, // pairing or refusal, already reported
             Err(e) => {
-                eprintln!("viewer handshake failed: {e}");
+                eprintln!("A connection attempt failed: {e}");
                 continue;
             }
         };
-        println!("Viewer connected from {}", session.peer_tcp);
+        if mdns::registered() == Some(false) {
+            println!("(Listing on the network failed; type the address on the Mac.)");
+        }
+        println!(
+            "Viewer connected: \"{}\" from {} (encrypted)",
+            session.peer_name,
+            session.peer_tcp.ip()
+        );
         let (mut report, blocked_by, blocked_us) = run_session(
             &gpu,
             &mut cap,
@@ -434,12 +496,18 @@ pub fn host(args: &[String]) -> Res<()> {
             mon.refresh_hz,
             &blocking,
         )?;
-        let ic = session.counters().input;
+        let counters = session.counters();
+        let ic = counters.input;
         drop(session); // releases anything the viewer still held
         let _ = writeln!(
             report,
             "  input: {} packets | {} keys, {} clicks, {} scrolls, {} moves | repaired {}",
             ic.packets, ic.keys, ic.clicks, ic.scrolls, ic.moves, ic.repaired
+        );
+        let _ = writeln!(
+            report,
+            "  rejected UDP datagrams (failed decryption or replays): {}",
+            counters.rejected_datagrams
         );
         let _ = writeln!(
             report,

@@ -1,31 +1,45 @@
-//! Live-stream sessions over the LAN (unencrypted until M6).
+//! Live-stream sessions over the LAN, paired devices only (M6).
 //!
-//! - Control: one TCP connection (Hello/Welcome, ping/pong clock sync,
-//!   keyframe requests, pointer shape/visibility, Bye).
-//!   LATER(M6): TLS 1.3 with pinned certificates.
-//! - Video: UDP host -> client. The client first sends a "punch" datagram to the
-//!   host's UDP port so the host learns where to send (and stateful firewalls
-//!   on the client side let the replies in).
-//! - Input: UDP client -> host on the same sockets (`input.rs`).
+//! - Control: one TCP connection inside mutual TLS 1.3 (`tls.rs`). Each side
+//!   checks the other's certificate fingerprint against its paired devices
+//!   (`identity.rs`) before acting on anything. An unknown viewer may only
+//!   pair (PIN, `pairing.rs`); it can't get a session.
+//!   Messages: Hello/Welcome, ping/pong clock sync, keyframe requests,
+//!   pointer shape/visibility, notices, Bye.
+//! - Video: UDP host -> viewer. The viewer first sends a "punch" datagram to
+//!   the host's UDP port so the host learns where to send (and stateful
+//!   firewalls on the viewer side let the replies in).
+//! - Input: UDP viewer -> host on the same sockets (`input.rs`).
+//! - Every UDP datagram is AES-128-GCM sealed (`seal.rs`) with per-session,
+//!   per-direction keys from the TLS exporter, so only the paired peer in
+//!   this session can produce or read them.
 //!
 //! The host side is driven by the app's capture/encode loop
 //! ([`HostSession::send_frame`]) and injects input from a callback on its UDP
 //! thread; the client side runs its own receive and control threads and hands
 //! complete frames to one consumer thread through a fixed-size queue
 //! ([`Client::wait_frame`]).
-//! LATER(M3b): IPv6.
+//! LATER(M3b): IPv6. LATER(M7): more than one viewer at a time.
 
 use crate::clock::{self, ClockSync};
+use crate::identity::{
+    clean_name, fingerprint_short, Device, Fingerprint, Peer, ROLE_HOST, ROLE_VIEWER,
+};
 use crate::input::{
     InputAction, InputApplier, InputCounters, InputPacket, InputSender, MAX_INPUT_DATAGRAM,
 };
-use crate::packet::{OutFrame, Packetiser, Reassembler, ReassemblyStats, MAX_DATAGRAM};
+use crate::packet::{OutFrame, Packetiser, Reassembler, ReassemblyStats};
+use crate::pairing::{self, PinState};
 use crate::protocol::{
-    decode_punch, encode_punch, Control, ControlError, CursorShape, Message, StreamInfo,
-    CONTROL_MAX, FRAME_MAX, PROTOCOL_VERSION, PUNCH_SIZE, REJECT_VERSION,
+    decode_punch, encode_pair, encode_punch, Control, ControlError, CursorShape, Message,
+    StreamInfo, CONTROL_MAX, FRAME_MAX, PAIR_CONFIRM, PAIR_PAKE, PAIR_READY, PAIR_START,
+    PROTOCOL_VERSION, PUNCH_SIZE, REJECT_DENIED, REJECT_NOT_PAIRED, REJECT_PAIRING_LOCKED,
+    REJECT_VERSION, REJECT_WRONG_PIN,
 };
+use crate::seal::{Opener, Sealer, Secret, WIRE_MAX};
+use crate::tls::{self, Channel, TlsReader, TlsWriter};
 use std::cell::UnsafeCell;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::{
     Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
 };
@@ -42,6 +56,10 @@ const PING_INTERVAL_US: u64 = 500_000;
 const FAST_PINGS: u32 = 8;
 const KEYFRAME_RETRY_US: u64 = 250_000;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a viewer waits for Welcome (the host may be asking its user).
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// TLS exporter label for the media keys (context = session id).
+const MEDIA_LABEL: &[u8] = b"EXPORTER-glass-media";
 
 fn udp_socket(bind: SocketAddrV4) -> io::Result<UdpSocket> {
     let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
@@ -52,17 +70,56 @@ fn udp_socket(bind: SocketAddrV4) -> io::Result<UdpSocket> {
     Ok(s.into())
 }
 
-fn send_control(w: &mut impl Write, msg: Control) -> io::Result<()> {
+fn send_control(w: &TlsWriter, msg: Control) -> io::Result<()> {
     let mut buf = [0u8; CONTROL_MAX];
     let n = msg.encode(&mut buf);
     w.write_all(&buf[..n])
+}
+
+fn send_pair(w: &TlsWriter, kind: u8, body: &[u8]) -> io::Result<()> {
+    let mut b = Vec::with_capacity(body.len() + 3);
+    if !encode_pair(kind, body, &mut b) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bad pairing message",
+        ));
+    }
+    w.write_all(&b)
+}
+
+fn invalid(what: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, what.to_string())
+}
+
+/// (host -> viewer, viewer -> host) media secrets for this session.
+fn media_secrets(w: &TlsWriter, session_id: u32) -> io::Result<(Secret, Secret)> {
+    let mut out = [0u8; 64];
+    w.export(MEDIA_LABEL, &session_id.to_be_bytes(), &mut out)?;
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    a.copy_from_slice(&out[..32]);
+    b.copy_from_slice(&out[32..]);
+    Ok((a, b))
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Accumulates TCP bytes and yields whole control messages. The buffer holds
+fn is_timeout(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// A handshake-time message, owned.
+enum Incoming {
+    Control(Control),
+    Pair(u8, Vec<u8>),
+}
+
+/// Accumulates control bytes and yields whole messages. The buffer holds
 /// the largest frame (a pointer image); it's allocated once per connection.
 struct ControlReader {
     buf: Vec<u8>,
@@ -77,26 +134,14 @@ impl ControlReader {
         }
     }
 
-    /// Reads once (honouring the stream's read timeout) and calls `on_msg` for
-    /// each complete message. `Ok(false)` = peer closed.
-    fn read(
-        &mut self,
-        s: &mut TcpStream,
-        mut on_msg: impl FnMut(Message<'_>) -> io::Result<()>,
-    ) -> io::Result<bool> {
-        match s.read(&mut self.buf[self.len..]) {
-            Ok(0) => return Ok(false),
-            Ok(n) => self.len += n,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Ok(true)
-            }
-            Err(e) => return Err(e),
-        }
+    /// `Ok(false)` = peer closed. Timeouts come back as errors.
+    fn read_more(&mut self, s: &mut impl Read) -> io::Result<bool> {
+        let n = s.read(&mut self.buf[self.len..])?;
+        self.len += n;
+        Ok(n > 0)
+    }
+
+    fn drain(&mut self, on_msg: &mut impl FnMut(Message<'_>) -> io::Result<()>) -> io::Result<()> {
         let mut used = 0;
         loop {
             match Message::decode(&self.buf[used..self.len]) {
@@ -105,38 +150,60 @@ impl ControlReader {
                     on_msg(m)?;
                 }
                 Err(ControlError::Incomplete) => break,
-                Err(ControlError::Malformed) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "bad control message",
-                    ))
-                }
+                Err(ControlError::Malformed) => return Err(invalid("bad control message")),
             }
         }
         self.buf.copy_within(used..self.len, 0);
         self.len -= used;
+        Ok(())
+    }
+
+    /// Reads once (honouring the stream's read timeout) and calls `on_msg` for
+    /// each complete message. `Ok(false)` = peer closed.
+    fn read(
+        &mut self,
+        s: &mut impl Read,
+        mut on_msg: impl FnMut(Message<'_>) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        // Anything left over from the handshake first.
+        self.drain(&mut on_msg)?;
+        match self.read_more(s) {
+            Ok(false) => return Ok(false),
+            Ok(true) => {}
+            Err(e) if is_timeout(&e) => return Ok(true),
+            Err(e) => return Err(e),
+        }
+        self.drain(&mut on_msg)?;
         Ok(true)
     }
 
-    /// Blocks (up to the stream's read timeout) for exactly one small message.
-    fn read_one(&mut self, s: &mut TcpStream) -> io::Result<Control> {
-        let mut got = None;
-        while got.is_none() {
-            let open = self.read(s, |m| {
-                if let Message::Control(c) = m {
-                    got.get_or_insert(c);
+    /// Blocks (up to the stream's read timeout per read) for exactly one
+    /// message, leaving anything after it buffered. Pointer shapes are skipped.
+    fn read_one(&mut self, s: &mut impl Read) -> io::Result<Incoming> {
+        loop {
+            let got = match Message::decode(&self.buf[..self.len]) {
+                Ok((m, n)) => {
+                    let got = match m {
+                        Message::Control(c) => Some(Incoming::Control(c)),
+                        Message::Pair { kind, body } => Some(Incoming::Pair(kind, body.to_vec())),
+                        Message::Cursor(_) => None,
+                    };
+                    self.buf.copy_within(n..self.len, 0);
+                    self.len -= n;
+                    got
                 }
-                Ok(())
-            })?;
-            if !open {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-            if got.is_none() && self.len == 0 {
-                // Timed out with nothing buffered.
-                return Err(io::ErrorKind::TimedOut.into());
+                Err(ControlError::Incomplete) => {
+                    if !self.read_more(s)? {
+                        return Err(io::ErrorKind::UnexpectedEof.into());
+                    }
+                    None
+                }
+                Err(ControlError::Malformed) => return Err(invalid("bad control message")),
+            };
+            if let Some(g) = got {
+                return Ok(g);
             }
         }
-        Ok(got.unwrap())
     }
 }
 
@@ -149,18 +216,72 @@ fn unpack_v4(v: u64) -> Option<SocketAddrV4> {
 }
 
 fn new_session_id() -> u32 {
-    let t = clock::now_us();
-    let id = (t ^ (t >> 29) ^ (std::process::id() as u64).rotate_left(17)) as u32;
-    id.max(1)
+    use ring::rand::SecureRandom;
+    let mut b = [0u8; 4];
+    if ring::rand::SystemRandom::new().fill(&mut b).is_err() {
+        b = (clock::now_us() as u32).to_be_bytes();
+    }
+    u32::from_be_bytes(b).max(1)
 }
 
 // ---------------------------------------------------------------------------
 // Host
 
+/// What happened on the host that its user should see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostEvent {
+    /// A device asked to pair: show this PIN. `new` = not shown before.
+    PairingPin {
+        device: String,
+        pin: String,
+        new: bool,
+        addr: SocketAddr,
+    },
+    /// Pairing succeeded: `device` may now view and control this machine.
+    Paired { device: String },
+    /// A wrong (or expired) PIN; `left` more tries for the current PIN.
+    WrongPin { device: String, left: u32 },
+    /// Too many wrong PINs: pairing is off until the host restarts.
+    PairingLocked,
+    /// A device that isn't paired (or was forgotten) tried to connect.
+    Refused {
+        fingerprint: String,
+        addr: SocketAddr,
+    },
+    /// The user said no to a paired device ("ask before each connection").
+    Denied { device: String },
+}
+
+/// "Ask before each connection": true = allow this paired viewer.
+pub type AskFn = Box<dyn FnMut(&Peer) -> bool + Send>;
+
+/// Host behaviour.
+pub struct HostOptions {
+    /// Fixed pairing PIN (test tools only). `None`: a random PIN per request.
+    pub fixed_pin: Option<String>,
+    /// Asked before each connection of a paired viewer; `None` = always allow.
+    pub ask: Option<AskFn>,
+    pub events: Box<dyn FnMut(HostEvent) + Send>,
+}
+
+impl Default for HostOptions {
+    fn default() -> Self {
+        Self {
+            fixed_pin: None,
+            ask: None,
+            events: Box::new(|_| {}),
+        }
+    }
+}
+
 /// Listens for viewers: TCP control and UDP media on the same port number.
 pub struct HostListener {
     tcp: TcpListener,
     udp: UdpSocket,
+    device: Arc<Device>,
+    tls: Arc<rustls::ServerConfig>,
+    opts: HostOptions,
+    pins: PinState,
 }
 
 /// Host-side counters for one session.
@@ -171,6 +292,8 @@ pub struct HostCounters {
     pub bytes_sent: u64,
     pub keyframe_requests: u32,
     pub input: InputCounters,
+    /// UDP datagrams that failed authentication or were replays.
+    pub rejected_datagrams: u64,
 }
 
 /// Called on the host's UDP thread for every input action, in order.
@@ -186,6 +309,7 @@ struct HostShared {
     /// `InputApplier::applied_seq` for `FrameInfo::input_seq`.
     input_seq: AtomicU32,
     input: Mutex<InputCounters>,
+    rejected: AtomicU64,
 }
 
 /// One connected viewer. Dropping it ends the session (and releases any
@@ -193,59 +317,134 @@ struct HostShared {
 pub struct HostSession {
     shared: Arc<HostShared>,
     udp: UdpSocket,
-    tcp_out: Arc<Mutex<TcpStream>>,
+    out: TlsWriter,
     packetiser: Packetiser,
+    sealer: Sealer,
+    wire: [u8; WIRE_MAX],
     counters: HostCounters,
     cursor_buf: Vec<u8>,
     pub peer_tcp: SocketAddr,
+    /// The paired viewer's name.
+    pub peer_name: String,
     threads: Vec<JoinHandle<()>>,
 }
 
 impl HostListener {
     /// Binds `0.0.0.0:port` for TCP and UDP. `port = 0` picks a free one.
-    pub fn bind(port: u16) -> io::Result<Self> {
-        Self::bind_on(Ipv4Addr::UNSPECIFIED, port)
+    pub fn bind(port: u16, device: Arc<Device>, opts: HostOptions) -> io::Result<Self> {
+        Self::bind_on(Ipv4Addr::UNSPECIFIED, port, device, opts)
     }
 
     /// Like [`Self::bind`] on one interface (e.g. loopback-only for tests).
-    pub fn bind_on(ip: Ipv4Addr, port: u16) -> io::Result<Self> {
-        let tcp = TcpListener::bind((ip, port))?;
-        let port = tcp.local_addr()?.port();
-        let udp = udp_socket(SocketAddrV4::new(ip, port))?;
-        Ok(Self { tcp, udp })
+    pub fn bind_on(
+        ip: Ipv4Addr,
+        port: u16,
+        device: Arc<Device>,
+        opts: HostOptions,
+    ) -> io::Result<Self> {
+        // With port 0 the OS picks a free TCP port; its number may be taken
+        // for UDP, so try a few.
+        let mut tries = if port == 0 { 20 } else { 1 };
+        let (tcp, udp) = loop {
+            let tcp = TcpListener::bind((ip, port))?;
+            let p = tcp.local_addr()?.port();
+            match udp_socket(SocketAddrV4::new(ip, p)) {
+                Ok(udp) => break (tcp, udp),
+                Err(e) if tries <= 1 => return Err(e),
+                Err(_) => tries -= 1,
+            }
+        };
+        let tls = tls::server_config(&device.identity)?;
+        let pins = PinState::new(opts.fixed_pin.clone());
+        Ok(Self {
+            tcp,
+            udp,
+            device,
+            tls,
+            opts,
+            pins,
+        })
     }
 
     pub fn port(&self) -> u16 {
         self.tcp.local_addr().map(|a| a.port()).unwrap_or(0)
     }
 
-    /// Waits for a viewer and completes the handshake. Input actions go to
-    /// `on_input` (on the UDP thread). A failed handshake returns an error;
-    /// call again to keep listening.
-    pub fn accept(&self, info: StreamInfo, on_input: InputSink) -> io::Result<HostSession> {
-        let (mut tcp, peer_tcp) = self.tcp.accept()?;
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
+    /// True once too many wrong PINs have switched pairing off.
+    pub fn pairing_locked(&self) -> bool {
+        self.pins.locked()
+    }
+
+    fn event(&mut self, e: HostEvent) {
+        (self.opts.events)(e)
+    }
+
+    /// Waits for one connection and handles it. A paired, allowed viewer gets
+    /// a session (`Some`); a pairing request or a refused device is handled
+    /// here and reported through `HostOptions::events` (`None`). An error is
+    /// a failed connection attempt: call again to keep listening. Input
+    /// actions go to `on_input` (on the UDP thread).
+    pub fn accept(
+        &mut self,
+        info: StreamInfo,
+        on_input: InputSink,
+    ) -> io::Result<Option<HostSession>> {
+        let (tcp, peer_tcp) = self.tcp.accept()?;
         tcp.set_nodelay(true)?;
         tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        let mut ch = tls::handshake(tcp, tls::server_conn(&self.tls)?)?;
         let mut reader = ControlReader::new();
-        match reader.read_one(&mut tcp)? {
-            Control::Hello { version, .. } if version == PROTOCOL_VERSION => {}
-            Control::Hello { .. } => {
+        let version = match reader.read_one(&mut ch.reader)? {
+            Incoming::Pair(PAIR_START, name) => {
+                self.pair(&mut ch, &mut reader, &name, peer_tcp)?;
+                return Ok(None);
+            }
+            Incoming::Control(Control::Hello { version, .. }) => version,
+            // A viewer that doesn't know us looked and left.
+            Incoming::Control(Control::Bye) => return Ok(None),
+            _ => return Err(invalid("expected Hello")),
+        };
+        if version != PROTOCOL_VERSION {
+            let _ = send_control(
+                &ch.writer,
+                Control::Reject {
+                    reason: REJECT_VERSION,
+                },
+            );
+            return Err(invalid("viewer speaks a different protocol version"));
+        }
+        let Some(peer) = self.device.peer_with(&ch.peer, ROLE_VIEWER) else {
+            let _ = send_control(
+                &ch.writer,
+                Control::Reject {
+                    reason: REJECT_NOT_PAIRED,
+                },
+            );
+            self.event(HostEvent::Refused {
+                fingerprint: fingerprint_short(&ch.peer),
+                addr: peer_tcp,
+            });
+            return Ok(None);
+        };
+        if let Some(ask) = &mut self.opts.ask {
+            if !ask(&peer) {
                 let _ = send_control(
-                    &mut tcp,
+                    &ch.writer,
                     Control::Reject {
-                        reason: REJECT_VERSION,
+                        reason: REJECT_DENIED,
                     },
                 );
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "viewer speaks a different protocol version",
-                ));
+                self.event(HostEvent::Denied { device: peer.name });
+                return Ok(None);
             }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "expected Hello")),
         }
         let session_id = new_session_id();
         send_control(
-            &mut tcp,
+            &ch.writer,
             Control::Welcome {
                 version: PROTOCOL_VERSION,
                 info,
@@ -253,6 +452,7 @@ impl HostListener {
                 session_id,
             },
         )?;
+        let (to_viewer, from_viewer) = media_secrets(&ch.writer, session_id)?;
 
         let shared = Arc::new(HostShared {
             stop: AtomicBool::new(false),
@@ -262,19 +462,24 @@ impl HostListener {
             peer: AtomicU64::new(0),
             input_seq: AtomicU32::new(0),
             input: Mutex::new(InputCounters::default()),
+            rejected: AtomicU64::new(0),
         });
-        let tcp_out = Arc::new(Mutex::new(tcp.try_clone()?));
         let mut threads = Vec::new();
 
         // Control: answer pings, take keyframe requests, notice disconnects.
-        tcp.set_read_timeout(Some(Duration::from_millis(100)))?;
+        let Channel {
+            reader: mut tls_in,
+            writer: out,
+            ..
+        } = ch;
+        tls_in.set_read_timeout(Some(Duration::from_millis(100)))?;
         let sh = shared.clone();
-        let out = tcp_out.clone();
+        let w = out.clone();
         threads.push(std::thread::spawn(move || {
             let mut reader = reader;
             while !sh.stop.load(Ordering::Relaxed) {
                 let mut pong = None;
-                let r = reader.read(&mut tcp, |m| {
+                let r = reader.read(&mut tls_in, |m| {
                     match m {
                         Message::Control(Control::Ping { seq, client_ts }) => {
                             pong = Some(Control::Pong {
@@ -298,23 +503,25 @@ impl HostListener {
                     break;
                 }
                 if let Some(p) = pong {
-                    if send_control(&mut *lock(&out), p).is_err() {
+                    if send_control(&w, p).is_err() {
                         break;
                     }
                 }
             }
-            let _ = send_control(&mut *lock(&out), Control::Bye);
+            let _ = send_control(&w, Control::Bye);
             sh.connected.store(false, Ordering::Relaxed);
         }));
 
-        // UDP from the viewer: punches (where to send video) and input.
+        // UDP from the viewer: punches (where to send video) and input. Only
+        // datagrams sealed with this session's viewer key get past `open`.
         let udp = self.udp.try_clone()?;
         udp.set_read_timeout(Some(Duration::from_millis(100)))?;
         let client_ip = peer_tcp.ip();
         let sh = shared.clone();
         let mut on_input = on_input;
         threads.push(std::thread::spawn(move || {
-            let mut buf = [0u8; MAX_INPUT_DATAGRAM + 64];
+            let mut buf = [0u8; WIRE_MAX + 64];
+            let mut opener = Opener::new(from_viewer, session_id);
             let mut applier = InputApplier::new();
             while !sh.stop.load(Ordering::Relaxed) && sh.connected.load(Ordering::Relaxed) {
                 let Ok((n, from)) = udp.recv_from(&mut buf) else {
@@ -323,7 +530,11 @@ impl HostListener {
                 let (SocketAddr::V4(v4), true) = (from, from.ip() == client_ip) else {
                     continue;
                 };
-                let d = &buf[..n];
+                let Ok(d) = opener.open(&mut buf[..n]) else {
+                    let s = opener.stats;
+                    sh.rejected.store(s.bad + s.replayed, Ordering::Relaxed);
+                    continue;
+                };
                 if decode_punch(d) == Some(session_id) {
                     let packed = pack_v4(v4);
                     if sh.peer.swap(packed, Ordering::Relaxed) != packed {
@@ -341,16 +552,96 @@ impl HostListener {
             *lock(&sh.input) = applier.counters;
         }));
 
-        Ok(HostSession {
+        Ok(Some(HostSession {
             shared,
             udp: self.udp.try_clone()?,
-            tcp_out,
+            out,
             packetiser: Packetiser::default(),
+            sealer: Sealer::new(to_viewer, session_id),
+            wire: [0; WIRE_MAX],
             counters: HostCounters::default(),
             cursor_buf: Vec::with_capacity(FRAME_MAX),
             peer_tcp,
+            peer_name: peer.name,
             threads,
-        })
+        }))
+    }
+
+    /// Host side of PIN pairing (after the viewer's `PAIR_START`).
+    fn pair(
+        &mut self,
+        ch: &mut Channel,
+        reader: &mut ControlReader,
+        name: &[u8],
+        addr: SocketAddr,
+    ) -> io::Result<()> {
+        let device = clean_name(&String::from_utf8_lossy(name));
+        let reject = |ch: &Channel, reason| {
+            let _ = send_control(&ch.writer, Control::Reject { reason });
+        };
+        if self.pins.locked() {
+            reject(ch, REJECT_PAIRING_LOCKED);
+            self.event(HostEvent::PairingLocked);
+            return Ok(());
+        }
+        let now = clock::now_us();
+        let (pin, new) = self.pins.for_request(now);
+        self.event(HostEvent::PairingPin {
+            device: device.clone(),
+            pin,
+            new,
+            addr,
+        });
+        send_pair(&ch.writer, PAIR_READY, self.device.name.as_bytes())?;
+        // The viewer's user is typing the PIN.
+        let wait = self.pins.remaining_us(now).max(1_000_000);
+        ch.reader
+            .set_read_timeout(Some(Duration::from_micros(wait)))?;
+        let theirs = match reader.read_one(&mut ch.reader)? {
+            Incoming::Pair(PAIR_PAKE, m) => m,
+            Incoming::Control(Control::Bye) => return Ok(()), // cancelled
+            _ => return Err(invalid("expected a pairing message")),
+        };
+        ch.reader.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        // Counted before anything is computed or sent.
+        let Some(pin) = self.pins.begin_attempt(clock::now_us()) else {
+            reject(ch, REJECT_WRONG_PIN);
+            self.event(HostEvent::WrongPin { device, left: 0 });
+            return Ok(());
+        };
+        let (pake, ours) = pairing::start(true, &pin, &ch.peer, &self.device.fingerprint());
+        send_pair(&ch.writer, PAIR_PAKE, &ours)?;
+        let mut binding = [0u8; 32];
+        ch.writer.export(pairing::EXPORT_LABEL, &[], &mut binding)?;
+        let confirm = pake.finish(&theirs, &binding);
+        let mac = match reader.read_one(&mut ch.reader)? {
+            Incoming::Pair(PAIR_CONFIRM, m) => m,
+            _ => return Err(invalid("expected a pairing message")),
+        };
+        let Some(c) = confirm.filter(|c| c.verify(false, &mac)) else {
+            let locked = self.pins.locked();
+            reject(
+                ch,
+                if locked {
+                    REJECT_PAIRING_LOCKED
+                } else {
+                    REJECT_WRONG_PIN
+                },
+            );
+            let left = self.pins.left_for_pin();
+            self.event(HostEvent::WrongPin { device, left });
+            if locked {
+                self.event(HostEvent::PairingLocked);
+            }
+            return Ok(());
+        };
+        self.pins.succeeded();
+        self.device.add_peer(ch.peer, &device, ROLE_VIEWER)?;
+        send_pair(&ch.writer, PAIR_CONFIRM, &c.mac(true))?;
+        self.event(HostEvent::Paired { device });
+        // Let the viewer read our confirmation before we close.
+        let _ = reader.read_one(&mut ch.reader);
+        Ok(())
     }
 }
 
@@ -375,17 +666,20 @@ impl HostSession {
         self.shared.input_seq.load(Ordering::Acquire)
     }
 
-    /// Sends one encoded frame. Returns `Ok(false)` (and sends nothing) while
-    /// the viewer's UDP address is still unknown.
+    /// Seals and sends one encoded frame. Returns `Ok(false)` (and sends
+    /// nothing) while the viewer's UDP address is still unknown.
     pub fn send_frame(&mut self, f: &OutFrame, data: &[u8]) -> io::Result<bool> {
         let Some(peer) = unpack_v4(self.shared.peer.load(Ordering::Relaxed)) else {
             return Ok(false);
         };
         let udp = &self.udp;
         let c = &mut self.counters;
+        let sealer = &mut self.sealer;
+        let wire = &mut self.wire;
         let n = self.packetiser.send_frame(f, data, |pkt| {
-            c.bytes_sent += pkt.len() as u64;
-            udp.send_to(pkt, peer).map(|_| ())
+            let len = sealer.seal(pkt, wire);
+            c.bytes_sent += len as u64;
+            udp.send_to(&wire[..len], peer).map(|_| ())
         })?;
         c.packets_sent += n as u64;
         c.frames_sent += 1;
@@ -398,25 +692,23 @@ impl HostSession {
         if !shape.encode(&mut self.cursor_buf) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad cursor"));
         }
-        lock(&self.tcp_out).write_all(&self.cursor_buf)
+        self.out.write_all(&self.cursor_buf)
     }
 
     /// Tells the viewer about a condition (`protocol::NOTICE_*`; `NOTICE_NONE` clears it).
     pub fn send_notice(&mut self, code: u8) -> io::Result<()> {
-        send_control(&mut *lock(&self.tcp_out), Control::HostNotice { code })
+        send_control(&self.out, Control::HostNotice { code })
     }
 
     pub fn send_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
-        send_control(
-            &mut *lock(&self.tcp_out),
-            Control::CursorVisible { visible },
-        )
+        send_control(&self.out, Control::CursorVisible { visible })
     }
 
     pub fn counters(&self) -> HostCounters {
         HostCounters {
             keyframe_requests: self.shared.keyframe_requests.load(Ordering::Relaxed),
             input: *lock(&self.shared.input),
+            rejected_datagrams: self.shared.rejected.load(Ordering::Relaxed),
             ..self.counters
         }
     }
@@ -556,6 +848,16 @@ pub enum ConnectError {
     Version = 4,
     /// Couldn't create the UDP socket.
     Socket = 5,
+    /// We haven't paired with this host (or it has forgotten us): pair first.
+    NotPaired = 6,
+    /// The host refused (its user said no, or it's busy).
+    Refused = 7,
+    /// Pairing: wrong or expired PIN.
+    WrongPin = 8,
+    /// Pairing: too many wrong PINs; restart the host to pair.
+    PairingLocked = 9,
+    /// This device's identity couldn't be loaded, created or saved.
+    Identity = 10,
 }
 
 impl std::fmt::Display for ConnectError {
@@ -568,6 +870,13 @@ impl std::fmt::Display for ConnectError {
             ConnectError::Handshake => "connected, but the handshake failed",
             ConnectError::Version => "host runs a different Glass protocol version",
             ConnectError::Socket => "could not open a UDP socket",
+            ConnectError::NotPaired => "not paired with this host (pair with its PIN first)",
+            ConnectError::Refused => "the host refused the connection",
+            ConnectError::WrongPin => "wrong or expired PIN",
+            ConnectError::PairingLocked => {
+                "too many wrong PINs: restart Glass on the host to pair again"
+            }
+            ConnectError::Identity => "could not load or save this device's identity",
         })
     }
 }
@@ -594,6 +903,9 @@ pub struct ClientStats {
     pub input_packets: u64,
     /// Latest `HostNotice` code (`protocol::NOTICE_*`), 0 = none.
     pub host_notice: u8,
+    /// UDP datagrams that failed authentication / were replays.
+    pub crypto_bad: u64,
+    pub crypto_replayed: u64,
 }
 
 /// The host's pointer as last reported. `generation` changes on every update.
@@ -652,23 +964,33 @@ impl AtomicRx {
     }
 }
 
-/// Input side of the client: builds datagrams and sends them on the media
-/// socket. Shared by the UI thread (events) and the control thread (heartbeats).
+/// Input side of the client: builds datagrams, seals them and sends them on
+/// the media socket. Shared by the UI thread (events), the control thread
+/// (heartbeats) and the receiver (punches).
 struct InputTx {
     sender: InputSender,
     udp: UdpSocket,
     dest: SocketAddrV4,
-    buf: [u8; MAX_INPUT_DATAGRAM],
+    sealer: Sealer,
+    punch: [u8; PUNCH_SIZE],
+    plain: [u8; MAX_INPUT_DATAGRAM],
+    wire: [u8; WIRE_MAX],
     packets: u64,
     active: bool, // any input yet (no heartbeats before the first event)
 }
 
 impl InputTx {
     fn flush(&mut self, now: u64) {
-        let (n, _) = self.sender.build(now, &mut self.buf);
-        let _ = self.udp.send_to(&self.buf[..n], self.dest);
+        let (n, _) = self.sender.build(now, &mut self.plain);
+        let len = self.sealer.seal(&self.plain[..n], &mut self.wire);
+        let _ = self.udp.send_to(&self.wire[..len], self.dest);
         self.packets += 1;
         self.active = true;
+    }
+
+    fn send_punch(&mut self) {
+        let len = self.sealer.seal(&self.punch, &mut self.wire);
+        let _ = self.udp.send_to(&self.wire[..len], self.dest);
     }
 }
 
@@ -679,6 +1001,8 @@ struct ClientShared {
     keyframe_requests: AtomicU32,
     queue_full: AtomicU64,
     rx: AtomicRx,
+    crypto_bad: AtomicU64,
+    crypto_replayed: AtomicU64,
     clock_valid: AtomicBool,
     clock_offset: AtomicI64,
     clock_rtt: AtomicU32,
@@ -695,6 +1019,7 @@ pub struct Client {
     shared: Arc<ClientShared>,
     info: StreamInfo,
     host: SocketAddrV4,
+    peer: Peer,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -705,24 +1030,134 @@ pub enum Wait<'a> {
     Disconnected,
 }
 
-impl Client {
-    /// Connects to `host:port`, completes the handshake and starts receiving.
-    pub fn connect(host: &str, port: u16) -> Result<Self, ConnectError> {
-        let addr = (host, port)
-            .to_socket_addrs()
-            .map_err(|_| ConnectError::Resolve)?
-            .find_map(|a| match a {
-                SocketAddr::V4(v4) => Some(v4),
-                SocketAddr::V6(_) => None,
-            })
-            .ok_or(ConnectError::Resolve)?;
-        let mut tcp = TcpStream::connect_timeout(&SocketAddr::V4(addr), Duration::from_secs(3))
-            .map_err(|_| ConnectError::Connect)?;
+fn reject_error(reason: u8) -> ConnectError {
+    match reason {
+        REJECT_VERSION => ConnectError::Version,
+        REJECT_NOT_PAIRED => ConnectError::NotPaired,
+        REJECT_PAIRING_LOCKED => ConnectError::PairingLocked,
+        REJECT_WRONG_PIN => ConnectError::WrongPin,
+        _ => ConnectError::Refused, // REJECT_DENIED, REJECT_BUSY
+    }
+}
+
+/// TCP connect + TLS handshake (no pinning decision yet).
+fn open_channel(
+    device: &Device,
+    host: &str,
+    port: u16,
+) -> Result<(Channel, SocketAddrV4), ConnectError> {
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| ConnectError::Resolve)?
+        .find_map(|a| match a {
+            SocketAddr::V4(v4) => Some(v4),
+            SocketAddr::V6(_) => None,
+        })
+        .ok_or(ConnectError::Resolve)?;
+    let tcp = TcpStream::connect_timeout(&SocketAddr::V4(addr), Duration::from_secs(3))
+        .map_err(|_| ConnectError::Connect)?;
+    let hs = |_| ConnectError::Handshake;
+    tcp.set_nodelay(true).map_err(hs)?;
+    tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).map_err(hs)?;
+    let cfg = tls::client_config(&device.identity).map_err(|_| ConnectError::Identity)?;
+    let conn = tls::client_conn(&cfg).map_err(hs)?;
+    let ch = tls::handshake(tcp, conn).map_err(hs)?;
+    Ok((ch, addr))
+}
+
+/// A pairing in progress: the host is showing a PIN.
+pub struct Pairing {
+    ch: Channel,
+    reader: ControlReader,
+    device: Arc<Device>,
+    host_name: String,
+}
+
+/// Asks `host` to pair. On success the host is showing a PIN; get it from
+/// the user and call [`Pairing::finish`] (dropping the `Pairing` cancels).
+pub fn pair_begin(device: &Arc<Device>, host: &str, port: u16) -> Result<Pairing, ConnectError> {
+    let (mut ch, _) = open_channel(device, host, port)?;
+    let hs = |_| ConnectError::Handshake;
+    send_pair(&ch.writer, PAIR_START, device.name.as_bytes()).map_err(hs)?;
+    let mut reader = ControlReader::new();
+    match reader.read_one(&mut ch.reader).map_err(hs)? {
+        Incoming::Pair(PAIR_READY, name) => Ok(Pairing {
+            ch,
+            reader,
+            device: device.clone(),
+            host_name: clean_name(&String::from_utf8_lossy(&name)),
+        }),
+        Incoming::Control(Control::Reject { reason }) => Err(reject_error(reason)),
+        _ => Err(ConnectError::Handshake),
+    }
+}
+
+impl Pairing {
+    /// The name the host gave (shown to the user next to the PIN prompt).
+    pub fn host_name(&self) -> &str {
+        &self.host_name
+    }
+
+    pub fn host_fingerprint(&self) -> Fingerprint {
+        self.ch.peer
+    }
+
+    /// Runs the PIN exchange. On success both sides have stored each other.
+    pub fn finish(mut self, pin: &str) -> Result<Peer, ConnectError> {
         let hs = |_| ConnectError::Handshake;
-        tcp.set_nodelay(true).map_err(hs)?;
-        tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).map_err(hs)?;
+        let ch = &mut self.ch;
+        let (pake, ours) = pairing::start(false, pin, &self.device.fingerprint(), &ch.peer);
+        send_pair(&ch.writer, PAIR_PAKE, &ours).map_err(hs)?;
+        ch.reader
+            .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+            .map_err(hs)?;
+        let theirs = match self.reader.read_one(&mut ch.reader).map_err(hs)? {
+            Incoming::Pair(PAIR_PAKE, m) => m,
+            Incoming::Control(Control::Reject { reason }) => return Err(reject_error(reason)),
+            _ => return Err(ConnectError::Handshake),
+        };
+        let mut binding = [0u8; 32];
+        ch.writer
+            .export(pairing::EXPORT_LABEL, &[], &mut binding)
+            .map_err(hs)?;
+        let c = pake
+            .finish(&theirs, &binding)
+            .ok_or(ConnectError::Handshake)?;
+        send_pair(&ch.writer, PAIR_CONFIRM, &c.mac(false)).map_err(hs)?;
+        match self.reader.read_one(&mut ch.reader).map_err(hs)? {
+            Incoming::Pair(PAIR_CONFIRM, m) if c.verify(true, &m) => {}
+            Incoming::Control(Control::Reject { reason }) => return Err(reject_error(reason)),
+            _ => return Err(ConnectError::Handshake),
+        }
+        self.device
+            .add_peer(ch.peer, &self.host_name, ROLE_HOST)
+            .map_err(|_| ConnectError::Identity)?;
+        // (Drop says Bye.)
+        self.device
+            .peer_with(&ch.peer, ROLE_HOST)
+            .ok_or(ConnectError::Identity)
+    }
+}
+
+impl Drop for Pairing {
+    fn drop(&mut self) {
+        let _ = send_control(&self.ch.writer, Control::Bye);
+    }
+}
+
+impl Client {
+    /// Connects to a paired host at `host:port`, completes the handshake and
+    /// starts receiving. A host we haven't paired with gives
+    /// `ConnectError::NotPaired` before anything about us is sent.
+    pub fn connect(device: &Arc<Device>, host: &str, port: u16) -> Result<Self, ConnectError> {
+        let (mut ch, addr) = open_channel(device, host, port)?;
+        let hs = |_| ConnectError::Handshake;
+        let Some(peer) = device.peer_with(&ch.peer, ROLE_HOST) else {
+            let _ = send_control(&ch.writer, Control::Bye);
+            return Err(ConnectError::NotPaired);
+        };
         send_control(
-            &mut tcp,
+            &ch.writer,
             Control::Hello {
                 version: PROTOCOL_VERSION,
                 display_w: 0, // LATER(M7): request native resolution.
@@ -730,25 +1165,41 @@ impl Client {
             },
         )
         .map_err(hs)?;
+        ch.reader
+            .set_read_timeout(Some(APPROVAL_TIMEOUT))
+            .map_err(hs)?;
         let mut reader = ControlReader::new();
-        let (info, udp_port, session_id) = match reader.read_one(&mut tcp).map_err(hs)? {
-            Control::Welcome {
+        let (info, udp_port, session_id) = match reader.read_one(&mut ch.reader).map_err(hs)? {
+            Incoming::Control(Control::Welcome {
                 version,
                 info,
                 udp_port,
                 session_id,
-            } if version == PROTOCOL_VERSION => (info, udp_port, session_id),
-            Control::Welcome { .. } | Control::Reject { .. } => return Err(ConnectError::Version),
+            }) if version == PROTOCOL_VERSION => (info, udp_port, session_id),
+            Incoming::Control(Control::Welcome { .. }) => return Err(ConnectError::Version),
+            Incoming::Control(Control::Reject { reason }) => return Err(reject_error(reason)),
             _ => return Err(ConnectError::Handshake),
         };
+        let (from_host, to_host) = media_secrets(&ch.writer, session_id).map_err(hs)?;
         let host_udp = SocketAddrV4::new(*addr.ip(), udp_port);
         let sock = |_| ConnectError::Socket;
         let udp = udp_socket(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).map_err(sock)?;
         udp.set_read_timeout(Some(Duration::from_millis(100)))
             .map_err(sock)?;
-        let punch = encode_punch(session_id);
-        let _ = udp.send_to(&punch, host_udp);
-        tcp.set_read_timeout(Some(Duration::from_millis(20)))
+        let mut tx = InputTx {
+            sender: InputSender::new(session_id),
+            udp: udp.try_clone().map_err(sock)?,
+            dest: host_udp,
+            sealer: Sealer::new(to_host, session_id),
+            punch: encode_punch(session_id),
+            plain: [0; MAX_INPUT_DATAGRAM],
+            wire: [0; WIRE_MAX],
+            packets: 0,
+            active: false,
+        };
+        tx.send_punch();
+        ch.reader
+            .set_read_timeout(Some(Duration::from_millis(20)))
             .map_err(hs)?;
 
         let shared = Arc::new(ClientShared {
@@ -758,30 +1209,36 @@ impl Client {
             keyframe_requests: AtomicU32::new(0),
             queue_full: AtomicU64::new(0),
             rx: AtomicRx::default(),
+            crypto_bad: AtomicU64::new(0),
+            crypto_replayed: AtomicU64::new(0),
             clock_valid: AtomicBool::new(false),
             clock_offset: AtomicI64::new(0),
             clock_rtt: AtomicU32::new(0),
             last_rtt: AtomicU32::new(0),
             host_notice: std::sync::atomic::AtomicU8::new(0),
             queue: FrameQueue::new(),
-            input: Mutex::new(InputTx {
-                sender: InputSender::new(session_id),
-                udp: udp.try_clone().map_err(sock)?,
-                dest: host_udp,
-                buf: [0; MAX_INPUT_DATAGRAM],
-                packets: 0,
-                active: false,
-            }),
+            input: Mutex::new(tx),
             cursor: Mutex::new(CursorState::default()),
         });
+        let Channel {
+            reader: tls_in,
+            writer,
+            ..
+        } = ch;
         let threads = vec![
-            spawn_receiver(shared.clone(), udp, host_udp, punch),
-            spawn_control(shared.clone(), tcp, reader),
+            spawn_receiver(
+                shared.clone(),
+                udp,
+                host_udp,
+                Opener::new(from_host, session_id),
+            ),
+            spawn_control(shared.clone(), tls_in, writer, reader),
         ];
         Ok(Self {
             shared,
             info,
             host: addr,
+            peer,
             threads,
         })
     }
@@ -792,6 +1249,11 @@ impl Client {
 
     pub fn host(&self) -> SocketAddrV4 {
         self.host
+    }
+
+    /// The paired host we're connected to.
+    pub fn peer(&self) -> &Peer {
+        &self.peer
     }
 
     /// Waits up to `timeout` for the next frame. The returned bytes stay valid
@@ -881,6 +1343,8 @@ impl Client {
             input_events: events,
             input_packets: packets,
             host_notice: sh.host_notice.load(Ordering::Relaxed),
+            crypto_bad: sh.crypto_bad.load(Ordering::Relaxed),
+            crypto_replayed: sh.crypto_replayed.load(Ordering::Relaxed),
         }
     }
 
@@ -893,17 +1357,17 @@ impl Client {
     }
 }
 
-/// Datagrams -> reassembler -> queue. Re-punches every second until video
-/// flows, then every 5 s.
+/// Datagrams -> open -> reassembler -> queue. Re-punches every second until
+/// video flows, then every 5 s.
 fn spawn_receiver(
     sh: Arc<ClientShared>,
     udp: UdpSocket,
     host_udp: SocketAddrV4,
-    punch: [u8; PUNCH_SIZE],
+    mut opener: Opener,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut r = Reassembler::new();
-        let mut buf = [0u8; MAX_DATAGRAM + 64];
+        let mut buf = [0u8; WIRE_MAX + 64];
         let mut last_punch = clock::now_us();
         let host_ip = std::net::IpAddr::V4(*host_udp.ip());
         while !sh.stop.load(Ordering::Relaxed) && sh.connected.load(Ordering::Relaxed) {
@@ -914,7 +1378,7 @@ fn spawn_receiver(
                 5_000_000
             };
             if now.saturating_sub(last_punch) >= every {
-                let _ = udp.send_to(&punch, host_udp);
+                lock(&sh.input).send_punch();
                 last_punch = now;
             }
             let Ok((n, from)) = udp.recv_from(&mut buf) else {
@@ -923,7 +1387,16 @@ fn spawn_receiver(
             if from.ip() != host_ip {
                 continue;
             }
-            if let Some(f) = r.push(&buf[..n], clock::now_us()) {
+            let plain = match opener.open(&mut buf[..n]) {
+                Ok(p) => p,
+                Err(_) => {
+                    sh.crypto_bad.store(opener.stats.bad, Ordering::Relaxed);
+                    sh.crypto_replayed
+                        .store(opener.stats.replayed, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            if let Some(f) = r.push(plain, clock::now_us()) {
                 let meta = LiveFrameMeta {
                     frame_id: f.frame_id,
                     flags: f.flags,
@@ -958,7 +1431,8 @@ fn spawn_receiver(
 /// updates, disconnect detection.
 fn spawn_control(
     sh: Arc<ClientShared>,
-    mut tcp: TcpStream,
+    mut tls_in: TlsReader,
+    out: TlsWriter,
     mut reader: ControlReader,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
@@ -968,7 +1442,7 @@ fn spawn_control(
         let mut last_kf = 0u64;
         loop {
             if sh.stop.load(Ordering::Relaxed) {
-                let _ = send_control(&mut tcp, Control::Bye);
+                let _ = send_control(&out, Control::Bye);
                 break;
             }
             let now = clock::now_us();
@@ -985,14 +1459,14 @@ fn spawn_control(
                     seq,
                     client_ts: clock::now_us(),
                 };
-                ok &= send_control(&mut tcp, ping).is_ok();
+                ok &= send_control(&out, ping).is_ok();
             }
             if now.saturating_sub(last_kf) >= KEYFRAME_RETRY_US
                 && sh.want_keyframe.swap(false, Ordering::Relaxed)
             {
                 last_kf = now;
                 sh.keyframe_requests.fetch_add(1, Ordering::Relaxed);
-                ok &= send_control(&mut tcp, Control::KeyframeRequest).is_ok();
+                ok &= send_control(&out, Control::KeyframeRequest).is_ok();
             }
             {
                 let mut tx = lock(&sh.input);
@@ -1000,7 +1474,7 @@ fn spawn_control(
                     tx.flush(now);
                 }
             }
-            let r = reader.read(&mut tcp, |m| {
+            let r = reader.read(&mut tls_in, |m| {
                 match m {
                     Message::Control(Control::Pong {
                         client_ts, host_ts, ..

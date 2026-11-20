@@ -6,19 +6,22 @@
 pub mod annexb;
 pub mod clock;
 pub mod ffi;
+pub mod identity;
 pub mod input;
 pub mod keymap;
 pub mod net;
 pub mod packet;
+pub mod pairing;
 pub mod protocol;
 pub mod recording;
 pub mod replay;
+pub mod seal;
 pub mod stats;
+mod tls;
 
 /// Crate version, e.g. "0.0.1".
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // LATER(M4): Reed-Solomon FEC over packet groups.
 // LATER(M5): adaptive jitter buffer.
-// LATER(M6): pairing (PAKE), TLS exporter key derivation, AES-GCM + replay window.
 // LATER(M7): content-aware rate-control decisions.

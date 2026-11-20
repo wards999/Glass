@@ -12,6 +12,15 @@ public struct ConnectFailure: Error, CustomStringConvertible {
     public let code: Int32
     public let host: String
 
+    public init(code: Int32, host: String) {
+        self.code = code
+        self.host = host
+    }
+
+    /// Pair first (unknown host, or the host doesn't know this Mac).
+    public var needsPairing: Bool { code == 6 }
+    public var wrongPin: Bool { code == 8 }
+
     // Codes are GLASS_ConnectError values (core/src/net.rs). Matched as
     // literals: the C enum's typedef is int32_t before C23.
     public var description: String {
@@ -21,11 +30,21 @@ public struct ConnectFailure: Error, CustomStringConvertible {
         case 2: // GLASS_ConnectError_Connect
             return "Couldn't reach Glass on \(host). Is host.cmd running on the PC, and is glass.exe allowed through Windows Firewall (Windows Security > Firewall > Allow an app)? Both machines must be on the same network."
         case 3: // GLASS_ConnectError_Handshake
-            return "Reached \(host), but the Glass handshake failed."
+            return "Reached \(host), but the secure handshake failed. Make sure the PC and the Mac run the same Glass test build (zip and dmg from one release)."
         case 4: // GLASS_ConnectError_Version
             return "The PC runs a different Glass version. Use the zip and dmg from the same test build."
         case 5: // GLASS_ConnectError_Socket
             return "Couldn't open a UDP socket."
+        case 6: // GLASS_ConnectError_NotPaired
+            return "This Mac isn't paired with \(host) (or the PC has forgotten it)."
+        case 7: // GLASS_ConnectError_Refused
+            return "\(host) didn't allow the connection."
+        case 8: // GLASS_ConnectError_WrongPin
+            return "That PIN wasn't right, or it expired. Use the PIN the PC is showing now."
+        case 9: // GLASS_ConnectError_PairingLocked
+            return "Too many wrong PINs, so the PC has switched pairing off. Restart host.cmd on the PC, then pair again."
+        case 10: // GLASS_ConnectError_Identity
+            return "Couldn't read or create this Mac's Glass identity in ~/Library/Application Support/Glass."
         default:
             return "Connecting to \(host) failed (error \(code))."
         }
@@ -49,16 +68,24 @@ public final class GlassClient {
     public let info: GLASS_StreamInfo
     public let host: String
     public let port: UInt16
+    /// The paired host's name ("QUIETPC22").
+    public let hostName: String
 
     public static let defaultPort = UInt16(GLASS_DEFAULT_PORT)
 
-    public init(host: String, port: UInt16 = GlassClient.defaultPort) throws {
+    /// Connects to a paired host (TLS with pinned certificates; encrypted
+    /// media). Throws `ConnectFailure` with `needsPairing` if not paired.
+    public init(host: String, port: UInt16 = GlassClient.defaultPort, device: GlassDevice? = GlassDevice.shared) throws {
+        guard let device else { throw ConnectFailure(code: 10, host: host) }
         var err: Int32 = 0
-        guard let p = glass_client_connect(host, port, &err) else {
+        guard let p = glass_client_connect(device.ptr, host, port, &err) else {
             throw ConnectFailure(code: err, host: host)
         }
         ptr = p
         info = glass_client_info(p)
+        var name = [CChar](repeating: 0, count: 128)
+        glass_client_host_name(p, &name, name.count)
+        hostName = String(cString: name)
         self.host = host
         self.port = port
     }
@@ -164,16 +191,17 @@ public final class GlassClient {
     }
 }
 
-/// Serves a recording as a live stream on loopback (tests, demos). Logs the
-/// input it receives and sends a 16x16 test pointer.
+/// Serves a recording as a live stream on loopback (tests, demos), as an
+/// in-memory host "Glass test host" that pairs with the fixed `pin`. Logs
+/// the input it receives and sends a 16x16 test pointer.
 public final class ReplayHost {
     private var ptr: OpaquePointer?
     public let port: UInt16
 
-    public init(data: Data, port: UInt16 = 0) throws {
+    public init(data: Data, pin: String, port: UInt16 = 0) throws {
         var out: UInt16 = 0
         let p = data.withUnsafeBytes { raw in
-            glass_replay_start(raw.bindMemory(to: UInt8.self).baseAddress, raw.count, port, &out)
+            glass_replay_start(raw.bindMemory(to: UInt8.self).baseAddress, raw.count, port, pin, &out)
         }
         guard let p else { throw GlassError.recording(-2) }
         ptr = p

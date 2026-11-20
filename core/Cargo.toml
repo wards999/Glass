@@ -12,5 +12,9 @@ name = "glass_core"
 crate-type = ["rlib", "staticlib"]
 
 [dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # UDP socket buffer sizes (std has no SO_RCVBUF/SO_SNDBUF).
 socket2 = "0.6"
+spake2 = "0.4"

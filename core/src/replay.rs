@@ -7,10 +7,13 @@
 //! client only. A keyframe request restarts from the first frame (an IDR).
 //! Input from the viewer is logged (not injected) and a test pointer shape is
 //! sent, so the input and cursor paths can be checked without a desktop.
+//! It's a real host: viewers must pair (with `HostOptions::fixed_pin` for
+//! scripted tests) and everything is encrypted as in a live session.
 
 use crate::clock;
+use crate::identity::Device;
 use crate::input::{InputAction, InputCounters};
-use crate::net::{HostListener, HostSession};
+use crate::net::{HostListener, HostOptions, HostSession};
 use crate::packet::OutFrame;
 use crate::protocol::{CursorShape, StreamInfo};
 use crate::recording::{RecordingReader, CODEC_HEVC};
@@ -39,8 +42,14 @@ pub struct Replay {
 
 impl Replay {
     /// Starts serving `data` (a whole `.glsr` file) on `port` (0 = any free
-    /// port). Serves one viewer at a time, looping the recording, until dropped.
-    pub fn start(data: Vec<u8>, port: u16) -> io::Result<Self> {
+    /// port, loopback only) as `device`. Serves one viewer at a time, looping
+    /// the recording, until dropped.
+    pub fn start(
+        data: Vec<u8>,
+        port: u16,
+        device: Arc<Device>,
+        opts: HostOptions,
+    ) -> io::Result<Self> {
         let reader = RecordingReader::new(&data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))?;
         let h = reader.header;
@@ -58,10 +67,10 @@ impl Replay {
             fps: h.fps as u16,
         };
         // Loopback only when testing on a random port; LAN otherwise.
-        let listener = if port == 0 {
-            HostListener::bind_on(std::net::Ipv4Addr::LOCALHOST, 0)?
+        let mut listener = if port == 0 {
+            HostListener::bind_on(std::net::Ipv4Addr::LOCALHOST, 0, device, opts)?
         } else {
-            HostListener::bind(port)?
+            HostListener::bind(port, device, opts)?
         };
         let port = listener.port();
         let stop = Arc::new(AtomicBool::new(false));
@@ -76,7 +85,7 @@ impl Replay {
                         l.log.push(a);
                     }
                 });
-                let Ok(mut session) = listener.accept(info, sink) else {
+                let Ok(Some(mut session)) = listener.accept(info, sink) else {
                     continue;
                 };
                 if st.load(Ordering::Relaxed) {
@@ -205,7 +214,8 @@ impl Drop for Replay {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::{Client, Wait};
+    use crate::identity::ROLE_VIEWER;
+    use crate::net::{pair_begin, Client, ConnectError, HostEvent, Wait};
     use crate::protocol::FLAG_IDR;
     use crate::recording::{FrameMeta, RecordingHeader, RecordingWriter, CHROMA_444};
 
@@ -241,6 +251,56 @@ mod tests {
         (w.into_inner(), datas)
     }
 
+    const PIN: &str = "246810";
+
+    type Events = Arc<Mutex<Vec<HostEvent>>>;
+    type Ask = Option<crate::net::AskFn>;
+
+    /// A replay host with a fixed PIN, recording its events.
+    fn host(file: Vec<u8>) -> (Replay, Arc<Device>, Events) {
+        host_with(file, None)
+    }
+
+    fn host_with(file: Vec<u8>, ask: Ask) -> (Replay, Arc<Device>, Events) {
+        let dev = Device::ephemeral("Test host").unwrap();
+        let events: Events = Arc::default();
+        let ev = events.clone();
+        let opts = HostOptions {
+            fixed_pin: Some(PIN.into()),
+            ask,
+            events: Box::new(move |e| ev.lock().unwrap().push(e)),
+        };
+        (
+            Replay::start(file, 0, dev.clone(), opts).unwrap(),
+            dev,
+            events,
+        )
+    }
+
+    fn wait_for(events: &Events, f: impl Fn(&HostEvent) -> bool) -> bool {
+        let deadline = clock::now_us() + 2_000_000;
+        while clock::now_us() < deadline {
+            if events.lock().unwrap().iter().any(&f) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// A new viewer identity, paired with `r`.
+    fn viewer(r: &Replay) -> Arc<Device> {
+        let v = Device::ephemeral("Test viewer").unwrap();
+        let p = pair_begin(&v, "127.0.0.1", r.port()).unwrap();
+        assert_eq!(p.host_name(), "Test host");
+        p.finish(PIN).unwrap();
+        v
+    }
+
+    fn connect(r: &Replay) -> Client {
+        Client::connect(&viewer(r), "127.0.0.1", r.port()).unwrap()
+    }
+
     fn take(c: &Client, n: usize) -> Vec<(crate::net::LiveFrameMeta, Vec<u8>)> {
         let mut got = Vec::new();
         let deadline = clock::now_us() + 10_000_000;
@@ -260,8 +320,8 @@ mod tests {
     #[test]
     fn loopback_stream_is_bit_exact() {
         let (file, datas) = recording(30);
-        let replay = Replay::start(file, 0).unwrap();
-        let c = Client::connect("127.0.0.1", replay.port()).unwrap();
+        let (replay, _, _) = host(file);
+        let c = connect(&replay);
         assert_eq!(c.info().chroma, CHROMA_444);
         assert_eq!((c.info().width, c.info().height), (320, 192));
         let got = take(&c, datas.len());
@@ -297,8 +357,8 @@ mod tests {
     #[test]
     fn keyframe_request_restarts_from_idr() {
         let (file, datas) = recording(240); // 2 s at 120 fps
-        let replay = Replay::start(file, 0).unwrap();
-        let c = Client::connect("127.0.0.1", replay.port()).unwrap();
+        let (replay, _, _) = host(file);
+        let c = connect(&replay);
         let first = take(&c, 5);
         assert_eq!(first.len(), 5);
         c.request_keyframe();
@@ -315,9 +375,10 @@ mod tests {
     #[test]
     fn second_viewer_after_first_leaves() {
         let (file, datas) = recording(10);
-        let replay = Replay::start(file, 0).unwrap();
+        let (replay, _, _) = host(file);
+        let v = viewer(&replay);
         for _ in 0..2 {
-            let c = Client::connect("127.0.0.1", replay.port()).unwrap();
+            let c = Client::connect(&v, "127.0.0.1", replay.port()).unwrap();
             let got = take(&c, 3);
             assert_eq!(got.len(), 3);
             assert_eq!(got[0].1, datas[0]);
@@ -328,8 +389,8 @@ mod tests {
     fn input_and_cursor_round_trip() {
         use crate::input::{InputAction as A, BUTTON_LEFT};
         let (file, _) = recording(240);
-        let replay = Replay::start(file, 0).unwrap();
-        let c = Client::connect("127.0.0.1", replay.port()).unwrap();
+        let (replay, _, _) = host(file);
+        let c = connect(&replay);
         assert_eq!(take(&c, 2).len(), 2); // streaming
         c.input_move(100, 200);
         c.input_key(0xE0, true); // LCtrl
@@ -418,9 +479,149 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
+        let v = Device::ephemeral("v").unwrap();
         assert_eq!(
-            Client::connect("127.0.0.1", port).err(),
-            Some(crate::net::ConnectError::Connect)
+            Client::connect(&v, "127.0.0.1", port).err(),
+            Some(ConnectError::Connect)
         );
+    }
+
+    #[test]
+    fn unpaired_devices_get_nothing() {
+        let (file, _) = recording(30);
+        let (replay, host_dev, events) = host(file);
+        let port = replay.port();
+        // A viewer that never paired: it doesn't trust the host, so it stops
+        // after TLS without sending anything about itself.
+        let stranger = Device::ephemeral("Stranger").unwrap();
+        assert_eq!(
+            Client::connect(&stranger, "127.0.0.1", port).err(),
+            Some(ConnectError::NotPaired)
+        );
+        // A viewer that trusts the host, but the host has forgotten it.
+        let v = viewer(&replay);
+        assert!(host_dev.forget(&v.fingerprint()).unwrap());
+        assert_eq!(
+            Client::connect(&v, "127.0.0.1", port).err(),
+            Some(ConnectError::NotPaired)
+        );
+        // (The host reports it just after replying.)
+        assert!(wait_for(&events, |e| matches!(
+            e,
+            HostEvent::Refused { .. }
+        )));
+        // No session ever started, so no input was applied.
+        assert!(replay.input_log().is_empty());
+        // Pairing again restores access.
+        let p = pair_begin(&v, "127.0.0.1", port).unwrap();
+        p.finish(PIN).unwrap();
+        assert!(host_dev.peer_with(&v.fingerprint(), ROLE_VIEWER).is_some());
+        let c = Client::connect(&v, "127.0.0.1", port).unwrap();
+        assert_eq!(c.peer().name, "Test host");
+        assert_eq!(take(&c, 2).len(), 2);
+    }
+
+    #[test]
+    fn a_different_host_at_the_same_address_is_not_trusted() {
+        let (file, _) = recording(10);
+        let (a, _, _) = host(file.clone());
+        let v = viewer(&a);
+        drop(a);
+        // Another machine (new identity) now answers where `v` connects.
+        let (b, _, _) = host(file);
+        assert_eq!(
+            Client::connect(&v, "127.0.0.1", b.port()).err(),
+            Some(ConnectError::NotPaired)
+        );
+    }
+
+    #[test]
+    fn wrong_pins_are_limited() {
+        let (file, _) = recording(10);
+        let (replay, host_dev, events) = host(file);
+        let port = replay.port();
+        let v = Device::ephemeral("Guesser").unwrap();
+        let mut wrong = 0;
+        loop {
+            match pair_begin(&v, "127.0.0.1", port).map(|p| p.finish("000000")) {
+                Ok(Err(ConnectError::WrongPin)) => wrong += 1,
+                Ok(Err(ConnectError::PairingLocked)) | Err(ConnectError::PairingLocked) => break,
+                other => panic!("unexpected {:?}", other.map(|r| r.map(|p| p.name))),
+            }
+            assert!(wrong < 20, "never locked");
+        }
+        // The 10th wrong guess is answered with "locked".
+        assert_eq!(wrong, crate::pairing::WRONG_TOTAL - 1);
+        // Even the right PIN is refused now, and nothing was stored.
+        assert_eq!(
+            pair_begin(&v, "127.0.0.1", port).err(),
+            Some(ConnectError::PairingLocked)
+        );
+        assert!(host_dev.peers().is_empty());
+        assert!(v.peers().is_empty());
+        assert!(wait_for(&events, |e| matches!(e, HostEvent::PairingLocked)));
+        assert!(wait_for(&events, |e| matches!(
+            e,
+            HostEvent::WrongPin { .. }
+        )));
+    }
+
+    #[test]
+    fn cancelled_pairing_and_right_pin_after_wrong() {
+        let (file, _) = recording(10);
+        let (replay, _, _) = host(file);
+        let v = Device::ephemeral("v").unwrap();
+        // Begin and walk away (the PIN prompt was cancelled).
+        drop(pair_begin(&v, "127.0.0.1", replay.port()).unwrap());
+        let p = pair_begin(&v, "127.0.0.1", replay.port()).unwrap();
+        assert_eq!(p.finish("123123").err(), Some(ConnectError::WrongPin));
+        let p = pair_begin(&v, "127.0.0.1", replay.port()).unwrap();
+        assert_eq!(p.finish(PIN).unwrap().name, "Test host");
+        assert!(Client::connect(&v, "127.0.0.1", replay.port()).is_ok());
+    }
+
+    #[test]
+    fn ask_before_connecting() {
+        let (file, _) = recording(10);
+        let allow = Arc::new(AtomicBool::new(false));
+        let a = allow.clone();
+        let (replay, _, events) =
+            host_with(file, Some(Box::new(move |_| a.load(Ordering::Relaxed))));
+        let v = viewer(&replay);
+        assert_eq!(
+            Client::connect(&v, "127.0.0.1", replay.port()).err(),
+            Some(ConnectError::Refused)
+        );
+        assert!(wait_for(
+            &events,
+            |e| matches!(e, HostEvent::Denied { device } if device == "Test viewer")
+        ));
+        allow.store(true, Ordering::Relaxed);
+        assert!(Client::connect(&v, "127.0.0.1", replay.port()).is_ok());
+    }
+
+    #[test]
+    fn forged_udp_is_ignored() {
+        use crate::input::{InputSender, MAX_INPUT_DATAGRAM};
+        let (file, _) = recording(240);
+        let (replay, _, _) = host(file);
+        let c = connect(&replay);
+        assert_eq!(take(&c, 2).len(), 2);
+        // Plaintext input (any session id) and junk straight at the host's
+        // UDP port, from the viewer's own address.
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for sid in 0..50u32 {
+            let mut sender = InputSender::new(sid);
+            sender.key(clock::now_us(), 0x04, true);
+            let mut buf = [0u8; MAX_INPUT_DATAGRAM];
+            let (n, _) = sender.build(clock::now_us(), &mut buf);
+            s.send_to(&buf[..n], ("127.0.0.1", replay.port())).unwrap();
+            s.send_to(&[1u8; 200], ("127.0.0.1", replay.port()))
+                .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(replay.input_log().is_empty(), "forged input applied");
+        // The real session is unaffected.
+        assert_eq!(take(&c, 5).len(), 5);
     }
 }

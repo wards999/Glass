@@ -3,14 +3,50 @@
 //! constructors and their `_free`/`_close`/`_stop` counterparts.
 
 use crate::annexb;
+use crate::identity::{default_dir, Device};
 use crate::keymap::{self, ModifierRule};
-use crate::net::{Client, ClientStats, ConnectError, CursorInfo, LiveFrameMeta, Wait};
+use crate::net::{
+    pair_begin, Client, ClientStats, ConnectError, CursorInfo, HostOptions, LiveFrameMeta, Pairing,
+    Wait,
+};
 use crate::protocol::StreamInfo;
 use crate::recording::{self, FrameMeta, RecordingHeader};
 use crate::replay::Replay;
 use crate::stats::{StatRing, Summary};
 use std::ffi::{c_char, CStr};
+use std::sync::Arc;
 use std::time::Duration;
+
+/// This machine's identity and paired devices (opaque).
+pub struct DeviceHandle(Arc<Device>);
+
+/// Copies `s` into `buf` as a NUL-terminated string (truncated to fit).
+/// Returns the full length in bytes (without the NUL).
+unsafe fn copy_str(s: &str, buf: *mut c_char, len: usize) -> usize {
+    if !buf.is_null() && len > 0 {
+        let mut n = s.len().min(len - 1);
+        while !s.is_char_boundary(n) {
+            n -= 1;
+        }
+        std::ptr::copy_nonoverlapping(s.as_ptr(), buf.cast(), n);
+        *buf.add(n) = 0;
+    }
+    s.len()
+}
+
+unsafe fn str_arg<'a>(p: *const c_char) -> Option<&'a str> {
+    if p.is_null() {
+        None
+    } else {
+        CStr::from_ptr(p).to_str().ok()
+    }
+}
+
+unsafe fn set_err(err: *mut i32, v: i32) {
+    if !err.is_null() {
+        *err = v;
+    }
+}
 
 static VERSION_C: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
@@ -206,44 +242,221 @@ pub extern "C" fn glass_clock_now_us() -> u64 {
     crate::clock::now_us()
 }
 
-// --- Live viewer ------------------------------------------------------------
+// --- Device identity and paired devices -----------------------------------
 
-/// Connects to a host. Returns null on failure and sets `*err` to a
-/// `GLASS_ConnectError` value. Free with `glass_client_close`.
+/// Opens (creating on first run) this machine's identity in `dir`, or the
+/// default folder (`GLASS_HOME`, else ~/Library/Application Support/Glass)
+/// when `dir` is null. `name` is how other devices will see this one.
+/// Returns null on failure. Free with `glass_device_free`.
 ///
 /// # Safety
-/// `host` must be a NUL-terminated string; `err` must be valid for writes or null.
+/// `dir` (or null) and `name` must be NUL-terminated strings.
+#[no_mangle]
+pub unsafe extern "C" fn glass_device_open(
+    dir: *const c_char,
+    name: *const c_char,
+) -> *mut DeviceHandle {
+    let dir = match str_arg(dir) {
+        Some(d) => std::path::PathBuf::from(d),
+        None => match default_dir() {
+            Some(d) => d,
+            None => return std::ptr::null_mut(),
+        },
+    };
+    let name = str_arg(name).unwrap_or("Mac");
+    match Device::open(&dir, name, None) {
+        Ok(d) => Box::into_raw(Box::new(DeviceHandle(d))),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// # Safety
+/// `d` must come from `glass_device_open` (or be null) and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn glass_device_free(d: *mut DeviceHandle) {
+    if !d.is_null() {
+        drop(Box::from_raw(d));
+    }
+}
+
+/// Writes this device's 32-byte certificate fingerprint to `out`.
+///
+/// # Safety
+/// `d` from `glass_device_open`; `out` valid for 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn glass_device_fingerprint(d: *const DeviceHandle, out: *mut u8) {
+    std::ptr::copy_nonoverlapping((*d).0.fingerprint().as_ptr(), out, 32);
+}
+
+/// Number of paired devices (re-read from disk).
+///
+/// # Safety
+/// `d` must come from `glass_device_open`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_device_peer_count(d: *const DeviceHandle) -> u32 {
+    (*d).0.peers().len() as u32
+}
+
+/// Paired device `index`: writes its fingerprint (32 bytes) to `fp_out` and
+/// its name (NUL-terminated, truncated to `name_len`) to `name`. Returns its
+/// roles (`GLASS_ROLE_*` bits), or 0 if `index` is out of range.
+///
+/// # Safety
+/// `d` from `glass_device_open`; `fp_out` valid for 32 bytes; `name` valid
+/// for `name_len` bytes (or null).
+#[no_mangle]
+pub unsafe extern "C" fn glass_device_peer(
+    d: *const DeviceHandle,
+    index: u32,
+    fp_out: *mut u8,
+    name: *mut c_char,
+    name_len: usize,
+) -> u8 {
+    let peers = (*d).0.peers();
+    let Some(p) = peers.get(index as usize) else {
+        return 0;
+    };
+    if !fp_out.is_null() {
+        std::ptr::copy_nonoverlapping(p.fingerprint.as_ptr(), fp_out, 32);
+    }
+    copy_str(&p.name, name, name_len);
+    p.roles
+}
+
+/// Unpairs the device with this fingerprint. False if it wasn't paired.
+///
+/// # Safety
+/// `d` from `glass_device_open`; `fp` valid for 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn glass_device_forget(d: *const DeviceHandle, fp: *const u8) -> bool {
+    let mut f = [0u8; 32];
+    std::ptr::copy_nonoverlapping(fp, f.as_mut_ptr(), 32);
+    (*d).0.forget(&f).unwrap_or(false)
+}
+
+// --- Pairing ------------------------------------------------------------------
+
+/// Asks `host` to pair; on success the host is showing a PIN. Returns null
+/// and sets `*err` (`GLASS_ConnectError`) on failure. Finish with
+/// `glass_pair_finish` or cancel with `glass_pairing_cancel`.
+///
+/// # Safety
+/// `d` from `glass_device_open`; `host` NUL-terminated; `err` valid or null.
+#[no_mangle]
+pub unsafe extern "C" fn glass_pair_begin(
+    d: *const DeviceHandle,
+    host: *const c_char,
+    port: u16,
+    err: *mut i32,
+) -> *mut Pairing {
+    let Some(host) = str_arg(host) else {
+        set_err(err, ConnectError::Resolve as i32);
+        return std::ptr::null_mut();
+    };
+    match pair_begin(&(*d).0, host, port) {
+        Ok(p) => {
+            set_err(err, 0);
+            Box::into_raw(Box::new(p))
+        }
+        Err(e) => {
+            set_err(err, e as i32);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The host's name (NUL-terminated into `buf`); returns its full length.
+///
+/// # Safety
+/// `p` from `glass_pair_begin`; `buf` valid for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn glass_pairing_host_name(
+    p: *const Pairing,
+    buf: *mut c_char,
+    len: usize,
+) -> usize {
+    copy_str((*p).host_name(), buf, len)
+}
+
+/// Runs the PIN exchange and frees `p`. True = paired (both sides stored
+/// each other); false sets `*err` (e.g. `GLASS_ConnectError_WrongPin`).
+///
+/// # Safety
+/// `p` from `glass_pair_begin`, not used afterwards; `pin` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn glass_pair_finish(
+    p: *mut Pairing,
+    pin: *const c_char,
+    err: *mut i32,
+) -> bool {
+    let p = Box::from_raw(p);
+    let pin = str_arg(pin).unwrap_or("");
+    match p.finish(pin) {
+        Ok(_) => {
+            set_err(err, 0);
+            true
+        }
+        Err(e) => {
+            set_err(err, e as i32);
+            false
+        }
+    }
+}
+
+/// Cancels a pairing (the host stops waiting) and frees `p`.
+///
+/// # Safety
+/// `p` from `glass_pair_begin` (or null), not used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn glass_pairing_cancel(p: *mut Pairing) {
+    if !p.is_null() {
+        drop(Box::from_raw(p));
+    }
+}
+
+// --- Live viewer ------------------------------------------------------------
+
+/// Connects to a paired host. Returns null on failure and sets `*err` to a
+/// `GLASS_ConnectError` value (`NotPaired`: pair first). Free with
+/// `glass_client_close`.
+///
+/// # Safety
+/// `d` from `glass_device_open`; `host` must be a NUL-terminated string;
+/// `err` must be valid for writes or null.
 #[no_mangle]
 pub unsafe extern "C" fn glass_client_connect(
+    d: *const DeviceHandle,
     host: *const c_char,
     port: u16,
     err: *mut i32,
 ) -> *mut Client {
-    let set = |e: ConnectError| {
-        if !err.is_null() {
-            *err = e as i32;
-        }
-    };
-    if host.is_null() {
-        set(ConnectError::Resolve);
-        return std::ptr::null_mut();
-    }
-    let Ok(host) = CStr::from_ptr(host).to_str() else {
-        set(ConnectError::Resolve);
+    let Some(host) = str_arg(host) else {
+        set_err(err, ConnectError::Resolve as i32);
         return std::ptr::null_mut();
     };
-    match Client::connect(host, port) {
+    match Client::connect(&(*d).0, host, port) {
         Ok(c) => {
-            if !err.is_null() {
-                *err = 0;
-            }
+            set_err(err, 0);
             Box::into_raw(Box::new(c))
         }
         Err(e) => {
-            set(e);
+            set_err(err, e as i32);
             std::ptr::null_mut()
         }
     }
+}
+
+/// The connected host's paired name (NUL-terminated into `buf`).
+///
+/// # Safety
+/// `c` from `glass_client_connect`; `buf` valid for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_host_name(
+    c: *const Client,
+    buf: *mut c_char,
+    len: usize,
+) -> usize {
+    copy_str(&(*c).peer().name, buf, len)
 }
 
 /// # Safety
@@ -416,18 +629,29 @@ pub unsafe extern "C" fn glass_client_close(c: *mut Client) {
 // --- Replay host (tests) ----------------------------------------------------
 
 /// Serves a `.glsr` file (copied) as a live stream on `port` (0 = any free
-/// port; the chosen one is written to `*out_port`). Returns null on error.
+/// port; the chosen one is written to `*out_port`), as a new in-memory host
+/// identity "Glass test host" that pairs with the fixed PIN `pin`. Returns
+/// null on error.
 ///
 /// # Safety
-/// `buf` must point to `len` readable bytes; `out_port` valid for writes or null.
+/// `buf` must point to `len` readable bytes; `pin` NUL-terminated;
+/// `out_port` valid for writes or null.
 #[no_mangle]
 pub unsafe extern "C" fn glass_replay_start(
     buf: *const u8,
     len: usize,
     port: u16,
+    pin: *const c_char,
     out_port: *mut u16,
 ) -> *mut Replay {
-    match Replay::start(slice(buf, len).to_vec(), port) {
+    let Ok(dev) = Device::ephemeral("Glass test host") else {
+        return std::ptr::null_mut();
+    };
+    let opts = HostOptions {
+        fixed_pin: str_arg(pin).map(str::to_string),
+        ..Default::default()
+    };
+    match Replay::start(slice(buf, len).to_vec(), port, dev, opts) {
         Ok(r) => {
             if !out_port.is_null() {
                 *out_port = r.port();
@@ -540,10 +764,95 @@ mod tests {
             .unwrap()
             .port();
         let mut err = 0;
-        let c = unsafe { glass_client_connect(c"127.0.0.1".as_ptr(), port, &mut err) };
-        assert!(c.is_null());
-        assert_eq!(err, ConnectError::Connect as i32);
-        unsafe { glass_client_close(c) }; // null is fine
+        let dir = std::env::temp_dir().join(format!("glass-ffi-{}", std::process::id()));
+        let dir_c = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        unsafe {
+            let d = glass_device_open(dir_c.as_ptr(), c"FFI test".as_ptr());
+            assert!(!d.is_null());
+            let c = glass_client_connect(d, c"127.0.0.1".as_ptr(), port, &mut err);
+            assert!(c.is_null());
+            assert_eq!(err, ConnectError::Connect as i32);
+            glass_client_close(c); // null is fine
+            glass_device_free(d);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(glass_clock_now_us() > 0);
+    }
+
+    #[test]
+    fn pair_and_connect_over_ffi() {
+        // Smallest valid recording: one frame.
+        let h = RecordingHeader {
+            codec: CODEC_HEVC,
+            chroma: CHROMA_420,
+            width: 64,
+            height: 32,
+            fps: 60,
+        };
+        let mut w = RecordingWriter::new(Vec::new(), &h).unwrap();
+        w.write_frame(
+            &FrameMeta {
+                frame_id: 0,
+                flags: crate::protocol::FLAG_IDR,
+                len: 5,
+                ..Default::default()
+            },
+            &[0, 0, 1, 0x26, 1],
+        )
+        .unwrap();
+        let buf = w.into_inner();
+        let dir = std::env::temp_dir().join(format!("glass-ffi-pair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir_c = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        unsafe {
+            let mut port = 0u16;
+            let r = glass_replay_start(buf.as_ptr(), buf.len(), 0, c"135790".as_ptr(), &mut port);
+            assert!(!r.is_null());
+            let d = glass_device_open(dir_c.as_ptr(), c"FFI viewer".as_ptr());
+            let mut err = 0;
+            // Not paired yet.
+            let c = glass_client_connect(d, c"127.0.0.1".as_ptr(), port, &mut err);
+            assert!(c.is_null());
+            assert_eq!(err, ConnectError::NotPaired as i32);
+            // Wrong PIN, then the right one.
+            let p = glass_pair_begin(d, c"127.0.0.1".as_ptr(), port, &mut err);
+            assert!(!p.is_null());
+            assert!(!glass_pair_finish(p, c"000000".as_ptr(), &mut err));
+            assert_eq!(err, ConnectError::WrongPin as i32);
+            let p = glass_pair_begin(d, c"127.0.0.1".as_ptr(), port, &mut err);
+            let mut name = [0 as c_char; 64];
+            glass_pairing_host_name(p, name.as_mut_ptr(), name.len());
+            assert_eq!(
+                CStr::from_ptr(name.as_ptr()).to_str().unwrap(),
+                "Glass test host"
+            );
+            assert!(
+                glass_pair_finish(p, c"135790".as_ptr(), &mut err),
+                "err {err}"
+            );
+            assert_eq!(glass_device_peer_count(d), 1);
+            let mut fp = [0u8; 32];
+            let roles = glass_device_peer(d, 0, fp.as_mut_ptr(), name.as_mut_ptr(), name.len());
+            assert_eq!(roles, crate::identity::ROLE_HOST);
+            assert_eq!(
+                glass_device_peer(d, 1, fp.as_mut_ptr(), name.as_mut_ptr(), 64),
+                0
+            );
+            // Connect works now and knows the host's name.
+            let c = glass_client_connect(d, c"127.0.0.1".as_ptr(), port, &mut err);
+            assert!(!c.is_null(), "err {err}");
+            glass_client_host_name(c, name.as_mut_ptr(), name.len());
+            assert_eq!(
+                CStr::from_ptr(name.as_ptr()).to_str().unwrap(),
+                "Glass test host"
+            );
+            glass_client_close(c);
+            // Forget: back to not paired.
+            assert!(glass_device_forget(d, fp.as_ptr()));
+            assert_eq!(glass_device_peer_count(d), 0);
+            glass_device_free(d);
+            glass_replay_stop(r);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

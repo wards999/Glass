@@ -6,7 +6,8 @@ import GlassKit
 // Ways in:
 //  - Finder:    open Glass.app -> connect window (live viewer, M2) or a recording (M1)
 //  - Terminal:  GlassMac play FILE.glsr [--bench]           recording bench + playback
-//               GlassMac connect HOST[:PORT] [--seconds S]  live viewer, results printed
+//               GlassMac connect HOST[:PORT] [--pin PIN] [--seconds S]
+//                                                live viewer (pairs first with --pin), results printed
 
 let args = Array(CommandLine.arguments.dropFirst()).filter { !$0.hasPrefix("-psn_") }
 let app = NSApplication.shared
@@ -18,8 +19,9 @@ func usage() {
     usage:
       GlassMac play FILE.glsr            decode bench, then playback in a window
       GlassMac play FILE.glsr --bench    decode bench only (no window)
-      GlassMac connect HOST[:PORT] [--seconds S]
-                                         live viewer; prints results when it ends
+      GlassMac connect HOST[:PORT] [--pin PIN] [--seconds S]
+                                         live viewer; prints results when it ends.
+                                         Not paired yet: --pin with the PIN the host shows.
     Or open Glass.app and connect to the PC (run host.cmd there).
     """)
 }
@@ -46,9 +48,19 @@ if args.first == "play", args.count >= 2 {
         port = p
         host = String(host[..<i])
     }
-    let seconds = args.firstIndex(of: "--seconds").flatMap { i in args.dropFirst(i + 1).first.flatMap { Double($0) } }
+    func value(_ flag: String) -> String? { args.firstIndex(of: flag).flatMap { args.dropFirst($0 + 1).first } }
+    let seconds = value("--seconds").flatMap { Double($0) }
     do {
-        let client = try GlassClient(host: host, port: port)
+        let client: GlassClient
+        do {
+            client = try GlassClient(host: host, port: port)
+        } catch let f as ConnectFailure where f.needsPairing {
+            guard let pin = value("--pin"), let device = GlassDevice.shared else { throw f }
+            let pairing = try GlassPairing(device: device, host: host, port: port)
+            print("Pairing with \"\(pairing.hostName)\" …")
+            try pairing.finish(pin: pin)
+            client = try GlassClient(host: host, port: port)
+        }
         let viewer = try LiveViewer(client: client)
         viewer.onFinish = { print($0); exit(0) }
         app.setActivationPolicy(.regular)

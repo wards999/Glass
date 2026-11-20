@@ -97,14 +97,43 @@ final class PipelineTests: XCTestCase {
 /// Live path over loopback: core's replay host streams a fixture, GlassClient
 /// receives it (same code the viewer uses), VideoToolbox decodes it.
 final class LiveTests: XCTestCase {
+    static let pin = "135790"
+
+    /// A fresh identity in a temporary folder (never the user's real one).
+    func tempDevice() throws -> GlassDevice {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("glass-test-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        return try XCTUnwrap(GlassDevice(directory: dir.path, name: "Test Mac"))
+    }
+
+    /// Pairs a new identity with `host` (checking the refusals on the way) and connects.
+    func pairedClient(_ host: ReplayHost) throws -> GlassClient {
+        let device = try tempDevice()
+        XCTAssertThrowsError(try GlassClient(host: "127.0.0.1", port: host.port, device: device)) { e in
+            XCTAssertTrue((e as? ConnectFailure)?.needsPairing ?? false, "\(e)")
+        }
+        let wrong = try GlassPairing(device: device, host: "127.0.0.1", port: host.port)
+        XCTAssertThrowsError(try wrong.finish(pin: "000000")) { e in
+            XCTAssertTrue((e as? ConnectFailure)?.wrongPin ?? false, "\(e)")
+        }
+        let p = try GlassPairing(device: device, host: "127.0.0.1", port: host.port)
+        XCTAssertEqual(p.hostName, "Glass test host")
+        try p.finish(pin: LiveTests.pin)
+        XCTAssertEqual(device.peers.count, 1)
+        XCTAssertTrue(device.peers[0].isHost)
+        let c = try GlassClient(host: "127.0.0.1", port: host.port, device: device)
+        XCTAssertEqual(c.hostName, "Glass test host")
+        return c
+    }
+
     func testLoopbackStreamDecodes() throws {
         for name in ["testsrc-420", "testsrc-444"] {
             let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "glsr", subdirectory: "Fixtures"))
             let data = try Data(contentsOf: url)
             let rec = try Recording(data: data)
             let expected = Set(rec.frames.map { f in rec.withFrameBytes(f) { Data($0) } })
-            let host = try ReplayHost(data: data)
-            let client = try GlassClient(host: "127.0.0.1", port: host.port)
+            let host = try ReplayHost(data: data, pin: LiveTests.pin)
+            let client = try pairedClient(host)
             XCTAssertEqual(client.info.width, 320)
             XCTAssertEqual(client.info.height, 192)
             XCTAssertEqual(client.is444, rec.is444)
@@ -135,8 +164,8 @@ final class LiveTests: XCTestCase {
 
     func testInputAndCursorOverLoopback() throws {
         let url = try XCTUnwrap(Bundle.module.url(forResource: "testsrc-420", withExtension: "glsr", subdirectory: "Fixtures"))
-        let host = try ReplayHost(data: try Data(contentsOf: url))
-        let client = try GlassClient(host: "127.0.0.1", port: host.port)
+        let host = try ReplayHost(data: try Data(contentsOf: url), pin: LiveTests.pin)
+        let client = try pairedClient(host)
         _ = client.waitFrame(timeoutMs: 2000) { _, _ in } // streaming
         client.move(x: 1000, y: 2000)
         client.key(GlassClient.hid(forMacKey: 0x00, iso: false, pcStyle: false), down: true) // A
@@ -184,8 +213,11 @@ final class LiveTests: XCTestCase {
         XCTAssertEqual(Int(mid.y), 32768, accuracy: 2)
     }
 
-    func testConnectRefused() {
-        XCTAssertThrowsError(try GlassClient(host: "127.0.0.1", port: 9)) { error in
+    func testConnectRefused() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("glass-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let device = try XCTUnwrap(GlassDevice(directory: dir.path, name: "Test Mac"))
+        XCTAssertThrowsError(try GlassClient(host: "127.0.0.1", port: 9, device: device)) { error in
             XCTAssertEqual((error as? ConnectFailure)?.code, 2)
         }
     }

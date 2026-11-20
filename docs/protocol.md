@@ -1,16 +1,67 @@
 # Glass protocol
 
-**Version 3 (M3, test 2).** Unencrypted, LAN only, IPv4. This file is the source of
-truth for packet formats and control messages; `core/src/protocol.rs`,
-`core/src/packet.rs` and `core/src/input.rs` must match it. Bump the version
-on any change.
+**Version 4 (M6).** Paired devices only: mutual TLS 1.3 on the control
+connection, every UDP datagram sealed with AES-128-GCM. LAN, IPv4. This file
+is the source of truth for packet formats and control messages;
+`core/src/protocol.rs`, `packet.rs`, `input.rs`, `seal.rs`, `tls.rs` and
+`pairing.rs` must match it. Bump the version on any change. ADR 0010 has the
+security design.
 
 All integers are big-endian.
 
+## Identity, TLS and pairing
+
+Each device has a long-lived ECDSA P-256 key and a self-signed certificate,
+made on first run. A device *is* the SHA-256 fingerprint of its certificate
+(shown to people as the first 8 bytes, `3f2a 91c0 77de 10ab`). Each side
+keeps a list of paired fingerprints with roles: **host** (I view it) and
+**viewer** (it may view and control me).
+
+Every connection starts with **TLS 1.3** (only), both sides presenting their
+certificate. Verifiers check only that the peer signed the handshake with the
+key of the certificate it sent; no CA, no name check, no session resumption
+or tickets. Right after the handshake each side looks the peer's fingerprint
+up in its list, before acting on any message:
+
+- The **viewer** sends `Hello` only to a host it has paired with (role
+  host). Otherwise it sends `Bye` and reports "not paired" (it may then pair).
+- The **host** answers `Hello` from a fingerprint without the viewer role
+  with `Reject(3 not paired)`. Optionally ("ask") it asks its user first and
+  sends `Reject(4 denied)` on no.
+
+**Pairing** (viewer's first message is `PairStart` instead of `Hello`):
+
+1. viewer → `PairStart{name}`. The host shows a 6-digit PIN (OS RNG; valid
+   2 min; reused for repeat requests while valid) and replies
+   `PairReady{name}`, or `Reject(5 locked)`.
+2. The viewer's user types the PIN. viewer → `PairPake{X}`: SPAKE2
+   (Ed25519 group) side A, password = the PIN, identities
+   `"glass-viewer:" ‖ viewer_fp` and `"glass-host:" ‖ host_fp` (each side
+   uses the fingerprints *it saw in TLS*).
+3. The host counts the attempt **before** answering, then sends
+   `PairPake{Y}` (side B).
+4. Both derive K. Confirmation: `mac_v = HMAC-SHA256(K, "viewer" ‖ E)`,
+   `mac_h = HMAC-SHA256(K, "host" ‖ E)` with `E` = TLS exporter
+   (`"EXPORTER-glass-pairing"`, empty context, 32 bytes). viewer →
+   `PairConfirm{mac_v}`; the host checks it (constant time): wrong →
+   `Reject(6 wrong PIN)` (or `5` if that locked it); right → stores the viewer
+   (role viewer) and sends `PairConfirm{mac_h}`. The viewer checks it and
+   stores the host (role host), then `Bye`. The viewer reconnects normally.
+5. Limits: 3 wrong tries per PIN (then a new PIN), 10 wrong in total and
+   pairing is off until the host restarts. Abandoned attempts count.
+
+A man in the middle has to present its own certificate on each side, so the
+two SPAKE2 runs use different identities (and different exporters) and fail
+unless it guesses the PIN, once per attempt.
+
 ## Connection setup
 
-1. The viewer opens TCP to the host's port (default **47800**) and sends
-   `Hello`. The host replies `Welcome` (or `Reject`).
+1. The viewer opens TCP to the host's port (default **47800**), runs TLS and
+   the fingerprint check above, and sends `Hello`. The host replies `Welcome`
+   (or `Reject`). The viewer waits up to 60 s (the host may be asking).
+   Both sides derive the media keys from the TLS exporter
+   (`"EXPORTER-glass-media"`, context = `session_id` u32, 64 bytes): bytes
+   0–31 host → viewer, 32–63 viewer → host.
 2. The viewer binds a UDP socket and sends a **punch** datagram to the host's
    UDP port (from `Welcome`, normally the same number). The host sends video
    to the address the punch came from; it accepts punches only from the
@@ -24,16 +75,16 @@ All integers are big-endian.
 
 The host serves one viewer at a time.
 
-## Control messages (TCP)
+## Control messages (TLS over TCP)
 
-Framing: `u16 length` (type + body) · `u8 type` · body. Max 65537 bytes
-total; everything except CursorShape fits in 32.
+Framing (inside TLS): `u16 length` (type + body) · `u8 type` · body. Max
+65537 bytes total; everything except CursorShape fits in 32.
 
 | Type | Name | Direction | Body |
 |---|---|---|---|
 | 1 | Hello | viewer → host | `version u8`, `display_w u16`, `display_h u16` (0 = unknown; used from M7) |
 | 2 | Welcome | host → viewer | `version u8`, `codec u8`, `chroma u8`, `reserved u8`, `width u16`, `height u16`, `fps u16`, `udp_port u16`, `session_id u32` |
-| 3 | Reject | host → viewer | `reason u8` (1 = version mismatch, 2 = busy) |
+| 3 | Reject | host → viewer | `reason u8`: 1 version mismatch, 2 busy, 3 not paired, 4 denied by the host's user, 5 pairing locked (too many wrong PINs), 6 wrong or expired PIN |
 | 4 | Ping | viewer → host | `seq u32`, `client_ts u64` |
 | 5 | Pong | host → viewer | `seq u32`, `client_ts u64` (echoed), `host_ts u64` (host clock when the Ping was read) |
 | 6 | KeyframeRequest | viewer → host | — |
@@ -41,6 +92,10 @@ total; everything except CursorShape fits in 32.
 | 8 | CursorShape | host → viewer | `serial u32`, `width u16`, `height u16`, `hot_x u16`, `hot_y u16`, then `width × height × 4` bytes RGBA (straight alpha, top row first). 1–96 px per side; the host scales larger pointers down. Sent when the shape changes. |
 | 9 | CursorVisible | host → viewer | `visible u8` (0/1). Sent after every CursorShape and when the pointer is hidden/shown. |
 | 10 | HostNotice | host → viewer | `code u8`: 0 none (clears), 1 input blocked by an administrator window in front (UIPI), 2 input blocked by the secure desktop (UAC prompt, lock screen). The viewer shows it even with stats hidden. |
+| 11 | PairStart | viewer → host | `name` UTF-8, ≤ 63 bytes (the rest of the body) |
+| 12 | PairReady | host → viewer | `name` UTF-8, ≤ 63 bytes; the host is showing a PIN |
+| 13 | PairPake | either | SPAKE2 message, 33 bytes |
+| 14 | PairConfirm | either | HMAC-SHA256, 32 bytes |
 
 `codec`: 1 = HEVC. `chroma`: 0 = 4:2:0, 1 = 4:4:4. `fps` is the host
 display's refresh rate (capture only sends changed frames, so the real rate varies).
@@ -63,6 +118,27 @@ waiting. The host forces an IDR on the next captured frame, or re-encodes the
 last captured frame as an IDR if the screen is idle.
 
 ## UDP datagrams
+
+Every datagram (both directions, all kinds) is **sealed**:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | counter: 1, 2, 3 … per direction per session, never reused |
+| 8 | n | AES-128-GCM ciphertext of the datagram below |
+| 8 + n | 16 | GCM tag |
+
+- Nonce = `iv XOR (0⁴ ‖ counter)`; AAD = `counter ‖ session_id`.
+- Keys roll every 2^23 packets (epoch = `counter >> 23`):
+  `secret(e+1) = HKDF-Expand(secret(e), "glass media next", 32)`,
+  `key = HKDF-Expand(secret, "glass media key", 16)`,
+  `iv = HKDF-Expand(secret, "glass media iv", 12)` (HKDF-SHA256, the secret
+  as the PRK). Old secrets are dropped. A receiver follows up to 16 epochs
+  ahead and drops packets from epochs it has left.
+- Replay window: 1024 counters behind the highest accepted; duplicates and
+  older packets are dropped. Failures are counted (`rejected`), never answered.
+- Sealed size ≤ **1400** bytes; the plaintext inside is ≤ 1376.
+
+The datagrams inside:
 
 ### Punch (viewer → host, 8 bytes)
 | Offset | Size | Field |
@@ -111,13 +187,13 @@ non-modifiers first, then modifiers; press modifiers first). Record the
 latest datagram whose events (or repairs) changed anything as `input_seq`;
 pure pointer moves don't count (the pointer isn't in the captured picture).
 
-### Video packet (host → viewer, ≤ 1400 bytes)
+### Video packet (host → viewer, ≤ 1376 bytes before sealing)
 
 Header (24 bytes):
 
 | Offset | Size | Field | Notes |
 |---|---|---|---|
-| 0 | 1 | version | `PROTOCOL_VERSION` (1). Mismatch → drop. |
+| 0 | 1 | version | `PROTOCOL_VERSION` (4). Mismatch → drop. |
 | 1 | 1 | stream_id | 0 (video) |
 | 2 | 1 | flags | bit 0 `IDR`, bit 1 `REFINEMENT`; others 0 |
 | 3 | 1 | reserved | 0 |
@@ -139,9 +215,10 @@ Payload: a chunk of the frame's **logical payload**, which is
 The viewer measures **input → screen** as the time from sending input datagram
 `input_seq` to presenting the first frame that carries it.
 
-The logical payload is cut into chunks of exactly **1376** bytes (1400 − 24); only the last chunk may
-be shorter. Chunk `i` goes in the packet with `packet_index = i`, so a
-receiver can place packets at `i × 1376` in any order.
+The logical payload is cut into chunks of exactly **1352** bytes
+(1400 − 24 sealing − 24 header); only the last chunk may be shorter. Chunk `i`
+goes in the packet with `packet_index = i`, so a receiver can place packets at
+`i × 1352` in any order.
 
 ### Receiver rules
 - A frame is complete when all `packet_count` packets have arrived.
@@ -152,10 +229,19 @@ receiver can place packets at `i × 1376` in any order.
 
 ## Not yet defined
 - FEC group layout (M4)
-- Encryption envelope, nonce and replay window; TLS on the control channel (M6)
 - Resolution negotiation (M7)
 
+## Discovery (mDNS / DNS-SD)
+
+Hosts advertise `_glass._tcp` (Windows: the system responder). TXT: `v`
+protocol version, `fp` first 8 bytes of the fingerprint (hex), `ip`, `port`.
+Advisory only: trust comes from the pinned fingerprint, never from discovery.
+
 ## Changelog
+- v4 — M6 security: mutual TLS 1.3 with pinned self-signed certificates,
+  PIN pairing (SPAKE2 + exporter-bound confirmation, messages 11–14), reject
+  reasons 3–6, every UDP datagram AES-128-GCM sealed (24 bytes: video chunks
+  now 1352 bytes), random session ids, mDNS TXT.
 - v3 — HostNotice (Windows silently drops injected input into elevated
   windows and the secure desktop; the host detects it and tells the viewer).
   `input_seq` now only advances for events and repairs, not pure pointer moves.

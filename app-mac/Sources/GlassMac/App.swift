@@ -4,13 +4,17 @@ import Foundation
 import GlassKit
 import UniformTypeIdentifiers
 
-/// Finder / double-click mode: connect window -> live viewer (or a recording)
-/// -> results window -> back to the connect window.
-/// LATER(M6): menu-bar shell, device list (mDNS), pairing UI.
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+/// Finder / double-click mode: connect window -> (pairing) -> live viewer (or
+/// a recording) -> results window -> back to the connect window.
+/// LATER: menu-bar shell.
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private var connectWindow: NSWindow?
     private var hostField: NSTextField!
     private var connectButton: NSButton!
+    private var foundPopup: NSPopUpButton!
+    private var found: [DiscoveredHost] = []
+    private let browser = GlassBrowser()
+    private let pairedMenu = NSMenu(title: "Paired Devices")
     private var player: Player?
     private var viewer: LiveViewer?
     private var openedFile = false
@@ -51,8 +55,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let chord: NSEvent.ModifierFlags = [.control, .option, .command]
         let pcStyle = item("PC-Style Modifiers (⌘ → Win, ⌃ → Ctrl)", #selector(togglePcStyle(_:)), "", target: self)
         pcStyle.state = UserDefaults.standard.bool(forKey: "pcStyleModifiers") ? .on : .off
+        let paired = NSMenuItem(title: "Paired Devices", action: nil, keyEquivalent: "")
+        paired.submenu = pairedMenu
+        pairedMenu.delegate = self
         submenu("Connection", [
             item("Connect…", #selector(showConnectAction), "n", target: self),
+            paired,
             item("Open Recording…", #selector(openRecording), "o", target: self),
             item("Disconnect", #selector(NSWindow.performClose(_:)), "w", chord),
             item("Quit Glass (while viewing)", #selector(NSApplication.terminate(_:)), "q", chord),
@@ -73,6 +81,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func showConnectAction() { showConnect() }
+
+    // MARK: paired devices
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === pairedMenu else { return }
+        menu.removeAllItems()
+        let peers = GlassDevice.shared?.peers ?? []
+        if peers.isEmpty {
+            let none = NSMenuItem(title: "None yet: connect to a PC to pair", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            menu.addItem(none)
+        }
+        for p in peers {
+            let i = NSMenuItem(title: "Forget \u{201C}\(p.name)\u{201D}  (id \(p.shortID))…", action: #selector(forgetPeer(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = p.hex
+            menu.addItem(i)
+        }
+        if GlassDevice.shared != nil {
+            menu.addItem(.separator())
+            let me = NSMenuItem(title: "This Mac: \u{201C}\(GlassDevice.computerName)\u{201D}", action: nil, keyEquivalent: "")
+            me.isEnabled = false
+            menu.addItem(me)
+        }
+    }
+
+    @objc private func forgetPeer(_ sender: NSMenuItem) {
+        guard let d = GlassDevice.shared, let hex = sender.representedObject as? String,
+              let p = d.peers.first(where: { $0.hex == hex }) else { return }
+        let a = NSAlert()
+        a.messageText = "Forget \u{201C}\(p.name)\u{201D}?"
+        a.informativeText = "This Mac will no longer trust it. To connect again you'll pair with a new PIN. (To stop the PC accepting this Mac, run `glass forget` on the PC.)"
+        a.addButton(withTitle: "Forget")
+        a.addButton(withTitle: "Cancel")
+        if a.runModal() == .alertFirstButtonReturn { d.forget(p) }
+        refreshFound()
+    }
     @objc private func toggleStats() { viewer?.toggleOverlay() }
 
     @objc private func togglePcStyle(_ sender: NSMenuItem) {
@@ -88,18 +133,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if connectWindow == nil { buildConnectWindow() }
         connectButton.isEnabled = true
         connectButton.title = "Connect"
+        browser.start()
+        refreshFound()
         connectWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    private func setBusy(_ title: String) {
+        connectButton.isEnabled = false
+        connectButton.title = title
+    }
+
+    // MARK: discovery
+
+    private func refreshFound() {
+        guard let foundPopup else { return }
+        foundPopup.removeAllItems()
+        if found.isEmpty {
+            foundPopup.addItem(withTitle: "Searching… (or type the address below)")
+            foundPopup.isEnabled = false
+            return
+        }
+        foundPopup.isEnabled = true
+        foundPopup.addItem(withTitle: "Choose a PC…")
+        for h in found {
+            let paired = GlassDevice.shared?.pairedHost(prefix: h.fingerprintPrefix) != nil
+            let v = h.version.map { $0 == String(glass_protocol_version()) ? "" : "  (different Glass version)" } ?? ""
+            foundPopup.addItem(withTitle: "\(h.name) — \(h.address)\(paired ? "  ✓ paired" : "")\(v)")
+        }
+    }
+
+    @objc private func pickFound(_ sender: NSPopUpButton) {
+        let i = sender.indexOfSelectedItem - 1
+        guard i >= 0, i < found.count else { return }
+        let h = found[i]
+        hostField.stringValue = h.port == GlassClient.defaultPort ? h.address : "\(h.address):\(h.port)"
+    }
+
     private func buildConnectWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 170),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 230),
                          styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
         w.title = "Glass \(appVersion)"
         w.isReleasedWhenClosed = false
         w.delegate = self
 
-        let label = NSTextField(labelWithString: "PC address (host.cmd on the PC shows it):")
+        let foundLabel = NSTextField(labelWithString: "PCs running Glass on this network:")
+        foundPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+        foundPopup.target = self
+        foundPopup.action = #selector(pickFound(_:))
+        browser.onChange = { [weak self] hosts in
+            self?.found = hosts
+            self?.refreshFound()
+        }
+        let label = NSTextField(labelWithString: "Or the PC's address (host.cmd on the PC shows it):")
         hostField = NSTextField(string: UserDefaults.standard.string(forKey: "lastHost") ?? "")
         hostField.placeholderString = "e.g. 192.168.1.20"
         hostField.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
@@ -108,13 +194,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         connectButton = NSButton(title: "Connect", target: self, action: #selector(connect))
         connectButton.keyEquivalent = "\r"
         let open = NSButton(title: "Open Recording…", target: self, action: #selector(openRecording))
-        let note = NSTextField(labelWithString: "Opens full screen; mouse and keyboard go to the PC. ⌃⌥⌘F window, ⌃⌥⌘W disconnect.")
+        let note = NSTextField(labelWithString: "Paired PCs only; everything is encrypted. Opens full screen; ⌃⌥⌘F window, ⌃⌥⌘W disconnect.")
         note.textColor = .secondaryLabelColor
         note.font = .systemFont(ofSize: 11)
 
         let buttons = NSStackView(views: [open, NSView(), connectButton])
         buttons.orientation = .horizontal
-        let stack = NSStackView(views: [label, hostField, note, buttons])
+        let stack = NSStackView(views: [foundLabel, foundPopup, label, hostField, note, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -128,6 +214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             stack.topAnchor.constraint(equalTo: content.topAnchor),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             hostField.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
+            foundPopup.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
             buttons.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
         ])
         w.contentView = content
@@ -153,17 +240,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let (host, port) = parseAddress(hostField.stringValue)
         guard !host.isEmpty, connectButton.isEnabled else { return }
         UserDefaults.standard.set(hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "lastHost")
-        connectButton.isEnabled = false
-        connectButton.title = "Connecting…"
+        connectTo(host, port)
+    }
+
+    private func connectTo(_ host: String, _ port: UInt16) {
+        setBusy("Connecting…")
         DispatchQueue.global(qos: .userInitiated).async {
             let result = Result { try GlassClient(host: host, port: port) }
             DispatchQueue.main.async {
                 switch result {
                 case .success(let client):
                     self.startViewer(client)
+                case .failure(let f as ConnectFailure) where f.needsPairing:
+                    self.offerPairing(host, port)
                 case .failure(let error):
                     self.showConnect()
                     showError("Couldn't connect", "\(error)")
+                }
+            }
+        }
+    }
+
+    // MARK: pairing
+
+    private func offerPairing(_ host: String, _ port: UInt16) {
+        let a = NSAlert()
+        a.messageText = "Pair with this PC?"
+        a.informativeText = "This Mac isn't paired with \(host) yet. Glass on the PC will show a 6-digit PIN in its host.cmd window for you to type here.\n\nPair only with your own PC: a paired PC sees what you type while viewing it."
+        a.addButton(withTitle: "Pair")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { showConnect(); return }
+        beginPairing(host, port)
+    }
+
+    private func beginPairing(_ host: String, _ port: UInt16) {
+        guard let device = GlassDevice.shared else {
+            showConnect()
+            showError("Couldn't pair", "\(ConnectFailure(code: 10, host: host))")
+            return
+        }
+        setBusy("Pairing…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result { try GlassPairing(device: device, host: host, port: port) }
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let p): self.askPin(p, port)
+                case .failure(let error):
+                    self.showConnect()
+                    showError("Couldn't pair", "\(error)")
+                }
+            }
+        }
+    }
+
+    private func askPin(_ p: GlassPairing, _ port: UInt16) {
+        let a = NSAlert()
+        a.messageText = "Type the PIN shown on \u{201C}\(p.hostName)\u{201D}"
+        a.informativeText = "It's in the host.cmd window on the PC, valid for 2 minutes."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 160, height: 28))
+        field.font = .monospacedDigitSystemFont(ofSize: 18, weight: .medium)
+        field.placeholderString = "123 456"
+        a.accessoryView = field
+        a.addButton(withTitle: "Pair")
+        a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = field
+        guard a.runModal() == .alertFirstButtonReturn else {
+            p.cancel()
+            showConnect()
+            return
+        }
+        let pin = field.stringValue.filter(\.isNumber)
+        setBusy("Pairing…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Result { try p.finish(pin: pin) }
+            DispatchQueue.main.async {
+                switch result {
+                case .success:
+                    self.refreshFound()
+                    self.connectTo(p.host, port)
+                case .failure(let f as ConnectFailure) where f.wrongPin:
+                    let again = NSAlert()
+                    again.messageText = "Wrong PIN"
+                    again.informativeText = "\(f)"
+                    again.addButton(withTitle: "Try Again")
+                    again.addButton(withTitle: "Cancel")
+                    if again.runModal() == .alertFirstButtonReturn {
+                        self.beginPairing(p.host, port)
+                    } else {
+                        self.showConnect()
+                    }
+                case .failure(let error):
+                    self.showConnect()
+                    showError("Couldn't pair", "\(error)")
                 }
             }
         }
@@ -178,6 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.showConnect()
             }
             viewer = v
+            browser.stop()
             connectWindow?.orderOut(nil)
             v.open()
         } catch {

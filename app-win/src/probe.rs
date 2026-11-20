@@ -3,7 +3,7 @@
 //! run on any OS; CI uses them for an end-to-end loopback check.
 
 use glass_core::clock;
-use glass_core::net::{Client, Wait};
+use glass_core::net::{pair_begin, Client, ConnectError, HostOptions, Wait};
 use glass_core::protocol::{DEFAULT_PORT, FLAG_IDR};
 use glass_core::recording::RecordingReader;
 use glass_core::replay::Replay;
@@ -36,19 +36,35 @@ fn port_arg(v: Option<&String>) -> Res<u16> {
     Ok(v.map(|s| s.parse()).transpose()?.unwrap_or(DEFAULT_PORT))
 }
 
-/// `glass serve FILE.glsr [--port P]`
+/// `glass serve FILE.glsr [--port P] [--pin PIN]`
 pub fn serve(args: &[String]) -> Res<()> {
-    let (mut file, mut port) = (None, None);
+    let (mut file, mut port, mut pin) = (None, None, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--port" => port = it.next(),
+            "--pin" => pin = it.next().cloned(),
             s if file.is_none() => file = Some(s.to_string()),
             s => return Err(format!("unknown argument {s}").into()),
         }
     }
-    let file = file.ok_or("usage: glass serve FILE.glsr [--port P]")?;
-    let replay = Replay::start(std::fs::read(&file)?, port_arg(port)?)?;
+    let file = file.ok_or("usage: glass serve FILE.glsr [--port P] [--pin PIN]")?;
+    if let Some(p) = &pin {
+        if p.len() != 6 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("--pin must be 6 digits".into());
+        }
+    }
+    let opts = HostOptions {
+        fixed_pin: pin,
+        ask: None,
+        events: Box::new(crate::print_event),
+    };
+    let replay = Replay::start(
+        std::fs::read(&file)?,
+        port_arg(port)?,
+        crate::device()?,
+        opts,
+    )?;
     println!(
         "{} | serving {file} on port {} (Ctrl+C to stop)",
         crate::banner(),
@@ -69,10 +85,10 @@ pub fn serve(args: &[String]) -> Res<()> {
     }
 }
 
-/// `glass probe HOST [--port P] [--seconds S] [--verify FILE.glsr] [--min-frames N]`
+/// `glass probe HOST [--port P] [--pin PIN] [--seconds S] [--verify FILE.glsr] [--min-frames N]`
 pub fn probe(args: &[String]) -> Res<()> {
-    let (mut host, mut port, mut seconds, mut verify, mut min_frames) =
-        (None, None, 10.0f64, None, 0u64);
+    let (mut host, mut port, mut seconds, mut verify, mut min_frames, mut pin) =
+        (None, None, 10.0f64, None, 0u64, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{a} needs a value"));
@@ -81,6 +97,7 @@ pub fn probe(args: &[String]) -> Res<()> {
             "--seconds" => seconds = val()?.parse()?,
             "--verify" => verify = Some(val()?.clone()),
             "--min-frames" => min_frames = val()?.parse()?,
+            "--pin" => pin = Some(val()?.clone()),
             s if host.is_none() && !s.starts_with("--") => host = Some(s.to_string()),
             s => return Err(format!("unknown argument {s}").into()),
         }
@@ -104,11 +121,28 @@ pub fn probe(args: &[String]) -> Res<()> {
         None => None,
     };
 
-    let c = Client::connect(&host, port).map_err(|e| format!("{host}:{port}: {e}"))?;
+    let device = crate::device()?;
+    let err = |e: ConnectError| format!("{host}:{port}: {e}");
+    let c = match (Client::connect(&device, &host, port), &pin) {
+        (Err(ConnectError::NotPaired), Some(pin)) => {
+            let p = pair_begin(&device, &host, port).map_err(err)?;
+            println!("Pairing with \"{}\" ...", p.host_name());
+            p.finish(pin).map_err(err)?;
+            Client::connect(&device, &host, port).map_err(err)?
+        }
+        (Err(ConnectError::NotPaired), None) => {
+            return Err(format!(
+                "{host}:{port}: not paired; run again with --pin and the PIN the host shows"
+            )
+            .into())
+        }
+        (c, _) => c.map_err(err)?,
+    };
     let info = c.info();
     println!(
-        "{} | probe {host}:{port}: {}x{} @ {} Hz HEVC {}",
+        "{} | probe {host}:{port} (\"{}\", encrypted): {}x{} @ {} Hz HEVC {}",
         crate::banner(),
+        c.peer().name,
         info.width,
         info.height,
         info.fps,
@@ -162,13 +196,14 @@ pub fn probe(args: &[String]) -> Res<()> {
         if gone { " (host disconnected)" } else { "" }
     );
     println!(
-        "  packets {} | lost frames {} | skipped {} | dup {} | late {} | bad {} | queue full {} | keyframe requests {}",
+        "  packets {} | lost frames {} | skipped {} | dup {} | late {} | bad {} | rejected {} | queue full {} | keyframe requests {}",
         s.rx.packets,
         s.rx.frames_lost,
         s.rx.frames_skipped,
         s.rx.duplicates,
         s.rx.late,
         s.rx.bad,
+        s.crypto_bad + s.crypto_replayed,
         s.queue_full,
         s.keyframe_requests
     );

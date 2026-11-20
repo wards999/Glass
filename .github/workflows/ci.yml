@@ -105,14 +105,21 @@ jobs:
             target/release/glass.exe pack t$c.h265 rt$c.glsr 320 192 60 $c
             cmp $f rt$c.glsr
           done
-      - name: Live stream over loopback (serve -> probe, bit-exact)
+      - name: Live stream over loopback (pair, serve -> probe, bit-exact, unpaired refused)
         shell: bash
         run: |
           export PATH="$PWD/third_party/ffmpeg/bin:$PATH"
           f=app-mac/Tests/GlassKitTests/Fixtures/testsrc-444.glsr
-          target/release/glass.exe serve $f --port 47811 &
+          GLASS_HOME=$RUNNER_TEMP/host target/release/glass.exe serve $f --port 47811 --pin 246810 &
           sleep 2
-          target/release/glass.exe probe 127.0.0.1 --port 47811 --seconds 3 --verify $f --min-frames 30
+          # Unpaired: refused.
+          if GLASS_HOME=$RUNNER_TEMP/viewer target/release/glass.exe probe 127.0.0.1 --port 47811 --seconds 1; then
+            echo "unpaired probe was not refused"; exit 1
+          fi
+          # Pair with the PIN, then stream; then reconnect without a PIN.
+          GLASS_HOME=$RUNNER_TEMP/viewer target/release/glass.exe probe 127.0.0.1 --port 47811 --pin 246810 --seconds 3 --verify $f --min-frames 30
+          GLASS_HOME=$RUNNER_TEMP/viewer target/release/glass.exe probe 127.0.0.1 --port 47811 --seconds 2 --verify $f --min-frames 20
+          GLASS_HOME=$RUNNER_TEMP/host target/release/glass.exe devices
           kill %1 || true
       - uses: actions/upload-artifact@v4
         with:
@@ -151,10 +158,10 @@ jobs:
         continue-on-error: true
         run: |
           cargo build -p glass-win --release
-          target/release/glass serve app-mac/Tests/GlassKitTests/Fixtures/testsrc-420.glsr --port 47811 &
+          GLASS_HOME=$RUNNER_TEMP/host target/release/glass serve app-mac/Tests/GlassKitTests/Fixtures/testsrc-420.glsr --port 47811 --pin 246810 &
           sleep 2
           hdiutil attach dist/*.dmg -mountpoint /tmp/glass -nobrowse
-          perl -e "alarm 60; exec @ARGV" /tmp/glass/Glass.app/Contents/MacOS/GlassMac connect 127.0.0.1:47811 --seconds 5
+          GLASS_HOME=$RUNNER_TEMP/viewer perl -e "alarm 60; exec @ARGV" /tmp/glass/Glass.app/Contents/MacOS/GlassMac connect 127.0.0.1:47811 --pin 246810 --seconds 5
           hdiutil detach /tmp/glass
           kill %1 || true
       - uses: actions/upload-artifact@v4

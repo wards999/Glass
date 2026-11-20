@@ -10,9 +10,9 @@
 use crate::protocol::{FrameInfo, VideoPacketHeader, FLAG_IDR};
 use std::io;
 
-/// Whole UDP datagram, header included. Fits a 1500-byte Ethernet MTU with
-/// room for IP/UDP (and, from M6, the AEAD tag).
-pub const MAX_DATAGRAM: usize = 1400;
+/// Whole video datagram before encryption, header included. Sealed, it's
+/// `seal::WIRE_MAX` (1400) bytes: fits a 1500-byte MTU with room for IP/UDP.
+pub const MAX_DATAGRAM: usize = crate::seal::WIRE_MAX - crate::seal::OVERHEAD;
 pub const MAX_PAYLOAD: usize = MAX_DATAGRAM - VideoPacketHeader::SIZE;
 
 /// What the host knows about a frame when it sends it.

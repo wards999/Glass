@@ -401,6 +401,11 @@ impl HostSession {
         lock(&self.tcp_out).write_all(&self.cursor_buf)
     }
 
+    /// Tells the viewer about a condition (`protocol::NOTICE_*`; `NOTICE_NONE` clears it).
+    pub fn send_notice(&mut self, code: u8) -> io::Result<()> {
+        send_control(&mut *lock(&self.tcp_out), Control::HostNotice { code })
+    }
+
     pub fn send_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
         send_control(
             &mut *lock(&self.tcp_out),
@@ -587,6 +592,8 @@ pub struct ClientStats {
     /// Input events (keys, buttons, scrolls) and datagrams sent.
     pub input_events: u64,
     pub input_packets: u64,
+    /// Latest `HostNotice` code (`protocol::NOTICE_*`), 0 = none.
+    pub host_notice: u8,
 }
 
 /// The host's pointer as last reported. `generation` changes on every update.
@@ -676,6 +683,7 @@ struct ClientShared {
     clock_offset: AtomicI64,
     clock_rtt: AtomicU32,
     last_rtt: AtomicU32,
+    host_notice: std::sync::atomic::AtomicU8,
     queue: FrameQueue,
     input: Mutex<InputTx>,
     cursor: Mutex<CursorState>,
@@ -754,6 +762,7 @@ impl Client {
             clock_offset: AtomicI64::new(0),
             clock_rtt: AtomicU32::new(0),
             last_rtt: AtomicU32::new(0),
+            host_notice: std::sync::atomic::AtomicU8::new(0),
             queue: FrameQueue::new(),
             input: Mutex::new(InputTx {
                 sender: InputSender::new(session_id),
@@ -871,6 +880,7 @@ impl Client {
             last_rtt_us: sh.last_rtt.load(Ordering::Relaxed),
             input_events: events,
             input_packets: packets,
+            host_notice: sh.host_notice.load(Ordering::Relaxed),
         }
     }
 
@@ -1003,6 +1013,9 @@ fn spawn_control(
                             sh.last_rtt.store(last, Ordering::Relaxed);
                             sh.clock_valid.store(true, Ordering::Release);
                         }
+                    }
+                    Message::Control(Control::HostNotice { code }) => {
+                        sh.host_notice.store(code, Ordering::Relaxed);
                     }
                     Message::Control(Control::CursorVisible { visible }) => {
                         let mut c = lock(&sh.cursor);

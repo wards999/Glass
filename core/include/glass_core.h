@@ -78,10 +78,10 @@
 
 
 /**
- * Protocol version. 2 = M3: v1 (M2 video + plain-TCP control) plus input
- * datagrams, cursor messages and `FrameInfo::input_seq`.
+ * Protocol version. 3 = M3 (test 2): v2 (input datagrams, cursor messages,
+ * `FrameInfo::input_seq`) plus `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 2
+#define GLASS_PROTOCOL_VERSION 3
 
 /**
  * Default TCP control port; the host's UDP media socket uses the same number.
@@ -99,6 +99,21 @@
 #define GLASS_FLAG_REFINEMENT (1 << 1)
 
 #define GLASS_PUNCH_SIZE 8
+
+/**
+ * `HostNotice` codes: why the host can't do what the viewer expects.
+ */
+#define GLASS_NOTICE_NONE 0
+
+/**
+ * An administrator window is in front; Windows drops injected input (UIPI).
+ */
+#define GLASS_NOTICE_INPUT_BLOCKED_ELEVATED 1
+
+/**
+ * UAC prompt / lock screen: the secure desktop takes no input and isn't captured.
+ */
+#define GLASS_NOTICE_INPUT_BLOCKED_SECURE_DESKTOP 2
 
 /**
  * Why a host refused a viewer.
@@ -359,6 +374,10 @@ typedef struct {
    */
   uint64_t input_events;
   uint64_t input_packets;
+  /**
+   * Latest `HostNotice` code (`protocol::NOTICE_*`), 0 = none.
+   */
+  uint8_t host_notice;
 } GLASS_ClientStats;
 
 /**

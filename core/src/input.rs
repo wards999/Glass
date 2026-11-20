@@ -418,6 +418,7 @@ impl InputApplier {
     /// Applies one packet. Returns true if it changed anything.
     pub fn apply(&mut self, p: &InputPacket, out: &mut impl FnMut(InputAction)) -> bool {
         self.counters.packets += 1;
+        let repaired_before = self.counters.repaired;
         let mut changed = false;
         for i in 0..p.event_count as usize {
             let seq = p.first_event_seq.wrapping_add(i as u32);
@@ -490,7 +491,11 @@ impl InputApplier {
                 }
             }
         }
-        if changed {
+        // `input_seq` marks input that should change the picture: events and
+        // repairs, not pure pointer moves (the pointer is drawn on the viewer and
+        // isn't in the capture, so a move alone produces no new frame and would
+        // inflate input -> screen).
+        if changed && (p.event_count > 0 || self.counters.repaired > repaired_before) {
             self.applied_seq = p.packet_seq;
         }
         changed

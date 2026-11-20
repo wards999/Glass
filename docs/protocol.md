@@ -1,6 +1,6 @@
 # Glass protocol
 
-**Version 2 (M3).** Unencrypted, LAN only, IPv4. This file is the source of
+**Version 3 (M3, test 2).** Unencrypted, LAN only, IPv4. This file is the source of
 truth for packet formats and control messages; `core/src/protocol.rs`,
 `core/src/packet.rs` and `core/src/input.rs` must match it. Bump the version
 on any change.
@@ -40,6 +40,7 @@ total; everything except CursorShape fits in 32.
 | 7 | Bye | either | — |
 | 8 | CursorShape | host → viewer | `serial u32`, `width u16`, `height u16`, `hot_x u16`, `hot_y u16`, then `width × height × 4` bytes RGBA (straight alpha, top row first). 1–96 px per side; the host scales larger pointers down. Sent when the shape changes. |
 | 9 | CursorVisible | host → viewer | `visible u8` (0/1). Sent after every CursorShape and when the pointer is hidden/shown. |
+| 10 | HostNotice | host → viewer | `code u8`: 0 none (clears), 1 input blocked by an administrator window in front (UIPI), 2 input blocked by the secure desktop (UAC prompt, lock screen). The viewer shows it even with stats hidden. |
 
 `codec`: 1 = HEVC. `chroma`: 0 = 4:2:0, 1 = 4:4:4. `fps` is the host
 display's refresh rate (capture only sends changed frames, so the real rate varies).
@@ -107,7 +108,8 @@ sending. On losing focus, release everything.
 numbers already applied). Then, if the datagram is newer than any seen, move to
 its position and reconcile held buttons and keys with its state (release
 non-modifiers first, then modifiers; press modifiers first). Record the
-latest datagram that changed anything as `input_seq`.
+latest datagram whose events (or repairs) changed anything as `input_seq`;
+pure pointer moves don't count (the pointer isn't in the captured picture).
 
 ### Video packet (host → viewer, ≤ 1400 bytes)
 
@@ -154,6 +156,9 @@ receiver can place packets at `i × 1376` in any order.
 - Resolution negotiation (M7)
 
 ## Changelog
+- v3 — HostNotice (Windows silently drops injected input into elevated
+  windows and the secure desktop; the host detects it and tells the viewer).
+  `input_seq` now only advances for events and repairs, not pure pointer moves.
 - v2 — M3: input datagrams, CursorShape/CursorVisible, `input_seq` in the
   frame payload prefix (now 12 bytes), control frames up to 64 KB.
 - v1 — M2: control messages over TCP, UDP punch, frame payload prefix

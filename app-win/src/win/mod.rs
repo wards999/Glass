@@ -1,5 +1,6 @@
 //! Windows-only host pieces: D3D11 device, Windows.Graphics.Capture, NVENC.
 
+mod blocker;
 mod capture;
 mod cursor;
 mod d3d;
@@ -16,7 +17,7 @@ use glass_core::recording::{
 use glass_core::stats::{IntervalTracker, StatRing, Summary};
 use std::error::Error;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 pub type Res<T> = Result<T, Box<dyn Error>>;
@@ -271,6 +272,9 @@ struct HostRun {
     intervals: IntervalTracker,
     idrs: u32,
     idle_idrs: u32,
+    /// What blocked input during the session, and for how long (µs).
+    blocked_by: Vec<String>,
+    blocked_us: u64,
     not_sent: u32,
     skipped: u32,
     error: Option<String>,
@@ -286,6 +290,8 @@ impl HostRun {
             intervals: IntervalTracker::default(),
             idrs: 0,
             idle_idrs: 0,
+            blocked_by: Vec::new(),
+            blocked_us: 0,
             not_sent: 0,
             skipped: 0,
             error: None,
@@ -327,9 +333,28 @@ impl HostRun {
 
 /// `glass host`: waits for a viewer, streams the monitor live until it leaves,
 /// prints the session's numbers, and waits for the next viewer.
+/// Clicking inside a console with QuickEdit on starts a selection, and Windows
+/// then pauses the process at its next console write (freezing the host).
+fn disable_quick_edit() {
+    use windows::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, CONSOLE_MODE, ENABLE_EXTENDED_FLAGS,
+        ENABLE_QUICK_EDIT_MODE, STD_INPUT_HANDLE,
+    };
+    unsafe {
+        let Ok(h) = GetStdHandle(STD_INPUT_HANDLE) else {
+            return;
+        };
+        let mut mode = CONSOLE_MODE(0);
+        if GetConsoleMode(h, &mut mode).is_ok() {
+            let _ = SetConsoleMode(h, (mode & !ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS);
+        }
+    }
+}
+
 pub fn host(args: &[String]) -> Res<()> {
     let a = parse(args)?;
     d3d::init_process();
+    disable_quick_edit();
     let monitors = capture::monitors()?;
     let mon = monitors
         .get(a.monitor)
@@ -381,10 +406,14 @@ pub fn host(args: &[String]) -> Res<()> {
             }),
             failed: 0,
         };
+        // Windows drops input into admin windows and the secure desktop while
+        // still reporting success, so count what arrived during a known block.
         let blocked = Arc::new(AtomicU64::new(0));
-        let b = blocked.clone();
+        let blocking = Arc::new(AtomicU8::new(0));
+        let (b, bl) = (blocked.clone(), blocking.clone());
         let sink = Box::new(move |action| {
-            if !injector.inject(&action) {
+            let ok = injector.inject(&action);
+            if !ok || bl.load(Ordering::Relaxed) != 0 {
                 b.fetch_add(1, Ordering::Relaxed);
             }
         });
@@ -396,19 +425,32 @@ pub fn host(args: &[String]) -> Res<()> {
             }
         };
         println!("Viewer connected from {}", session.peer_tcp);
-        let mut report = run_session(&gpu, &mut cap, &mut session, &a, (w, h), mon.refresh_hz)?;
+        let (mut report, blocked_by, blocked_us) = run_session(
+            &gpu,
+            &mut cap,
+            &mut session,
+            &a,
+            (w, h),
+            mon.refresh_hz,
+            &blocking,
+        )?;
         let ic = session.counters().input;
         drop(session); // releases anything the viewer still held
         let _ = writeln!(
             report,
-            "  input: {} packets | {} keys, {} clicks, {} scrolls, {} moves | repaired {} | blocked by Windows {}",
-            ic.packets,
-            ic.keys,
-            ic.clicks,
-            ic.scrolls,
-            ic.moves,
-            ic.repaired,
-            blocked.load(Ordering::Relaxed)
+            "  input: {} packets | {} keys, {} clicks, {} scrolls, {} moves | repaired {}",
+            ic.packets, ic.keys, ic.clicks, ic.scrolls, ic.moves, ic.repaired
+        );
+        let _ = writeln!(
+            report,
+            "  input blocked by Windows: {} actions over {:.1} s{}",
+            blocked.load(Ordering::Relaxed),
+            blocked_us as f64 / 1e6,
+            if blocked_by.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", blocked_by.join(", "))
+            }
         );
         let report = format!("{head}{report}");
         println!("{report}");
@@ -431,7 +473,8 @@ fn run_session(
     a: &Args,
     (w, h): (u32, u32),
     fps: u32,
-) -> Res<String> {
+    blocking: &AtomicU8,
+) -> Res<(String, Vec<String>, u64)> {
     while cap.next_frame()?.is_some() {} // drop frames captured while waiting
     let mut enc = encode::Encoder::new(
         &gpu.device,
@@ -446,11 +489,40 @@ fn run_session(
     )?;
     let mut run = HostRun::new();
     let mut pointer = cursor::CursorWatch::new();
+    let mut watch = blocker::BlockerWatch::new();
+    let mut blocked_since = None;
     let t0 = clock::now_us();
     let mut pending_idr = true;
     while session.connected() && run.error.is_none() {
         cap.wait(5);
         pending_idr |= session.take_keyframe_request();
+        let now = clock::now_us();
+        if let Some(b) = watch.poll(now, 250_000) {
+            blocking.store(b.code(), Ordering::Relaxed);
+            let _ = session.send_notice(b.code());
+            if let Some(since) = blocked_since.take() {
+                run.blocked_us += now - since;
+            }
+            match &b {
+                blocker::Blocker::None => println!("Input works again."),
+                blocker::Blocker::Elevated(name) => {
+                    println!("Input blocked: {name} runs as administrator and is in front. Run host.cmd as administrator to control it.");
+                    if !run.blocked_by.contains(name) {
+                        run.blocked_by.push(name.clone());
+                    }
+                }
+                blocker::Blocker::SecureDesktop => {
+                    println!("Input blocked: a UAC prompt or the lock screen is showing (answer it on the PC).");
+                    let s = "UAC prompt / lock screen".to_string();
+                    if !run.blocked_by.contains(&s) {
+                        run.blocked_by.push(s);
+                    }
+                }
+            }
+            if b != blocker::Blocker::None {
+                blocked_since = Some(now);
+            }
+        }
         match pointer.poll() {
             cursor::Change::Shape(s) => {
                 let _ = session.send_cursor(&CursorShape {
@@ -529,5 +601,8 @@ fn run_session(
         fmt_line("capture interval", &run.intervals.intervals.summary())
     );
     let _ = writeln!(r, "{}", size_line(&run.size.summary()));
-    Ok(r)
+    if let Some(since) = blocked_since {
+        run.blocked_us += clock::now_us() - since;
+    }
+    Ok((r, run.blocked_by, run.blocked_us))
 }

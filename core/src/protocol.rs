@@ -1,9 +1,9 @@
 //! Wire formats. `docs/protocol.md` is the source of truth; keep them in sync and
 //! bump [`PROTOCOL_VERSION`] on any change.
 
-/// Protocol version. 2 = M3: v1 (M2 video + plain-TCP control) plus input
-/// datagrams, cursor messages and `FrameInfo::input_seq`.
-pub const PROTOCOL_VERSION: u8 = 2;
+/// Protocol version. 3 = M3 (test 2): v2 (input datagrams, cursor messages,
+/// `FrameInfo::input_seq`) plus `HostNotice`.
+pub const PROTOCOL_VERSION: u8 = 3;
 
 /// Default TCP control port; the host's UDP media socket uses the same number.
 pub const DEFAULT_PORT: u16 = 47800;
@@ -153,6 +153,13 @@ pub struct StreamInfo {
     pub fps: u16,
 }
 
+/// `HostNotice` codes: why the host can't do what the viewer expects.
+pub const NOTICE_NONE: u8 = 0;
+/// An administrator window is in front; Windows drops injected input (UIPI).
+pub const NOTICE_INPUT_BLOCKED_ELEVATED: u8 = 1;
+/// UAC prompt / lock screen: the secure desktop takes no input and isn't captured.
+pub const NOTICE_INPUT_BLOCKED_SECURE_DESKTOP: u8 = 2;
+
 /// Why a host refused a viewer.
 pub const REJECT_VERSION: u8 = 1;
 pub const REJECT_BUSY: u8 = 2;
@@ -196,6 +203,11 @@ pub enum Control {
     CursorVisible {
         visible: bool,
     },
+    /// Host -> client: a condition the user should know about (`NOTICE_*`);
+    /// `NOTICE_NONE` clears it.
+    HostNotice {
+        code: u8,
+    },
 }
 
 /// Largest encoded control message (including the 2-byte length).
@@ -220,6 +232,7 @@ impl Control {
             Control::KeyframeRequest => 6,
             Control::Bye => 7,
             Control::CursorVisible { .. } => 9,
+            Control::HostNotice { .. } => 10,
         }
     }
 
@@ -255,6 +268,7 @@ impl Control {
             }
             Control::Reject { reason } => put(&[reason]),
             Control::CursorVisible { visible } => put(&[visible as u8]),
+            Control::HostNotice { code } => put(&[code]),
             Control::Ping { seq, client_ts } => {
                 put(&seq.to_be_bytes());
                 put(&client_ts.to_be_bytes());
@@ -293,7 +307,7 @@ impl Control {
             4 => 12,
             5 => 20,
             6 | 7 => 0,
-            9 => 1,
+            9 | 10 => 1,
             _ => return Err(ControlError::Malformed),
         };
         if b.len() != want {
@@ -329,6 +343,7 @@ impl Control {
             },
             6 => Control::KeyframeRequest,
             9 => Control::CursorVisible { visible: b[0] != 0 },
+            10 => Control::HostNotice { code: b[0] },
             _ => Control::Bye,
         };
         Ok(msg)
@@ -470,6 +485,9 @@ mod tests {
             Control::KeyframeRequest,
             Control::Bye,
             Control::CursorVisible { visible: true },
+            Control::HostNotice {
+                code: NOTICE_INPUT_BLOCKED_ELEVATED,
+            },
         ];
         // All messages back to back in one stream, as on TCP.
         let mut stream = Vec::new();

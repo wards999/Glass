@@ -172,8 +172,23 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         t.start()
     }
 
+    private var statsHidden = false
+
     func toggleOverlay() {
-        overlay?.isHidden.toggle()
+        statsHidden.toggle()
+        overlay?.isHidden = statsHidden
+    }
+
+    /// Why the PC isn't taking input right now (shown even with stats hidden).
+    private func noticeText(_ code: UInt8) -> String? {
+        switch Int32(code) {
+        case GLASS_NOTICE_INPUT_BLOCKED_ELEVATED:
+            return "⚠️ The PC is ignoring mouse and keyboard: a program running as administrator is in front. Click another window on the PC, or run host.cmd as administrator."
+        case GLASS_NOTICE_INPUT_BLOCKED_SECURE_DESKTOP:
+            return "⚠️ The PC is showing a UAC prompt or the lock screen, which Glass can't see or control. Answer it on the PC itself."
+        default:
+            return nil
+        }
     }
 
     /// Ends the session (from the UI); the decode thread closes the client.
@@ -433,7 +448,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             let inputLine = inp.count > 0
                 ? String(format: "input → screen    p50 %.1f  p99 %.1f ms", Double(inp.p50_us) / 1e3, Double(inp.p99_us) / 1e3)
                 : "input → screen    (move or type to measure)"
-            let lines = [
+            var lines = [
                 "Glass  \(client.host)  \(streamDesc)  [\(pcStyleModifiers ? "⌘→Win ⌃→Ctrl" : "⌘→Ctrl ⌃→Win")]",
                 String(format: "shown %.0f fps  received %.0f fps  %.1f Mbps", Double(r.presented) / secs, Double(r.frames) / secs, Double(r.bytes) * 8 / secs / 1e6),
                 totalLine,
@@ -442,6 +457,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 "lost \(st.rx.frames_lost)  skipped \(st.rx.frames_skipped)  keyframe req \(st.keyframe_requests)  decode err \(decodeErrors)  RTT \(String(format: "%.1f", Double(st.last_rtt_us) / 1e3)) ms  input events \(st.input_events)",
                 "⌃⌥⌘F full screen · ⌃⌥⌘S hide stats · ⌃⌥⌘W disconnect · ⌃⌥⌘Q quit",
             ]
+            if let n = noticeText(st.host_notice) { lines.insert(n, at: 0) }
             if now - windowStart >= 2_000_000 {
                 recent.reset()
                 windowStart = now
@@ -449,7 +465,16 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             return lines.joined(separator: "\n")
         }
         overlay.stringValue = text
+        // A blocking notice shows even when the stats are hidden.
+        let notice = noticeText(st.host_notice)
+        if statsHidden {
+            overlay.isHidden = notice == nil
+            if let notice { overlay.stringValue = notice }
+        }
+        if notice != nil { noticesSeen.insert(st.host_notice) }
     }
+
+    private var noticesSeen = Set<UInt8>()
 
     private func completed(_ reason: String) {
         guard !finished else { return }
@@ -477,6 +502,9 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                               Double(s.bytes) * 8 / secs / 1e6, st.clock_valid ? "ok" : "NOT SYNCED",
                               Double(st.clock_rtt_us) / 1e3, Double(st.last_rtt_us) / 1e3))
             out.append("  input: \(st.input_events) events in \(st.input_packets) packets | keyboard \(iso ? "ISO" : "ANSI"), \(pcStyleModifiers ? "PC-style (⌘→Win)" : "Mac-style (⌘→Ctrl)")")
+            if !noticesSeen.isEmpty {
+                out.append("  PC notices: \(noticesSeen.sorted().map { $0 == UInt8(GLASS_NOTICE_INPUT_BLOCKED_ELEVATED) ? "input blocked by an admin window" : "UAC prompt / lock screen" }.joined(separator: ", "))")
+            }
             out.append("  decoder: \(usingHardware ? "hardware" : "SOFTWARE")")
             out.append(s.encode.line("encode (host)"))
             out.append(s.network.line("network"))

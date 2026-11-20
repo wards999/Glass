@@ -40,6 +40,19 @@
       0.25 ms + present 5.0 ms.
     - Present interval sd 2.6 ms.
 
+## CI (macOS runner, packaged app)
+- Swift builds and its unit tests pass:
+  - the host over GlassKit: pairing PIN event, frames intact, keys arrive as HID
+  - Annex-B helper
+  - local addresses
+- Glass.app is signed with the stable certificate (designated requirement
+  `certificate leaf = H"d1d155bb…"`).
+- **Mac host smoke test:** `GlassMac host --test-pattern` (1280×720 test
+  pattern, VideoToolbox) streamed to `glass probe`: 188 frames in 4 s,
+  0 lost, 0 rejected, pairing included.
+- `check-444` on the runner (a VM): HEVC 4:2:0 and 4:4:4 hardware encode
+  both YES. To be confirmed on the M4.
+
 ## Not compiled or tested here
 - The Mac host (Swift) is built and unit-tested only in CI on macOS. The CI
   runner has no screen to share, so CI streams a test pattern from the

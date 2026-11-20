@@ -18,6 +18,7 @@ Live viewer (M2):
     Ctrl+Option+Cmd+F   full screen / window
     Ctrl+Option+Cmd+S   hide / show stats
     Ctrl+Option+Cmd+W   disconnect (then "Copy results" and paste them back)
+    Ctrl+Option+Cmd+Q   quit Glass (Cmd+Q goes to the PC while viewing)
   Every other key goes to the PC: Cmd acts as Ctrl (Cmd+C copies), Ctrl as the
   Windows key, Option as Alt. Connection > PC-Style Modifiers swaps Cmd/Ctrl.
   macOS keeps Cmd+Tab, Cmd+Space and Mission Control for itself.

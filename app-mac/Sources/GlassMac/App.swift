@@ -55,6 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             item("Connect…", #selector(showConnectAction), "n", target: self),
             item("Open Recording…", #selector(openRecording), "o", target: self),
             item("Disconnect", #selector(NSWindow.performClose(_:)), "w", chord),
+            item("Quit Glass (while viewing)", #selector(NSApplication.terminate(_:)), "q", chord),
             .separator(),
             pcStyle,
         ])

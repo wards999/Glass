@@ -222,7 +222,9 @@ capacity that changes as you move. Design for it:
     admin password) keeps `awdl0` down only while a session runs and restores
     it when the session ends, when Glass quits, or if Glass crashes (the helper
     watches the app). The overlay shows when it's active, and the stats show
-    whether it helped. Needs a Developer ID-signed app to install cleanly.
+    whether it helped. Without a Developer ID (§7b) the helper is installed
+    by a one-time admin step (a LaunchDaemon that only toggles `awdl0` and
+    only answers Glass on a local socket), not by `SMAppService`.
     Built after M5, and only if Glass still shows AWDL spikes there.
 - **Baseline:** StarDesk on the same machines and Wi-Fi is the bar to beat.
   Measure it once (glass-to-glass with a phone slow-motion video, both
@@ -248,6 +250,31 @@ capacity that changes as you move. Design for it:
 - Per-session ephemeral keys (forward secrecy); periodic rekeying for long sessions.
 - Host-side setting: "require confirmation for each connection" vs unattended access.
 - Clipboard and audio are off until enabled per paired device.
+
+## 7b. Distribution without an Apple Developer ID
+
+Glass will not be signed with an Apple Developer ID or notarized. Design around it:
+
+- **Stable self-signed code signature.** CI signs `Glass.app` with one
+  self-signed code-signing certificate (made once; the private key is kept as
+  an encrypted GitHub Actions secret), instead of ad-hoc signing. macOS ties
+  Screen Recording, Accessibility and Local Network approvals to the app's
+  signing identity, so with a stable certificate they **survive updates**;
+  ad-hoc signatures change with every build and would make the user re-grant
+  them each time.
+- **Gatekeeper:** each downloaded build still needs right-click → Open (or
+  "Open Anyway", or `xattr -dr com.apple.quarantine`) on first launch. The
+  README and the release notes say so.
+- **Permissions (Mac host):** detect missing Screen Recording/Accessibility at
+  start, open the right System Settings pane, and explain the one-time
+  approval. Keep the bundle ID (`local.glass.Glass`) and certificate fixed.
+- **No `SMAppService`/privileged-helper APIs** that need notarization;
+  anything needing root (only the optional §5d Wi-Fi toggle) is a one-time
+  admin install step.
+- **Private APIs are allowed** (no App Store): `CGVirtualDisplay` for §4b.
+- **Windows:** the exe is unsigned too; SmartScreen needs "More info → Run
+  anyway" per build, and Windows Firewall asks per folder. `host.cmd` and the
+  README explain both. The ViGEmBus driver (M5b) is signed by its vendor.
 
 ## 8. Latency budget (targets)
 
@@ -286,7 +313,7 @@ numbers give the order. (Reordered 2026-11-20, ADR 0007.)
 7. **M4 – Robustness (Wi-Fi):** FEC (adaptive, interleaved, sized for Wi-Fi), send pacing, DSCP marking, packet-loss simulator in `/tools` with Wi-Fi-like burst loss and delay spikes (replayed from M2/M3 measurements). Both directions.
 8. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation on both viewers, capture rate matched to the viewer's refresh, adaptive bitrate, frame-interval metrics against the §5c pacing target on Wi-Fi. StarDesk baseline measured before it (§5d). Compare against StarDesk and Moonlight.
 9. **M5b – Gaming (use case B):** audio (Opus, A/V sync), game controller (GameController → ViGEmBus), relative mouse mode, game-mode overlay. Measured with a real Steam game (§5c). The opt-in low-latency Wi-Fi toggle (§5d) goes here if M5 still shows AWDL spikes.
-10. **M6 – Security:** mDNS discovery, PIN pairing, pinned mutual TLS, encrypted UDP. Developer ID signing for both apps.
+10. **M6 – Security:** mDNS discovery, PIN pairing, pinned mutual TLS, encrypted UDP. Code-signing as in §7b.
 11. **M7 – Clarity (rest):** native resolution for PC → Mac (Windows virtual display, IddCx), scene-change burst, still-region refinement on the Windows host.
 12. **M8 – Extras:** clipboard, direct NVENC SDK path, audio and controller for the Mac-host direction.
 

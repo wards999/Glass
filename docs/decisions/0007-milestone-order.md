@@ -21,5 +21,4 @@ Milestone names stay the same so earlier results and ADRs still line up.
 - Use case A becomes usable (and sharp) two milestones from now, before the
   Wi-Fi and smoothness work, which then improves both directions at once.
 - The Mac host needs Screen Recording and Accessibility permissions from
-  M3b; unsigned test builds will ask again after each update until M6 adds
-  Developer ID signing.
+  M3b; ADR 0008 keeps those approvals across updates without a Developer ID.

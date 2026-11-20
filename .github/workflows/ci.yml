@@ -52,6 +52,8 @@ jobs:
       - name: Smoke test (no GPU/capture on runners)
         shell: bash
         run: |
+          ls target/release/*.dll || echo "no FFmpeg DLLs copied next to glass.exe"
+          export PATH="$PWD/third_party/ffmpeg/bin:$PATH"
           target/release/glass.exe --version
           for c in 420 444; do
             f=app-mac/Tests/GlassKitTests/Fixtures/testsrc-$c.glsr

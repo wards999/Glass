@@ -52,7 +52,6 @@ public final class Renderer {
         guard st == kCVReturnSuccess, let cache else { throw GlassError.metal("CVMetalTextureCacheCreate \(st)") }
         self.device = device
         self.queue = queue
-        self.pipeline = pipeline
         self.cache = cache
     }
 

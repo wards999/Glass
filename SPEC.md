@@ -2,6 +2,47 @@
 
 Working name: **Glass** (rename freely)
 
+## 0. Use cases and acceptance criteria (read first)
+
+Both use cases run **over home Wi-Fi** (§5d). If Glass doesn't beat the
+existing tools on the criteria below, there's no reason to build it, so every
+milestone reports against them.
+
+The setup: Windows PC with RTX 4070 and a 2560×1440 @ 165 Hz monitor; MacBook
+Air M4 with a 2940×1912 @ 60 Hz built-in display.
+
+### A. Primary: the PC shows the Mac's desktop (Mac host → Windows viewer)
+Desktop work: reading and writing text, code, web, documents.
+
+- **Text is never fuzzy.** The Mac renders a desktop at the PC monitor's
+  exact pixel size (2560×1440 virtual display, §4b) and the PC shows it **1:1,
+  no scaling, no bars**. Chroma is full (4:4:4) or, if the Mac can't encode
+  4:4:4 in hardware, an equivalent: still regions are refined to visually
+  lossless.
+  - **Still content:** within **150 ms** of something stopping, the viewer's
+    picture matches the Mac's to visually lossless (PSNR ≥ 45 dB on the clarity
+    test card; text edges exact).
+  - **While moving** (scroll, drag): allowed to soften, but text stays readable
+    and recovers within the 150 ms above. Wi-Fi capacity changes lower the
+    bitrate (§5d) but never the resolution.
+- **Very responsive:** input → screen **p50 ≤ 30 ms, p99 ≤ 60 ms** on Wi-Fi
+  (PC display at 165 Hz, Mac capturing at up to 120 Hz). The pointer is drawn
+  locally on the PC, so it always moves with zero lag.
+
+### B. Secondary: the Mac shows the PC, often a Steam game (Windows host → Mac viewer)
+- **No stutter:** the §5c pacing target on Wi-Fi (≤ 1 missed refresh in 1000,
+  present-interval stddev < 1 ms, p99 < 1.5 refreshes at 60 Hz).
+- **Audio:** in sync with the picture (±20 ms), audio latency ≤ 40 ms, no
+  dropouts on a good Wi-Fi link.
+- **Very responsive:** input → screen **p50 ≤ 35 ms, p99 ≤ 60 ms** on Wi-Fi at
+  60 Hz; game controller and mouse-look work (§5c).
+- Text clarity matters less here than smoothness: the bitrate adapts first.
+
+### How we prove it
+Each result file (`docs/results/Mx.md`) states the network (Wi-Fi band, RTT,
+spike count) and the numbers above for whichever use case the milestone
+touches. "Feels fine" is recorded too, but the numbers decide.
+
 ## 1. Goal
 
 A **two-way** remote desktop tool between a Windows PC and a Mac on the same LAN. Either machine can be the host, and either can connect to the other (A → B or B → A). Each app contains both roles. It:
@@ -91,7 +132,8 @@ Why this split: networking, FEC and crypto must match exactly on both sides, so 
 - **Encode:** VideoToolbox `VTCompressionSession` (HEVC, hardware) with real-time and low-latency rate control (`kVTVideoEncoderSpecification_EnableLowLatencyRateControl`), no frame reordering, and a short max frame delay. 4:4:4 where supported. Scene-change bursts and still-region refinement use the same `core` rate-control logic as Windows, applied through per-frame bitrate/keyframe properties.
 - **Input injection:** `CGEvent` posting (mouse, keyboard, scroll). Needs the **Accessibility** permission. Map Windows key codes to macOS key codes, and Ctrl ↔ Cmd by configurable rule.
 - **Audio:** ScreenCaptureKit system-audio capture (macOS 13+) → Opus.
-- **Virtual display (later):** macOS has no public virtual-display API; look into the private `CGVirtualDisplay` approach used by some open-source tools, or stream the physical display at its native resolution.
+- **Virtual display (required for use case A, §0):** create a display at the viewer's exact pixel size (2560×1440 for the PC monitor, at 1× so one Mac pixel = one PC pixel; up to 120 Hz) and stream that, so the PC never scales. macOS has no public API: use the private `CGVirtualDisplay` approach used by open-source tools (e.g. BetterDisplay, DeskPad), behind a fallback that streams the physical display (scaled, with bars) if it ever breaks.
+- **Text clarity on the Mac host:** check first (start of M3b) whether VideoToolbox can hardware-encode HEVC 4:4:4 on the M4. If not, use 4:2:0 for motion plus still-region refinement (re-encode unchanged areas at very low QP, or send them in a lossless 4:4:4 side path) to meet the §0 still-content target.
 - **Unattended access:** run as a login item. The login window / locked screen is out of scope for v1.
 
 ## 5. Mac as client
@@ -217,7 +259,7 @@ display queue, which M5 removes.
 
 ## 9. Milestones
 
-Build PC → Mac first through M3, then add the reverse direction (M3b) before hardening, so `core` is proven symmetric early.
+Build PC → Mac first through M3, then add the reverse direction (M3b) before hardening, so `core` is proven symmetric early. §0 sets the priorities: use case A (PC views the Mac) is primary.
 
 1. **M0 – Skeleton:** repo layout, `core` crate building for Windows and macOS, Swift app linking `core`, CI build for both.
 2. **M1 – Offline pipeline:** PC captures and encodes to an HEVC file; Mac decodes and renders that file with Metal. Measure encode/decode times.

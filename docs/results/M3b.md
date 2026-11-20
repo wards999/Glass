@@ -1,6 +1,6 @@
 # M3b — The PC views and controls the Mac: results
 
-**Status: built and tested locally; `m3b-test1` on the real PC and Mac pending.**
+**Status: DONE.** m3b-test1 worked on the real PC and Mac (2026-11-20). `check-444` on the M4 still to come (it decides M3c).
 **Date:** 2026-11-20 · design: ADR 0011 · protocol v4 (unchanged)
 
 ## What's in it
@@ -61,5 +61,47 @@
   the signing-certificate permission persistence need the real Mac.
 - 4:4:4 hardware encode on the M4: `GlassMac check-444` on the real Mac.
 
-## Measured — m3b-test1
-_Pending: PC viewer report and Mac host report, how it felt, check-444._
+## Measured — m3b-test1 (home Wi-Fi; MacBook Air M4 host 2940×1912 @ 60 Hz → PC viewer 2560×1440 @ 165 Hz)
+
+**It worked.** Typing, pointer and scrolling all reached the Mac. The user
+found the text **sharp and not small**, although it is scaled to 2214×1440
+on the PC.
+
+PC viewer, 106 s session: 1660 frames (15.7 fps on average: mostly a still
+screen), **0 lost, 0 decode errors, 0 rejected**, 1 keyframe request, D3D11VA,
+exact DXGI on-screen times, RTT 4.2–5.2 ms.
+
+| Stage | Mac → PC p50 / p99 | PC → Mac (m6-test1) p50 / p99 |
+|---|---|---|
+| encode (host) | 15.08 / 67.26 ms | 2.91 / 15.32 ms |
+| network (Wi-Fi) | 3.02 / 12.42 ms | 5.26 / 10.46 ms |
+| decode | 1.20 / 2.48 ms | 1.98 / 3.15 ms |
+| wait for refresh | 0.00 / 0.01 ms | 4.72 / 17.50 ms |
+| present | **8.48** / 12.55 ms | **32.00** / 48.71 ms |
+| **capture → screen** | **27.94 / 79.05 ms** | 48.00 / 71.93 ms |
+| input → screen | 38.74 / 205.96 ms | 65.84 / 215.89 ms |
+
+- **Mac → PC already meets SPEC §0's ≤ 35 ms p50** (27.9 ms). The Windows
+  flip-model present takes 8.5 ms, against 32 ms in the Mac's display queue.
+- **The Mac's encode step is the weak spot:** 15 ms p50 and 67 ms p99 in
+  the long session.
+  - In a short second session (59 frames at 5.5 fps, mostly idle) the
+    host's own report gave encode p50 60 ms.
+  - Sparse frames make it worse, as NVENC's GPU clocks did in M1 and M3.
+  - The measure runs from ScreenCaptureKit's frame time to encoder output,
+    so it also includes ScreenCaptureKit's delivery delay. The next build
+    reports the two separately ("capture delivery", "VideoToolbox"). M5.
+- The input → screen and present-interval p99s are idle gaps (screen
+  unchanged), as before.
+- The host report said "encoder SOFTWARE, low-latency rate control". That
+  was a reporting bug: a session created with "hardware only" is hardware,
+  but the low-latency encoder doesn't report the property. Fixed for the
+  next build.
+
+Problems found (fixed for the next build):
+1. connect.cmd run from inside the zip couldn't find glass.exe: both .cmd
+   files now say to extract first.
+2. Stop Sharing during a session lost its results: they now open in their
+   own window.
+3. Copy Results gave no feedback: it is now **Show Results**, a window with
+   Copy.

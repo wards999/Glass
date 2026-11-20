@@ -24,7 +24,10 @@ Desktop work: reading and writing text, code, web, documents.
     test card; text edges exact).
   - **While moving** (scroll, drag): allowed to soften, but text stays readable
     and recovers within the 150 ms above. Wi-Fi capacity changes lower the
-    bitrate (§5d) but never the resolution.
+    bitrate first (§5d); resolution drops only if the user allows it (§5e).
+  - The 1:1 native mode is the default; lower resolutions and the Mac's own
+    shape (bars at the sides) are user choices (§5e), still as sharp as
+    possible.
 - **Very responsive:** input → screen **p50 ≤ 30 ms, p99 ≤ 60 ms** on Wi-Fi
   (PC display at 165 Hz, Mac capturing at up to 120 Hz). The pointer is drawn
   locally on the PC, so it always moves with zero lag.
@@ -206,7 +209,9 @@ capacity that changes as you move. Design for it:
 - **Adaptive bitrate** (M5): the viewer reports loss, delay growth and jitter;
   the host lowers or raises the target bitrate (and the 4:4:4 → 4:2:0 choice)
   so the stream fits the link's current capacity instead of building queues.
-  Default ceiling 40–60 Mbps on Wi-Fi.
+  Default ceiling 40–60 Mbps on Wi-Fi. If even the floor bitrate can't hold
+  quality and "Auto" resolution is on (§5e), step the resolution down a rung,
+  and back up when the link recovers (with hysteresis, so it doesn't flap).
 - **Jitter buffer** (M5) adapts to the measured arrival jitter, typically
   0–2 frames on Wi-Fi, 0–1 wired; drops late frames rather than queueing.
 - **Wi-Fi QoS:** mark media and input packets with DSCP (video CS4/AF41, audio
@@ -231,6 +236,36 @@ capacity that changes as you move. Design for it:
   directions) and keep the numbers in `docs/results/baseline-stardesk.md`.
 - **Show the link:** the overlay shows Wi-Fi delay spikes, loss and current
   bitrate, so a bad link is visible as a link problem.
+
+## 5e. Resolution and shape choices (both directions)
+
+Native 1:1 is the sharpest, but it isn't always worth the data. The viewer
+offers, per connection (remembered per host):
+
+- **Shape:** *Fit this screen* (default: the host renders at the viewer's
+  shape, no bars), or *Host's own shape* (e.g. the Mac's 16:10 desktop on the
+  16:9 PC monitor, with black bars at the sides).
+- **Resolution:** *Native* (default for use case A), a ladder of lower sizes
+  in that shape (e.g. for 16:9: 2560×1440, 1920×1080, 1600×900, 1280×720), and
+  *Auto* (start native, step down only when §5d's bitrate floor can't keep
+  quality; default for use case B).
+- **As sharp as possible at a lower size:**
+  - **Render, don't shrink.** Where the host can render at the chosen size,
+    it does, so text is drawn crisply at that size instead of being shrunk
+    after the fact. Mac host: set the virtual display (§4b) to the chosen
+    size. Windows host: the IddCx virtual display (M7); until then, or for the
+    physical monitor, downscale on the GPU.
+  - **Good scaling where scaling is unavoidable.** Host downscale on the GPU
+    with an area/Lanczos filter (D3D11 video processor or a compute shader;
+    VideoToolbox/vImage on the Mac), never on the CPU. Viewer upscale with a
+    sharpening-aware filter (e.g. Lanczos or bicubic, optionally integer
+    scaling when the ratio is exact: 1280×720 → 2560×1440 is exactly 2×).
+  - Prefer sizes that divide the viewer's screen evenly (2×) and keep 4:4:4
+    for text when the bitrate allows.
+- Changing size or shape mid-stream: the host sends the new `StreamInfo` and an
+  IDR; the viewer re-creates its decoder and view without dropping the
+  session (needs M7's resolution-change handling, pulled into M3c).
+- The overlay shows the current size, shape and why it changed (user / Auto).
 
 ## 6. Transport protocol
 
@@ -309,9 +344,9 @@ numbers give the order. (Reordered 2026-11-20, ADR 0007.)
 3. **M2 – Live stream (unencrypted, LAN):** UDP packetiser, no FEC; live PC video on the Mac. Stats overlay with in-band latency.
 4. **M3 – Input:** mouse and keyboard back-channel, local cursor. Usable PC → Mac remote desktop.
 5. **M3b – Reverse direction (use case A):** first check whether VideoToolbox can hardware-encode HEVC 4:4:4 on the M4 (decides the clarity approach). Then the Mac host (ScreenCaptureKit + VideoToolbox encode + CGEvent, with Screen Recording/Accessibility permission checks) and the Windows viewer (D3D11VA decode + flip-model swap chain + Raw Input/keyboard hook + local pointer), full screen on the PC. Same protocol, with no changes to `core` beyond bug fixes. Role selection in both apps.
-6. **M3c – Sharp text, Mac → PC (use case A):** 2560×1440 virtual display on the Mac (`CGVirtualDisplay`, fallback to the physical display), shown 1:1 on the PC; native-resolution negotiation (viewer sends its size in `Hello`); 4:4:4 or still-region refinement; a clarity test card and PSNR measurement against the §0 still-content target (≤ 150 ms to visually lossless). Pulled forward from M7.
+6. **M3c – Sharp text, Mac → PC (use case A):** 2560×1440 virtual display on the Mac (`CGVirtualDisplay`, fallback to the physical display), shown 1:1 on the PC; native-resolution negotiation (viewer sends its size in `Hello`); resolution and shape choices with render-don't-shrink on the Mac and GPU scaling elsewhere (§5e), with mid-stream size changes; 4:4:4 or still-region refinement; a clarity test card and PSNR measurement against the §0 still-content target (≤ 150 ms to visually lossless). Pulled forward from M7.
 7. **M4 – Robustness (Wi-Fi):** FEC (adaptive, interleaved, sized for Wi-Fi), send pacing, DSCP marking, packet-loss simulator in `/tools` with Wi-Fi-like burst loss and delay spikes (replayed from M2/M3 measurements). Both directions.
-8. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation on both viewers, capture rate matched to the viewer's refresh, adaptive bitrate, frame-interval metrics against the §5c pacing target on Wi-Fi. StarDesk baseline measured before it (§5d). Compare against StarDesk and Moonlight.
+8. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation on both viewers, capture rate matched to the viewer's refresh, adaptive bitrate with the Auto resolution ladder (§5e), frame-interval metrics against the §5c pacing target on Wi-Fi. StarDesk baseline measured before it (§5d). Compare against StarDesk and Moonlight.
 9. **M5b – Gaming (use case B):** audio (Opus, A/V sync), game controller (GameController → ViGEmBus), relative mouse mode, game-mode overlay. Measured with a real Steam game (§5c). The opt-in low-latency Wi-Fi toggle (§5d) goes here if M5 still shows AWDL spikes.
 10. **M6 – Security:** mDNS discovery, PIN pairing, pinned mutual TLS, encrypted UDP. Code-signing as in §7b.
 11. **M7 – Clarity (rest):** native resolution for PC → Mac (Windows virtual display, IddCx), scene-change burst, still-region refinement on the Windows host.

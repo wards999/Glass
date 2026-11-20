@@ -18,9 +18,11 @@ Live stream to the Mac:
   3. When the Mac disconnects, this window prints the session's numbers and
      saves them to results-host.txt. Paste them back to Claude.
   For 4:4:4 instead of 4:2:0:  host.cmd --chroma 444
-  The Mac's mouse and keyboard control this PC while connected. To control
-  programs running as administrator, right-click host.cmd > Run as
-  administrator (Windows blocks input into them otherwise).
+  The Mac's mouse and keyboard control this PC while connected. host.cmd
+  asks Windows for administrator rights when it starts: answer Yes so the Mac
+  can also control admin windows (Task Manager, installers). If you answer
+  No it still works, but Windows blocks all of the Mac's input while an admin
+  window is in front. UAC prompts and the lock screen need the PC itself.
 
 M1 test (recordings): record-clips.cmd.
 

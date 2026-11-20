@@ -182,12 +182,17 @@ pub fn build(a: &InputAction, m: &Mapper, out: &mut [INPUT; 2]) -> usize {
 pub struct Injector {
     pub mapper: Mapper,
     pub failed: u64,
+    /// Last pointer position in screen pixels.
+    pub pointer: (i32, i32),
 }
 
 impl Injector {
     /// False if Windows refused it (UIPI: an elevated window has focus, or
     /// the secure desktop is up).
     pub fn inject(&mut self, a: &InputAction) -> bool {
+        if let InputAction::MoveTo { x, y } = *a {
+            self.pointer = self.mapper.pixel_of(x, y);
+        }
         let mut buf = [mouse(0, 0, 0, MOUSE_EVENT_FLAGS(0)); 2];
         let n = build(a, &self.mapper, &mut buf);
         if n == 0 {

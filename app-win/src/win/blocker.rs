@@ -4,6 +4,7 @@
 //! reports success in both cases, so this is the only way to tell the user.
 
 use windows::core::PWSTR;
+use windows::Win32::Foundation::POINT;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::StationsAndDesktops::{
@@ -14,7 +15,10 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetAncestor, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    SwitchToThisWindow, WindowFromPoint, GA_ROOT,
+};
 
 /// What is blocking input right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +133,28 @@ fn elevated_foreground() -> Option<String> {
         };
         let _ = CloseHandle(proc);
         elevated.then_some(name)
+    }
+}
+
+/// Best-effort escape while an admin window is in front and the host isn't
+/// elevated: bring the top-level window at `(x, y)` (screen pixels) to the
+/// front, as the click would have. Windows may refuse (foreground lock);
+/// then nothing changes. Returns whether it is now in front.
+pub fn try_focus_at((x, y): (i32, i32)) -> bool {
+    unsafe {
+        let hit = WindowFromPoint(POINT { x, y });
+        if hit.is_invalid() {
+            return false;
+        }
+        let top = GetAncestor(hit, GA_ROOT);
+        if top.is_invalid() || top == GetForegroundWindow() {
+            return false; // clicked the admin window itself
+        }
+        if SetForegroundWindow(top).as_bool() {
+            return true;
+        }
+        SwitchToThisWindow(top, true);
+        GetForegroundWindow() == top
     }
 }
 

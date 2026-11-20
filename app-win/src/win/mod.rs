@@ -11,6 +11,7 @@ mod mdns;
 
 use glass_core::clock;
 use glass_core::identity::fingerprint_short;
+use glass_core::input::InputAction;
 use glass_core::net::{HostListener, HostOptions, HostSession};
 use glass_core::packet::OutFrame;
 use glass_core::protocol::{CursorShape, StreamInfo, DEFAULT_PORT, FLAG_IDR};
@@ -429,7 +430,12 @@ pub fn host(args: &[String]) -> Res<()> {
         println!("You'll be asked before each connection (--ask).");
     }
     println!("(Allow glass.exe through Windows Firewall on private networks if asked.)");
-    println!("(To control programs running as administrator, run host.cmd as administrator.)");
+    if blocker::self_elevated() {
+        println!("Running as administrator: the Mac can control admin windows too (not UAC prompts or the lock screen).");
+    } else {
+        println!("Not running as administrator: Windows blocks the Mac's input while an admin window (e.g. Task Manager) is in front.");
+        println!("(Start host.cmd and answer Yes when Windows asks, or right-click it > Run as administrator.)");
+    }
     if !a.local {
         let v4 = match lan {
             Some(std::net::IpAddr::V4(v4)) => Some(v4),
@@ -459,6 +465,7 @@ pub fn host(args: &[String]) -> Res<()> {
                 height: mon.height as i32,
             }),
             failed: 0,
+            pointer: (0, 0),
         };
         // Windows drops input into admin windows and the secure desktop while
         // still reporting success, so count what arrived during a known block.
@@ -466,6 +473,14 @@ pub fn host(args: &[String]) -> Res<()> {
         let blocking = Arc::new(AtomicU8::new(0));
         let (b, bl) = (blocked.clone(), blocking.clone());
         let sink = Box::new(move |action| {
+            // Without admin rights Windows drops every injected event while an
+            // admin window has focus, so a click can't move focus away. Try
+            // bringing the clicked window forward instead (best effort).
+            if bl.load(Ordering::Relaxed) == glass_core::protocol::NOTICE_INPUT_BLOCKED_ELEVATED {
+                if let InputAction::Button { down: true, .. } = action {
+                    blocker::try_focus_at(injector.pointer);
+                }
+            }
             let ok = injector.inject(&action);
             if !ok || bl.load(Ordering::Relaxed) != 0 {
                 b.fetch_add(1, Ordering::Relaxed);

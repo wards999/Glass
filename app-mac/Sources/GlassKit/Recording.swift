@@ -74,6 +74,7 @@ public final class Stats {
     deinit { glass_stats_free(ring) }
 
     public func push(_ us: UInt32) { glass_stats_push(ring, us) }
+    public func reset() { glass_stats_reset(ring) }
     public func push(seconds: Double) { push(UInt32(max(0, min(seconds * 1e6, Double(UInt32.max))))) }
     public var summary: GLASS_Summary { glass_stats_summary(ring) }
 

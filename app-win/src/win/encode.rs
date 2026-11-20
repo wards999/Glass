@@ -7,7 +7,10 @@ use ffmpeg_sys_next as ff;
 use std::ffi::{c_void, CStr, CString};
 use std::ptr;
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+};
 
 pub struct Config {
     pub width: u32,
@@ -15,6 +18,9 @@ pub struct Config {
     pub fps: u32,
     pub bitrate: i64,
     pub chroma444: bool,
+    /// Keep a GPU copy of the last frame so an IDR can be sent on request
+    /// even when the screen is idle and capture delivers nothing new.
+    pub keep_last: bool,
 }
 
 pub struct Encoder {
@@ -23,6 +29,9 @@ pub struct Encoder {
     frame: *mut ff::AVFrame,
     pkt: *mut ff::AVPacket,
     d3d: ID3D11DeviceContext,
+    device: ID3D11Device,
+    keep_last: bool,
+    last: Option<ID3D11Texture2D>,
 }
 
 const EAGAIN: i32 = -11; // AVERROR(EAGAIN) on Windows
@@ -134,6 +143,9 @@ impl Encoder {
                 frame: ff::av_frame_alloc(),
                 pkt: ff::av_packet_alloc(),
                 d3d: device.GetImmediateContext()?,
+                device: device.clone(),
+                keep_last: cfg.keep_last,
+                last: None,
             })
         }
     }
@@ -141,6 +153,49 @@ impl Encoder {
     /// Encodes one captured texture. `on_packet(data, is_keyframe, pts_us)` is
     /// called for every packet the encoder emits (with delay=0: this frame's).
     pub fn encode(
+        &mut self,
+        src: &ID3D11Texture2D,
+        pts_us: i64,
+        force_idr: bool,
+        on_packet: impl FnMut(&[u8], bool, i64),
+    ) -> Res<()> {
+        if self.keep_last {
+            if self.last.is_none() {
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe { src.GetDesc(&mut desc) };
+                desc.Usage = D3D11_USAGE_DEFAULT;
+                desc.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
+                desc.CPUAccessFlags = 0;
+                desc.MiscFlags = 0;
+                let mut t = None;
+                unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut t))? };
+                self.last = t;
+            }
+            if let Some(last) = &self.last {
+                unsafe { self.d3d.CopyResource(last, src) };
+            }
+        }
+        self.encode_texture(src, pts_us, force_idr, on_packet)
+    }
+
+    /// True once a frame has been kept for [`Self::encode_last_idr`].
+    pub fn has_last(&self) -> bool {
+        self.last.is_some()
+    }
+
+    /// Re-encodes the last captured frame as an IDR (idle screen + keyframe request).
+    pub fn encode_last_idr(
+        &mut self,
+        pts_us: i64,
+        on_packet: impl FnMut(&[u8], bool, i64),
+    ) -> Res<()> {
+        let Some(last) = self.last.clone() else {
+            return Ok(());
+        };
+        self.encode_texture(&last, pts_us, true, on_packet)
+    }
+
+    fn encode_texture(
         &mut self,
         src: &ID3D11Texture2D,
         pts_us: i64,

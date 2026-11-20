@@ -11,6 +11,7 @@
     <key>CFBundleVersion</key><string>__BUILD__</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSLocalNetworkUsageDescription</key><string>Glass connects to your PC on the local network to show its screen.</string>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>

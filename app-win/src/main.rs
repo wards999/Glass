@@ -1,11 +1,13 @@
 //! Glass for Windows: host and client roles in one app.
 //!
-//! M1 commands:
+//! Commands:
+//!   glass host [opts]                  stream a monitor live to a viewer (M2)
+//!   glass probe HOST [opts]            headless viewer: receive and time, no decode
+//!   glass serve FILE.glsr              stream a recording as if live (tests)
 //!   glass list                         list monitors and GPUs
 //!   glass record [opts] out.glsr       capture a monitor and encode HEVC to a recording
 //!   glass dump in.glsr out.h265        write the raw Annex-B stream (for ffplay)
 //!
-//! LATER(M2): live UDP stream instead of a file.
 //! LATER(M3b): client decode (D3D11VA) -> flip-model present, Raw Input.
 //! LATER(M6): tray shell, device list, pairing UI.
 
@@ -15,21 +17,33 @@ const VERSION: &str = match option_env!("GLASS_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+mod probe;
 #[cfg(windows)]
 mod win;
 
+/// "Glass (Windows) <version> | core <v> | protocol v<n>"
+pub fn banner() -> String {
+    format!(
+        "Glass (Windows) {} | core {} | protocol v{}",
+        VERSION,
+        glass_core::VERSION,
+        glass_core::protocol::PROTOCOL_VERSION
+    )
+}
+
 fn usage() -> ! {
     eprintln!(
-        "Glass (Windows) {ver} | core {core} | protocol v{proto}
+        "{}
 
 usage:
+  glass host [--monitor N] [--chroma 420|444] [--mbps M] [--port P] [--log FILE]
+  glass probe HOST [--port P] [--seconds S] [--verify FILE.glsr] [--min-frames N]
+  glass serve FILE.glsr [--port P]
   glass list
   glass record [--monitor N] [--seconds S] [--chroma 420|444] [--mbps M] out.glsr
   glass dump in.glsr out.h265
   glass pack in.h265 out.glsr WIDTH HEIGHT FPS 420|444",
-        ver = VERSION,
-        core = glass_core::VERSION,
-        proto = glass_core::protocol::PROTOCOL_VERSION,
+        banner()
     );
     std::process::exit(2)
 }
@@ -104,17 +118,16 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("dump") if args.len() == 3 => dump(&args[1], &args[2]),
         Some("pack") => pack(&args[1..]),
+        Some("probe") => probe::probe(&args[1..]),
+        Some("serve") => probe::serve(&args[1..]),
+        #[cfg(windows)]
+        Some("host") => win::host(&args[1..]),
         #[cfg(windows)]
         Some("list") => win::list(),
         #[cfg(windows)]
         Some("record") => win::record(&args[1..]),
         Some("--version") => {
-            println!(
-                "Glass (Windows) {} | core {} | protocol v{}",
-                VERSION,
-                glass_core::VERSION,
-                glass_core::protocol::PROTOCOL_VERSION
-            );
+            println!("{}", banner());
             Ok(())
         }
         _ => usage(),

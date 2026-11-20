@@ -6,7 +6,9 @@ style = "type"
 
 [export]
 prefix = "GLASS_"
-include = []
+include = ["ConnectError"]
+# OS functions declared in core/src/clock.rs; the system headers own them.
+exclude = ["clock_gettime_nsec_np", "QueryPerformanceCounter", "QueryPerformanceFrequency"]
 
 [enum]
 prefix_with_name = true

@@ -1,3 +1,4 @@
+import CoreGraphics
 import CoreVideo
 import Foundation
 import Metal
@@ -82,19 +83,38 @@ public final class Renderer {
         return t
     }
 
-    /// Encodes the conversion draw into `cb`. Returns false if the planes
-    /// couldn't be wrapped.
+    /// Aspect-fit rectangle for a `src`-sized image inside `dst` (centred, bars
+    /// on the short sides). Integer-aligned so a 1:1 fit stays pixel-exact.
+    public static func fitViewport(src: CGSize, dst: CGSize) -> MTLViewport {
+        guard src.width > 0, src.height > 0 else {
+            return MTLViewport(originX: 0, originY: 0, width: dst.width, height: dst.height, znear: 0, zfar: 1)
+        }
+        let s = min(dst.width / src.width, dst.height / src.height)
+        let w = (src.width * s).rounded(), h = (src.height * s).rounded()
+        return MTLViewport(originX: ((dst.width - w) / 2).rounded(.down), originY: ((dst.height - h) / 2).rounded(.down),
+                           width: w, height: h, znear: 0, zfar: 1)
+    }
+
+    /// Encodes the conversion draw into `cb`. With `fit`, the picture keeps its
+    /// aspect ratio inside `target` with black bars; otherwise it fills it.
+    /// Returns false if the planes couldn't be wrapped.
     @discardableResult
-    public func encode(_ pb: CVPixelBuffer, to target: MTLTexture, in cb: MTLCommandBuffer) -> Bool {
+    public func encode(_ pb: CVPixelBuffer, to target: MTLTexture, in cb: MTLCommandBuffer, fit: Bool = false) -> Bool {
         guard let yT = texture(pb, plane: 0, format: .r8Unorm),
               let cT = texture(pb, plane: 1, format: .rg8Unorm),
               let y = CVMetalTextureGetTexture(yT), let c = CVMetalTextureGetTexture(cT)
         else { return false }
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = target
-        pass.colorAttachments[0].loadAction = .dontCare
+        pass.colorAttachments[0].loadAction = fit ? .clear : .dontCare
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         pass.colorAttachments[0].storeAction = .store
         guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return false }
+        if fit {
+            enc.setViewport(Self.fitViewport(
+                src: CGSize(width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb)),
+                dst: CGSize(width: target.width, height: target.height)))
+        }
         var csc = Self.csc(bt709: Self.isBT709(pb))
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentTexture(y, index: 0)

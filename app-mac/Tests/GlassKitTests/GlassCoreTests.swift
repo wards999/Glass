@@ -7,7 +7,7 @@ final class GlassCoreTests: XCTestCase {
     func testCoreLinksAndReportsVersions() {
         XCTAssertFalse(GlassCore.version.isEmpty)
         XCTAssertEqual(GlassCore.version.split(separator: ".").count, 3)
-        XCTAssertEqual(GlassCore.protocolVersion, 0)
+        XCTAssertEqual(GlassCore.protocolVersion, 1)
     }
 }
 
@@ -91,5 +91,64 @@ final class PipelineTests: XCTestCase {
             distinct.insert((r << 16) | (g << 8) | b)
         }
         XCTAssertGreaterThan(distinct.count, 8, "expected a colourful test pattern")
+    }
+}
+
+/// Live path over loopback: core's replay host streams a fixture, GlassClient
+/// receives it (same code the viewer uses), VideoToolbox decodes it.
+final class LiveTests: XCTestCase {
+    func testLoopbackStreamDecodes() throws {
+        for name in ["testsrc-420", "testsrc-444"] {
+            let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "glsr", subdirectory: "Fixtures"))
+            let data = try Data(contentsOf: url)
+            let rec = try Recording(data: data)
+            let expected = Set(rec.frames.map { f in rec.withFrameBytes(f) { Data($0) } })
+            let host = try ReplayHost(data: data)
+            let client = try GlassClient(host: "127.0.0.1", port: host.port)
+            XCTAssertEqual(client.info.width, 320)
+            XCTAssertEqual(client.info.height, 192)
+            XCTAssertEqual(client.is444, rec.is444)
+            let dec = HEVCDecoder(chroma444: client.is444)
+            var received = 0, decoded = 0, mismatched = 0
+            let deadline = Date().addingTimeInterval(10)
+            do {
+                while decoded < 24, Date() < deadline {
+                    let r = try client.waitFrame(timeoutMs: 200) { _, bytes in
+                        received += 1
+                        if !expected.contains(Data(bytes)) { mismatched += 1 }
+                        if try dec.decode(bytes) != nil { decoded += 1 }
+                    }
+                    XCTAssertNotEqual(r, .disconnected)
+                }
+            } catch let error where rec.is444 {
+                throw XCTSkip("HEVC 4:4:4 decode unavailable on this machine: \(error)")
+            }
+            XCTAssertGreaterThanOrEqual(decoded, 24, name)
+            XCTAssertEqual(mismatched, 0, name)
+            XCTAssertEqual(client.stats.rx.frames_lost, 0, name)
+            XCTAssertNotNil(client.hostToLocal(GlassClock.nowUs()), "clock sync should have a sample by now")
+            print("\(name): received \(received), decoded \(decoded), RTT \(client.stats.last_rtt_us) us")
+            client.close()
+            host.stop()
+        }
+    }
+
+    func testConnectRefused() {
+        XCTAssertThrowsError(try GlassClient(host: "127.0.0.1", port: 9)) { error in
+            XCTAssertEqual((error as? ConnectFailure)?.code, 2)
+        }
+    }
+
+    func testFitViewport() {
+        // 16:9 into 16:10 -> bars top and bottom.
+        let v = Renderer.fitViewport(src: CGSize(width: 2560, height: 1440), dst: CGSize(width: 2940, height: 1912))
+        XCTAssertEqual(v.width, 2940)
+        XCTAssertEqual(v.height, 1654)
+        XCTAssertEqual(v.originX, 0)
+        XCTAssertEqual(v.originY, 129)
+        // Exact fit stays 1:1.
+        let e = Renderer.fitViewport(src: CGSize(width: 2560, height: 1440), dst: CGSize(width: 2560, height: 1440))
+        XCTAssertEqual(e.width, 2560)
+        XCTAssertEqual(e.originY, 0)
     }
 }

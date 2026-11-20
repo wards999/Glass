@@ -17,10 +17,25 @@
 
 #define GLASS_NAL_AUD 35
 
+#define GLASS_ClockSync_WINDOW 16
+
 /**
- * Protocol version. 0 = draft (pre-M2); nothing is on the wire yet.
+ * Whole UDP datagram, header included. Fits a 1500-byte Ethernet MTU with
+ * room for IP/UDP (and, from M6, the AEAD tag).
  */
-#define GLASS_PROTOCOL_VERSION 0
+#define GLASS_MAX_DATAGRAM 1400
+
+
+
+/**
+ * Protocol version. 1 = M2: unencrypted LAN video + plain-TCP control.
+ */
+#define GLASS_PROTOCOL_VERSION 1
+
+/**
+ * Default TCP control port; the host's UDP media socket uses the same number.
+ */
+#define GLASS_DEFAULT_PORT 47800
 
 /**
  * Frame is an IDR / keyframe.
@@ -32,7 +47,23 @@
  */
 #define GLASS_FLAG_REFINEMENT (1 << 1)
 
+#define GLASS_PUNCH_SIZE 8
+
+/**
+ * Why a host refused a viewer.
+ */
+#define GLASS_REJECT_VERSION 1
+
+#define GLASS_REJECT_BUSY 2
+
+/**
+ * Largest encoded control message (including the 2-byte length).
+ */
+#define GLASS_CONTROL_MAX 32
+
 #define GLASS_VideoPacketHeader_SIZE 24
+
+#define GLASS_FrameInfo_SIZE 8
 
 #define GLASS_FORMAT_VERSION 1
 
@@ -50,10 +81,57 @@
 #define GLASS_Stage_COUNT 6
 
 /**
+ * Why `Client::connect` failed. `repr(i32)` for the C ABI.
+ */
+enum GLASS_ConnectError
+#if __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // __STDC_VERSION__ >= 202311L
+ {
+  /**
+   * Host name didn't resolve to an IPv4 address.
+   */
+  GLASS_ConnectError_Resolve = 1,
+  /**
+   * TCP connect failed (refused, unreachable, timed out).
+   */
+  GLASS_ConnectError_Connect = 2,
+  /**
+   * Connected but the handshake failed.
+   */
+  GLASS_ConnectError_Handshake = 3,
+  /**
+   * Host speaks a different protocol version.
+   */
+  GLASS_ConnectError_Version = 4,
+  /**
+   * Couldn't create the UDP socket.
+   */
+  GLASS_ConnectError_Socket = 5,
+};
+#if __STDC_VERSION__ >= 202311L
+typedef enum GLASS_ConnectError GLASS_ConnectError;
+#else
+typedef int32_t GLASS_ConnectError;
+#endif // __STDC_VERSION__ >= 202311L
+
+/**
+ * A viewer connection. Exactly one thread may call `wait_frame`/`release_frame`.
+ */
+typedef struct GLASS_Client GLASS_Client;
+
+typedef struct GLASS_Replay GLASS_Replay;
+
+/**
  * Fixed-capacity ring of duration samples (µs). `push` is O(1) and never
  * allocates; `summary` sorts a copy and is meant for reporting, off the hot path.
  */
 typedef struct GLASS_StatRing GLASS_StatRing;
+
+/**
+ * Header at the start of every video packet. Fixed size, big-endian.
+ */
+typedef struct GLASS_VideoPacketHeader GLASS_VideoPacketHeader;
 
 typedef struct {
   uint8_t codec;
@@ -123,6 +201,93 @@ typedef struct {
   double mean_us;
   double stddev_us;
 } GLASS_Summary;
+
+/**
+ * Stream description sent by the host in [`Control::Welcome`].
+ */
+typedef struct {
+  /**
+   * `recording::CODEC_HEVC`.
+   */
+  uint8_t codec;
+  /**
+   * `recording::CHROMA_420` or `CHROMA_444`.
+   */
+  uint8_t chroma;
+  uint16_t width;
+  uint16_t height;
+  /**
+   * Host display refresh rate (capture rate cap).
+   */
+  uint16_t fps;
+} GLASS_StreamInfo;
+
+/**
+ * Per-frame metadata handed to the consumer. All `*_us` are local-clock except
+ * `capture_ts_us` (host clock; see [`Client::host_to_local`]).
+ */
+typedef struct {
+  uint32_t frame_id;
+  uint8_t flags;
+  uint16_t packets;
+  uint32_t encode_us;
+  uint64_t capture_ts_us;
+  uint64_t first_packet_us;
+  uint64_t last_packet_us;
+  /**
+   * When the frame entered the consumer queue.
+   */
+  uint64_t queued_us;
+} GLASS_LiveFrameMeta;
+
+/**
+ * Receive-side counters. `repr(C)` so the client can hand them over FFI.
+ */
+typedef struct {
+  uint64_t packets;
+  uint64_t bytes;
+  uint64_t duplicates;
+  /**
+   * Packets for frames older than the last delivered one.
+   */
+  uint64_t late;
+  /**
+   * Unparseable or inconsistent packets.
+   */
+  uint64_t bad;
+  uint64_t frames;
+  /**
+   * Frames that never completed (a packet was lost).
+   */
+  uint64_t frames_lost;
+  /**
+   * Complete frames discarded while waiting for an IDR after a loss.
+   */
+  uint64_t frames_skipped;
+} GLASS_ReassemblyStats;
+
+/**
+ * Client-side counters and clock state, safe to read from any thread.
+ */
+typedef struct {
+  GLASS_ReassemblyStats rx;
+  /**
+   * Complete frames dropped because the consumer queue was full.
+   */
+  uint64_t queue_full;
+  uint32_t keyframe_requests;
+  bool connected;
+  bool clock_valid;
+  /**
+   * `host clock - local clock`, µs (valid when `clock_valid`).
+   */
+  int64_t clock_offset_us;
+  /**
+   * RTT of the sample behind the offset (error bound ±rtt/2), and the latest.
+   */
+  uint32_t clock_rtt_us;
+  uint32_t last_rtt_us;
+} GLASS_ClientStats;
 
 /**
  * NUL-terminated core version string, e.g. "0.0.1". Static; do not free.
@@ -207,5 +372,96 @@ GLASS_Summary glass_stats_summary(const GLASS_StatRing *ring);
  * `ring` must come from `glass_stats_new` (or be null) and not be used afterwards.
  */
 void glass_stats_free(GLASS_StatRing *ring);
+
+/**
+ * # Safety
+ * `ring` must come from `glass_stats_new` and not be used concurrently.
+ */
+void glass_stats_reset(GLASS_StatRing *ring);
+
+/**
+ * Media clock in µs. On macOS this equals `CACurrentMediaTime() * 1e6`.
+ */
+uint64_t glass_clock_now_us(void);
+
+/**
+ * Connects to a host. Returns null on failure and sets `*err` to a
+ * `GLASS_ConnectError` value. Free with `glass_client_close`.
+ *
+ * # Safety
+ * `host` must be a NUL-terminated string; `err` must be valid for writes or null.
+ */
+GLASS_Client *glass_client_connect(const char *host, uint16_t port, int32_t *err);
+
+/**
+ * # Safety
+ * `c` must come from `glass_client_connect`.
+ */
+GLASS_StreamInfo glass_client_info(const GLASS_Client *c);
+
+/**
+ * Waits up to `timeout_ms` for the next frame. Returns 1 with `meta`/`data`
+ * filled (data valid until `glass_client_release_frame`), 0 on timeout, or
+ * -1 once the host has gone and no frames remain.
+ *
+ * # Safety
+ * `c` must come from `glass_client_connect`; only one thread may wait/release.
+ * `meta` and `data` must be valid for writes.
+ */
+int32_t glass_client_wait_frame(const GLASS_Client *c,
+                                uint32_t timeout_ms,
+                                GLASS_LiveFrameMeta *meta,
+                                GLASS_Bytes *data);
+
+/**
+ * # Safety
+ * `c` must come from `glass_client_connect`; call from the waiting thread.
+ */
+void glass_client_release_frame(const GLASS_Client *c);
+
+/**
+ * Asks the host for an IDR (e.g. after a decode error).
+ *
+ * # Safety
+ * `c` must come from `glass_client_connect`.
+ */
+void glass_client_request_keyframe(const GLASS_Client *c);
+
+/**
+ * # Safety
+ * `c` must come from `glass_client_connect`.
+ */
+GLASS_ClientStats glass_client_stats(const GLASS_Client *c);
+
+/**
+ * Host timestamp -> local clock, or 0 until clock sync has a sample.
+ *
+ * # Safety
+ * `c` must come from `glass_client_connect`.
+ */
+uint64_t glass_client_host_to_local_us(const GLASS_Client *c, uint64_t host_us);
+
+/**
+ * Says goodbye, stops the threads and frees the client.
+ *
+ * # Safety
+ * `c` must come from `glass_client_connect` (or be null) and not be used afterwards.
+ */
+void glass_client_close(GLASS_Client *c);
+
+/**
+ * Serves a `.glsr` file (copied) as a live stream on `port` (0 = any free
+ * port; the chosen one is written to `*out_port`). Returns null on error.
+ *
+ * # Safety
+ * `buf` must point to `len` readable bytes; `out_port` valid for writes or null.
+ */
+GLASS_Replay *glass_replay_start(const uint8_t *buf, size_t len, uint16_t port, uint16_t *out_port);
+
+/**
+ * # Safety
+ * `r` must come from `glass_replay_start` (or be null) and not be used afterwards.
+ */
+void glass_replay_stop(GLASS_Replay *r);
 
 #endif  /* GLASS_CORE_H */

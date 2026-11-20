@@ -21,7 +21,7 @@ let package = Package(
             dependencies: ["CGlassCore"],
             linkerSettings: [.unsafeFlags(["-L", coreLibDir])]
         ),
-        .executableTarget(name: "GlassMac", dependencies: ["GlassKit"]),
+        .executableTarget(name: "GlassMac", dependencies: ["GlassKit", "CGlassCore"]),
         .testTarget(
             name: "GlassKitTests",
             dependencies: ["GlassKit"],

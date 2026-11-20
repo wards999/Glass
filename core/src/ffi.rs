@@ -1,10 +1,15 @@
 //! C ABI for the Swift app. Header: `core/include/glass_core.h` (cbindgen).
-//! Everything here is allocation-free except `glass_stats_new`/`_free`.
+//! Everything here is allocation-free except the `_new`/`_connect`/`_start`
+//! constructors and their `_free`/`_close`/`_stop` counterparts.
 
 use crate::annexb;
+use crate::net::{Client, ClientStats, ConnectError, LiveFrameMeta, Wait};
+use crate::protocol::StreamInfo;
 use crate::recording::{self, FrameMeta, RecordingHeader};
+use crate::replay::Replay;
 use crate::stats::{StatRing, Summary};
-use std::ffi::c_char;
+use std::ffi::{c_char, CStr};
+use std::time::Duration;
 
 static VERSION_C: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
@@ -187,11 +192,172 @@ pub unsafe extern "C" fn glass_stats_free(ring: *mut StatRing) {
     }
 }
 
+/// # Safety
+/// `ring` must come from `glass_stats_new` and not be used concurrently.
+#[no_mangle]
+pub unsafe extern "C" fn glass_stats_reset(ring: *mut StatRing) {
+    (*ring).reset();
+}
+
+/// Media clock in µs. On macOS this equals `CACurrentMediaTime() * 1e6`.
+#[no_mangle]
+pub extern "C" fn glass_clock_now_us() -> u64 {
+    crate::clock::now_us()
+}
+
+// --- Live viewer ------------------------------------------------------------
+
+/// Connects to a host. Returns null on failure and sets `*err` to a
+/// `GLASS_ConnectError` value. Free with `glass_client_close`.
+///
+/// # Safety
+/// `host` must be a NUL-terminated string; `err` must be valid for writes or null.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_connect(
+    host: *const c_char,
+    port: u16,
+    err: *mut i32,
+) -> *mut Client {
+    let set = |e: ConnectError| {
+        if !err.is_null() {
+            *err = e as i32;
+        }
+    };
+    if host.is_null() {
+        set(ConnectError::Resolve);
+        return std::ptr::null_mut();
+    }
+    let Ok(host) = CStr::from_ptr(host).to_str() else {
+        set(ConnectError::Resolve);
+        return std::ptr::null_mut();
+    };
+    match Client::connect(host, port) {
+        Ok(c) => {
+            if !err.is_null() {
+                *err = 0;
+            }
+            Box::into_raw(Box::new(c))
+        }
+        Err(e) => {
+            set(e);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// `c` must come from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_info(c: *const Client) -> StreamInfo {
+    (*c).info()
+}
+
+/// Waits up to `timeout_ms` for the next frame. Returns 1 with `meta`/`data`
+/// filled (data valid until `glass_client_release_frame`), 0 on timeout, or
+/// -1 once the host has gone and no frames remain.
+///
+/// # Safety
+/// `c` must come from `glass_client_connect`; only one thread may wait/release.
+/// `meta` and `data` must be valid for writes.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_wait_frame(
+    c: *const Client,
+    timeout_ms: u32,
+    meta: *mut LiveFrameMeta,
+    data: *mut Bytes,
+) -> i32 {
+    match (*c).wait_frame(Duration::from_millis(timeout_ms as u64)) {
+        Wait::Frame(m, d) => {
+            *meta = m;
+            *data = Bytes::from(Some(d));
+            1
+        }
+        Wait::Timeout => 0,
+        Wait::Disconnected => -1,
+    }
+}
+
+/// # Safety
+/// `c` must come from `glass_client_connect`; call from the waiting thread.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_release_frame(c: *const Client) {
+    (*c).release_frame();
+}
+
+/// Asks the host for an IDR (e.g. after a decode error).
+///
+/// # Safety
+/// `c` must come from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_request_keyframe(c: *const Client) {
+    (*c).request_keyframe();
+}
+
+/// # Safety
+/// `c` must come from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_stats(c: *const Client) -> ClientStats {
+    (*c).stats()
+}
+
+/// Host timestamp -> local clock, or 0 until clock sync has a sample.
+///
+/// # Safety
+/// `c` must come from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_host_to_local_us(c: *const Client, host_us: u64) -> u64 {
+    (*c).host_to_local(host_us).unwrap_or(0)
+}
+
+/// Says goodbye, stops the threads and frees the client.
+///
+/// # Safety
+/// `c` must come from `glass_client_connect` (or be null) and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_close(c: *mut Client) {
+    if !c.is_null() {
+        drop(Box::from_raw(c));
+    }
+}
+
+// --- Replay host (tests) ----------------------------------------------------
+
+/// Serves a `.glsr` file (copied) as a live stream on `port` (0 = any free
+/// port; the chosen one is written to `*out_port`). Returns null on error.
+///
+/// # Safety
+/// `buf` must point to `len` readable bytes; `out_port` valid for writes or null.
+#[no_mangle]
+pub unsafe extern "C" fn glass_replay_start(
+    buf: *const u8,
+    len: usize,
+    port: u16,
+    out_port: *mut u16,
+) -> *mut Replay {
+    match Replay::start(slice(buf, len).to_vec(), port) {
+        Ok(r) => {
+            if !out_port.is_null() {
+                *out_port = r.port();
+            }
+            Box::into_raw(Box::new(r))
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// # Safety
+/// `r` must come from `glass_replay_start` (or be null) and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn glass_replay_stop(r: *mut Replay) {
+    if !r.is_null() {
+        drop(Box::from_raw(r));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::recording::{RecordingWriter, CHROMA_420, CODEC_HEVC};
-    use std::ffi::CStr;
 
     #[test]
     fn version_over_ffi_matches_crate() {
@@ -258,7 +424,24 @@ mod tests {
             }
             let s = glass_stats_summary(r);
             assert_eq!((s.count, s.p50_us, s.max_us), (3, 20, 30));
+            glass_stats_reset(r);
+            assert_eq!(glass_stats_summary(r).count, 0);
             glass_stats_free(r);
         }
+    }
+
+    #[test]
+    fn client_connect_error_over_ffi() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut err = 0;
+        let c = unsafe { glass_client_connect(c"127.0.0.1".as_ptr(), port, &mut err) };
+        assert!(c.is_null());
+        assert_eq!(err, ConnectError::Connect as i32);
+        unsafe { glass_client_close(c) }; // null is fine
+        assert!(glass_clock_now_us() > 0);
     }
 }

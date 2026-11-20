@@ -44,7 +44,7 @@ impl FrameTimestamps {
     }
 
     /// Microseconds from `from` to `to`, if both were recorded and are ordered.
-    /// Cross-machine spans need clock sync (LATER(M2)).
+    /// Cross-machine spans need the host timestamp mapped first (`clock::host_to_local`).
     pub fn span_us(&self, from: Stage, to: Stage) -> Option<u64> {
         self.get(to)?.checked_sub(self.get(from)?)
     }
@@ -92,6 +92,13 @@ impl StatRing {
             next: 0,
             total: 0,
         }
+    }
+
+    /// Forgets all samples (e.g. to start a new reporting window).
+    pub fn reset(&mut self) {
+        self.len = 0;
+        self.next = 0;
+        self.total = 0;
     }
 
     pub fn push(&mut self, us: u32) {

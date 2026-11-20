@@ -16,6 +16,7 @@ This repo builds **Glass**, a two-way low-latency remote desktop between a Windo
 - Anything both directions need (protocol, FEC, crypto, jitter buffer, rate-control decisions) belongs in `/core`, not duplicated in the apps.
 - Hot paths (capture, encode, packetise, receive, decode, present): no allocations per frame, no blocking locks, no logging above debug level.
 - Every pipeline stage records timestamps into the stats system.
+- Nothing is hardwired to the current test machines (RTX 4070 + 1440p165 monitor, MacBook Air M4). Sizes, refresh rates, shapes, codecs and chroma come from what each side reports at connect time (SPEC §0) and are re-negotiated when a display changes. Those machines may appear only as examples in tests and docs.
 
 ## Testing and measurement
 - Unit tests for `core` (packetiser round-trip, FEC recovery under loss, replay window, key derivation).

@@ -8,6 +8,9 @@ import GlassKit
 //  - Terminal:  GlassMac play FILE.glsr [--bench]           recording bench + playback
 //               GlassMac connect HOST[:PORT] [--pin PIN] [--seconds S]
 //                                                live viewer (pairs first with --pin), results printed
+//               GlassMac host [--test-pattern] [--pin PIN] [--port P] [--mbps M] [--seconds S]
+//                                                share this Mac (M3b); results printed per session
+//               GlassMac check-444               can this Mac hardware-encode HEVC 4:4:4?
 
 let args = Array(CommandLine.arguments.dropFirst()).filter { !$0.hasPrefix("-psn_") }
 let app = NSApplication.shared
@@ -22,7 +25,11 @@ func usage() {
       GlassMac connect HOST[:PORT] [--pin PIN] [--seconds S]
                                          live viewer; prints results when it ends.
                                          Not paired yet: --pin with the PIN the host shows.
-    Or open Glass.app and connect to the PC (run host.cmd there).
+      GlassMac host [--test-pattern] [--pin PIN] [--port P] [--mbps M] [--seconds S]
+                                         share this Mac; with --seconds, exits after one session.
+                                         --test-pattern: synthetic picture, input not injected.
+      GlassMac check-444                 can this Mac hardware-encode HEVC 4:4:4?
+    Or open Glass.app and connect to the PC (run host.cmd there), or Share This Mac.
     """)
 }
 
@@ -69,6 +76,44 @@ if args.first == "play", args.count >= 2 {
             DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { viewer.stop("--seconds elapsed") }
         }
         withExtendedLifetime(viewer) { app.run() }
+    } catch {
+        print("error: \(error)")
+        exit(1)
+    }
+} else if args.first == "check-444" {
+    print("\(banner)\n\(systemInfo())")
+    print(checkHEVC444Encode())
+    exit(0)
+} else if args.first == "host" {
+    func value(_ flag: String) -> String? { args.firstIndex(of: flag).flatMap { args.dropFirst($0 + 1).first } }
+    var o = HostRunner.Options()
+    o.testPattern = args.contains("--test-pattern")
+    o.fixedPin = value("--pin")
+    if let p = value("--port").flatMap({ UInt16($0) }) { o.port = p }
+    if let m = value("--mbps").flatMap({ Int($0) }) { o.mbps = m }
+    o.seconds = value("--seconds").flatMap { Double($0) }
+    guard let device = GlassDevice.shared else {
+        print("error: couldn't read or create this Mac's Glass identity")
+        exit(1)
+    }
+    if !o.testPattern {
+        if !HostPermissions.screenRecording { print("Screen Recording isn't allowed for this program yet (System Settings ▸ Privacy & Security).") }
+        if !HostPermissions.accessibility { print("Accessibility isn't allowed for this program yet: the viewer's input will do nothing.") }
+    }
+    do {
+        let runner = try HostRunner(device: device, options: o, banner: banner)
+        runner.onEvent = { print($0.text) }
+        runner.onConnected = { name, addr in print("Viewer connected: \u{201C}\(name)\u{201D} from \(addr) (encrypted)") }
+        runner.onSessionEnd = { report in
+            print(report)
+            if o.seconds != nil { exit(0) }
+        }
+        let d = runner.display
+        print("\(banner)\nThis Mac: \u{201C}\(GlassDevice.computerName)\u{201D}, id \(device.fingerprintShort) | \(d.width)x\(d.height) @ \(d.fps) Hz\(o.testPattern ? " (test pattern)" : "") | port \(runner.host.port) | addresses \(localIPv4Addresses().joined(separator: ", "))")
+        print(checkHEVC444Encode())
+        runner.start()
+        app.setActivationPolicy(.accessory)
+        withExtendedLifetime(runner) { app.run() }
     } catch {
         print("error: \(error)")
         exit(1)

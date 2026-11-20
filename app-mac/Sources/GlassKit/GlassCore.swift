@@ -5,6 +5,3 @@ public enum GlassCore {
     public static var version: String { String(cString: glass_core_version()) }
     public static var protocolVersion: UInt8 { glass_protocol_version() }
 }
-
-// LATER(M3b): host capture (ScreenCaptureKit) + VideoToolbox encode + CGEvent injection,
-//             with Screen Recording / Accessibility permission checks.

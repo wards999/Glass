@@ -10,6 +10,35 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M3b (the PC views and controls the Mac)
+Use the zip and dmg from the same test build.
+1. **Mac:** install the new Glass.app over the old one (Applications), open
+   it, and click **Share This Mac…**. macOS asks for Screen Recording and
+   Accessibility. Allow both in System Settings (the window has buttons that
+   open the right page), then quit Glass (⌘Q) and open it again.
+   From this build on, the app is signed with the same certificate every
+   time, so you won't need to do this again for later test builds.
+   The window shows the Mac's address and "Waiting for the PC…".
+2. **PC:** unzip, double-click **connect.cmd**, and type the Mac's address.
+   The first time, the Mac shows a 6-digit PIN: type it in the connect.cmd
+   window. The Mac opens full screen on the PC.
+3. Use the Mac from the PC for a few minutes:
+   - Type in TextEdit or Notes. Ctrl+C / Ctrl+V / Ctrl+Z copy, paste and
+     undo (Ctrl acts as ⌘).
+   - Use the arrows and hold Backspace (they should repeat).
+   - Click, double-click a word, drag-select, right-click, drag windows.
+   - Scroll a long page with the mouse wheel.
+   - Alt+Tab away from the viewer and back: nothing should stay held down
+     on the Mac.
+4. Press **Ctrl+Alt+Shift+Q** to disconnect. Send:
+   - the connect.cmd text (also saved in `results-viewer.txt`), and
+   - the Mac's results (**Copy Results** in the Share This Mac window).
+   Also say how it felt: pointer, typing, scrolling, and text sharpness.
+5. **The Mac's 4:4:4 check:** in Terminal run
+   `/Applications/Glass.app/Contents/MacOS/GlassMac check-444` and send the
+   two lines it prints. They decide how M3c keeps text sharp.
+6. Optional: Ctrl+Alt+Shift+F switches between window and full screen.
+
 ## M6 (pairing and encryption)
 Use the zip and dmg from the same test build (v4 can't talk to older builds).
 1. Windows: run `host.cmd`. It prints this PC's name and id and says no device

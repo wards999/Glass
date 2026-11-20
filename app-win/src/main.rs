@@ -2,6 +2,7 @@
 //!
 //! Commands:
 //!   glass host [opts]                  stream a monitor live to a paired viewer
+//!   glass connect [HOST] [opts]        view and control a paired host (a Mac)
 //!   glass devices                      this PC's identity and paired devices
 //!   glass forget NAME|FINGERPRINT      unpair a device
 //!   glass probe HOST [opts]            headless viewer: receive and time, no decode
@@ -10,7 +11,6 @@
 //!   glass record [opts] out.glsr       capture a monitor and encode HEVC to a recording
 //!   glass dump in.glsr out.h265        write the raw Annex-B stream (for ffplay)
 //!
-//! LATER(M3b): client decode (D3D11VA) -> flip-model present, Raw Input.
 //! LATER: tray shell with the device list and pairing UI.
 
 /// Build version: the test-build tag when packaged, else the crate version.
@@ -19,6 +19,8 @@ const VERSION: &str = match option_env!("GLASS_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+#[cfg(windows)]
+mod connect;
 mod probe;
 #[cfg(windows)]
 mod win;
@@ -150,6 +152,7 @@ fn usage() -> ! {
 
 usage:
   glass host [--monitor N] [--chroma 420|444] [--mbps M] [--port P] [--log FILE] [--ask]
+  glass connect [HOST[:PORT]] [--pin PIN] [--windowed] [--keys pc|labelled] [--seconds S] [--log FILE]
   glass devices
   glass forget NAME|FINGERPRINT
   glass probe HOST [--port P] [--pin PIN] [--seconds S] [--verify FILE.glsr] [--min-frames N]
@@ -241,6 +244,8 @@ fn main() {
         Some("forget") if args.len() == 2 => forget(&args[1]),
         #[cfg(windows)]
         Some("host") => win::host(&args[1..]),
+        #[cfg(windows)]
+        Some("connect") => connect::connect(&args[1..]),
         #[cfg(windows)]
         Some("list") => win::list(),
         #[cfg(windows)]

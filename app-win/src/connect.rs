@@ -1,0 +1,171 @@
+//! `glass connect`: pair with a host if needed, then view and control it.
+//!
+//! `glass connect [HOST[:PORT]] [--pin PIN] [--seconds S] [--windowed]
+//!                [--keys pc|labelled] [--log FILE]`
+//!
+//! Keys: by default the PC's Ctrl acts as the Mac's ⌘ (so Ctrl+C copies)
+//! and Win as ⌃; `--keys labelled` sends them as labelled (for a PC host).
+//! LATER(M7): the host tells the viewer its OS, so this picks itself.
+
+use crate::win::viewer::{self, Options};
+use glass_core::identity::{default_dir, fingerprint_short};
+use glass_core::keymap::PcModifierRule;
+use glass_core::net::{pair_begin, Client, ConnectError};
+use glass_core::protocol::DEFAULT_PORT;
+use std::error::Error;
+use std::io::{BufRead, Write};
+
+type Res<T> = Result<T, Box<dyn Error>>;
+
+fn ask(prompt: &str) -> String {
+    print!("{prompt}");
+    let _ = std::io::stdout().flush();
+    let mut s = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut s);
+    s.trim().to_string()
+}
+
+/// "host" or "host:port".
+fn parse_address(s: &str) -> Res<(String, u16)> {
+    let s = s.trim();
+    match s.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !h.contains(':') => Ok((h.to_string(), p.parse()?)),
+        _ => Ok((s.to_string(), DEFAULT_PORT)),
+    }
+}
+
+pub fn connect(args: &[String]) -> Res<()> {
+    let (mut addr, mut pin, mut seconds, mut log) = (None, None, None, None);
+    let mut opts = Options {
+        windowed: false,
+        seconds: None,
+        rule: PcModifierRule::PcStyle,
+    };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--pin" => pin = Some(val()?.clone()),
+            "--seconds" => seconds = Some(val()?.parse::<f64>()?),
+            "--log" => log = Some(val()?.clone()),
+            "--windowed" => opts.windowed = true,
+            "--keys" => {
+                opts.rule = match val()?.as_str() {
+                    "pc" => PcModifierRule::PcStyle,
+                    "labelled" | "labeled" => PcModifierRule::MacStyle,
+                    k => return Err(format!("--keys {k}: use pc or labelled").into()),
+                }
+            }
+            s if addr.is_none() && !s.starts_with("--") => addr = Some(s.to_string()),
+            s => return Err(format!("unknown argument {s}").into()),
+        }
+    }
+    opts.seconds = seconds;
+
+    let device = crate::device()?;
+    println!(
+        "{}\nThis PC: \"{}\", id {}",
+        crate::banner(),
+        device.name,
+        fingerprint_short(&device.fingerprint())
+    );
+    let last_file = default_dir().unwrap_or_default().join("last-host.txt");
+    let last = std::fs::read_to_string(&last_file).unwrap_or_default();
+    let addr = match addr {
+        Some(a) => a,
+        None => {
+            let prompt = if last.trim().is_empty() {
+                "Address of the Mac (Glass on the Mac shows it under Share This Mac): ".to_string()
+            } else {
+                format!("Address of the Mac [{}]: ", last.trim())
+            };
+            let a = ask(&prompt);
+            if a.is_empty() {
+                last.trim().to_string()
+            } else {
+                a
+            }
+        }
+    };
+    if addr.is_empty() {
+        return Err("no address given".into());
+    }
+    let (host, port) = parse_address(&addr)?;
+    let err = |e: ConnectError| -> Box<dyn Error> { format!("{host}:{port}: {e}").into() };
+
+    let mut fixed_pin = pin;
+    let client = loop {
+        match Client::connect(&device, &host, port) {
+            Ok(c) => break c,
+            Err(ConnectError::NotPaired) => {
+                println!("This PC isn't paired with {host} yet. Asking it to show a PIN ...");
+                let p = pair_begin(&device, &host, port).map_err(err)?;
+                let pin = match fixed_pin.take() {
+                    Some(p) => p,
+                    None => {
+                        println!(
+                            "\"{}\" is showing a 6-digit PIN. Pair only with your own devices: \
+                             a paired host sees what you type while you view it.",
+                            p.host_name()
+                        );
+                        ask("PIN (Enter to cancel): ")
+                            .chars()
+                            .filter(char::is_ascii_digit)
+                            .collect()
+                    }
+                };
+                if pin.is_empty() {
+                    return Err("pairing cancelled".into());
+                }
+                let name = p.host_name().to_string();
+                match p.finish(&pin) {
+                    Ok(_) => println!("Paired with \"{name}\"."),
+                    Err(ConnectError::WrongPin) if args.iter().all(|a| a != "--pin") => {
+                        println!("That PIN wasn't right (or it expired). Try again.");
+                    }
+                    Err(e) => return Err(err(e)),
+                }
+            }
+            Err(e) => return Err(err(e)),
+        }
+    };
+    let _ = std::fs::write(&last_file, &addr);
+    let info = client.info();
+    println!(
+        "Connected to \"{}\" ({}x{} @ {} Hz, encrypted). Ctrl+Alt+Shift+F: window / full screen, \
+         Ctrl+Alt+Shift+Q: disconnect.",
+        client.peer().name,
+        info.width,
+        info.height,
+        info.fps
+    );
+    let report = viewer::run(client, opts, &crate::banner())?;
+    println!("\n{report}");
+    if let Some(path) = log {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(f, "{report}")?;
+        println!("(appended to {path})");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_address;
+
+    #[test]
+    fn addresses() {
+        assert_eq!(
+            parse_address("192.168.4.20").unwrap(),
+            ("192.168.4.20".into(), 47800)
+        );
+        assert_eq!(
+            parse_address(" mac.local:47811 ").unwrap(),
+            ("mac.local".into(), 47811)
+        );
+        assert!(parse_address("host:notaport").is_err());
+    }
+}

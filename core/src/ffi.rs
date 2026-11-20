@@ -4,17 +4,20 @@
 
 use crate::annexb;
 use crate::identity::{default_dir, Device};
+use crate::input::InputAction;
 use crate::keymap::{self, ModifierRule};
 use crate::net::{
-    pair_begin, Client, ClientStats, ConnectError, CursorInfo, HostOptions, LiveFrameMeta, Pairing,
-    Wait,
+    pair_begin, Client, ClientStats, ConnectError, CursorInfo, HostCounters, HostEvent,
+    HostListener, HostOptions, HostSession, LiveFrameMeta, Pairing, Wait,
 };
-use crate::protocol::StreamInfo;
+use crate::packet::OutFrame;
+use crate::protocol::{CursorShape, StreamInfo};
 use crate::recording::{self, FrameMeta, RecordingHeader};
 use crate::replay::Replay;
 use crate::stats::{StatRing, Summary};
-use std::ffi::{c_char, CStr};
-use std::sync::Arc;
+use std::ffi::{c_char, c_void, CStr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// This machine's identity and paired devices (opaque).
@@ -626,6 +629,472 @@ pub unsafe extern "C" fn glass_client_close(c: *mut Client) {
     }
 }
 
+// --- Host (Mac host, M3b) ---------------------------------------------------
+
+/// A caller-supplied context pointer handed back to callbacks on core's
+/// threads. The caller guarantees it stays valid and is thread-safe.
+#[derive(Clone, Copy)]
+struct Ctx(*mut c_void);
+unsafe impl Send for Ctx {}
+
+/// `HostEventC::kind`.
+pub const HOST_EVENT_PAIRING_PIN: u8 = 1;
+pub const HOST_EVENT_PAIRED: u8 = 2;
+pub const HOST_EVENT_WRONG_PIN: u8 = 3;
+pub const HOST_EVENT_PAIRING_LOCKED: u8 = 4;
+pub const HOST_EVENT_REFUSED: u8 = 5;
+pub const HOST_EVENT_DENIED: u8 = 6;
+
+/// Something the host's user should see (`net::HostEvent`). Strings are
+/// NUL-terminated UTF-8.
+#[repr(C)]
+pub struct HostEventC {
+    pub kind: u8,
+    /// PairingPin: true the first time this PIN is shown.
+    pub new_pin: bool,
+    /// WrongPin: tries left with the current PIN.
+    pub left: u32,
+    /// Device name (PairingPin, Paired, WrongPin, Denied) or short
+    /// fingerprint (Refused).
+    pub device: [c_char; 72],
+    /// PairingPin: the 6-digit PIN.
+    pub pin: [c_char; 8],
+    /// PairingPin, Refused: the device's IP address.
+    pub addr: [c_char; 48],
+}
+
+pub type HostEventFn = unsafe extern "C" fn(ctx: *mut c_void, event: *const HostEventC);
+
+/// `InputActionC::kind`.
+pub const INPUT_MOVE: u8 = 1;
+pub const INPUT_BUTTON: u8 = 2;
+pub const INPUT_KEY: u8 = 3;
+pub const INPUT_SCROLL: u8 = 4;
+
+/// One input action to inject (`input::InputAction`), in order.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InputActionC {
+    pub kind: u8,
+    /// Button: `input::BUTTON_*`.
+    pub button: u8,
+    /// Key: HID usage (`glass_keymap_hid_to_mac` gives the Mac key code).
+    pub hid: u8,
+    pub down: bool,
+    /// Move: normalised position on the picture, 0..=65535.
+    pub x: u16,
+    pub y: u16,
+    /// Scroll: wheel units (120 = one notch); `dy > 0` up, `dx > 0` right.
+    pub dy: i16,
+    pub dx: i16,
+}
+
+impl From<InputAction> for InputActionC {
+    fn from(a: InputAction) -> Self {
+        let mut c = InputActionC::default();
+        match a {
+            InputAction::MoveTo { x, y } => {
+                c.kind = INPUT_MOVE;
+                c.x = x;
+                c.y = y;
+            }
+            InputAction::Button { button, down } => {
+                c.kind = INPUT_BUTTON;
+                c.button = button;
+                c.down = down;
+            }
+            InputAction::Key { hid, down } => {
+                c.kind = INPUT_KEY;
+                c.hid = hid;
+                c.down = down;
+            }
+            InputAction::Scroll { dy, dx } => {
+                c.kind = INPUT_SCROLL;
+                c.dy = dy;
+                c.dx = dx;
+            }
+        }
+        c
+    }
+}
+
+pub type InputFn = unsafe extern "C" fn(ctx: *mut c_void, action: *const InputActionC);
+
+fn event_c(e: HostEvent) -> HostEventC {
+    let mut c = HostEventC {
+        kind: 0,
+        new_pin: false,
+        left: 0,
+        device: [0; 72],
+        pin: [0; 8],
+        addr: [0; 48],
+    };
+    let (kind, device, pin, addr) = match e {
+        HostEvent::PairingPin {
+            device,
+            pin,
+            new,
+            addr,
+        } => {
+            c.new_pin = new;
+            (HOST_EVENT_PAIRING_PIN, device, pin, addr.ip().to_string())
+        }
+        HostEvent::Paired { device } => (HOST_EVENT_PAIRED, device, "".into(), "".into()),
+        HostEvent::WrongPin { device, left } => {
+            c.left = left;
+            (HOST_EVENT_WRONG_PIN, device, "".into(), "".into())
+        }
+        HostEvent::PairingLocked => (HOST_EVENT_PAIRING_LOCKED, "".into(), "".into(), "".into()),
+        HostEvent::Refused { fingerprint, addr } => (
+            HOST_EVENT_REFUSED,
+            fingerprint,
+            "".into(),
+            addr.ip().to_string(),
+        ),
+        HostEvent::Denied { device } => (HOST_EVENT_DENIED, device, "".into(), "".into()),
+    };
+    c.kind = kind;
+    unsafe {
+        copy_str(&device, c.device.as_mut_ptr(), c.device.len());
+        copy_str(&pin, c.pin.as_mut_ptr(), c.pin.len());
+        copy_str(&addr, c.addr.as_mut_ptr(), c.addr.len());
+    }
+    c
+}
+
+/// A listening host (opaque): waits for paired viewers and pairing requests.
+pub struct HostHandle {
+    listener: Mutex<HostListener>,
+    stop: AtomicBool,
+    port: u16,
+}
+
+/// Starts listening on `port` (TCP and UDP; 0 = any free port) as `d`.
+/// `fixed_pin` (null = a random PIN per request) is for tests. `events`
+/// (nullable) is called on the accepting thread. Returns null on error
+/// (`*err`: 1 = port in use or no network, 10 = identity).
+///
+/// # Safety
+/// `d` from `glass_device_open`; `fixed_pin` null or NUL-terminated; `ctx`
+/// valid for as long as the host runs; `err` null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn glass_host_listen(
+    d: *const DeviceHandle,
+    port: u16,
+    fixed_pin: *const c_char,
+    events: HostEventFn,
+    ctx: *mut c_void,
+    err: *mut i32,
+) -> *mut HostHandle {
+    let ctx = Ctx(ctx);
+    let opts = HostOptions {
+        fixed_pin: str_arg(fixed_pin).map(str::to_string),
+        ask: None, // LATER: "ask before each connection" on the Mac.
+        events: Box::new(move |e| {
+            let f = events;
+            let c = event_c(e);
+            let ctx = ctx;
+            f(ctx.0, &c);
+        }),
+    };
+    match HostListener::bind(port, (*d).0.clone(), opts) {
+        Ok(l) => {
+            let port = l.port();
+            Box::into_raw(Box::new(HostHandle {
+                listener: Mutex::new(l),
+                stop: AtomicBool::new(false),
+                port,
+            }))
+        }
+        Err(e) => {
+            let code = if e.kind() == std::io::ErrorKind::AddrInUse {
+                1
+            } else if e.kind() == std::io::ErrorKind::InvalidData {
+                10
+            } else {
+                1
+            };
+            set_err(err, code);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The port the host listens on.
+///
+/// # Safety
+/// `h` from `glass_host_listen`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_host_port(h: *const HostHandle) -> u16 {
+    (*h).port
+}
+
+/// Waits for one connection and handles it. Returns a session for a paired
+/// viewer (`*status` = 1). A pairing request or a refused device is handled
+/// here, reported through the events callback, and gives null with
+/// `*status` = 0; a failed attempt gives -1; after `glass_host_wake`, -2.
+/// `input` is called on core's UDP thread for every action, in order.
+///
+/// # Safety
+/// `h` from `glass_host_listen`; `ctx` valid until the session is closed;
+/// `status` writable or null.
+#[no_mangle]
+pub unsafe extern "C" fn glass_host_accept(
+    h: *const HostHandle,
+    info: StreamInfo,
+    input: InputFn,
+    ctx: *mut c_void,
+    status: *mut i32,
+) -> *mut HostSession {
+    let h = &*h;
+    if h.stop.load(Ordering::Relaxed) {
+        set_err(status, -2);
+        return std::ptr::null_mut();
+    }
+    let ctx = Ctx(ctx);
+    let sink = Box::new(move |a: InputAction| {
+        let c = InputActionC::from(a);
+        let ctx = ctx;
+        input(ctx.0, &c);
+    });
+    let r = h
+        .listener
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .accept(info, sink);
+    if h.stop.load(Ordering::Relaxed) {
+        set_err(status, -2);
+        return std::ptr::null_mut(); // a session, if any, is dropped (Bye)
+    }
+    match r {
+        Ok(Some(s)) => {
+            set_err(status, 1);
+            Box::into_raw(Box::new(s))
+        }
+        Ok(None) => {
+            set_err(status, 0);
+            std::ptr::null_mut()
+        }
+        Err(_) => {
+            set_err(status, -1);
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Makes a blocked `glass_host_accept` return (-2), and every later one.
+///
+/// # Safety
+/// `h` from `glass_host_listen`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_host_wake(h: *const HostHandle) {
+    (*h).stop.store(true, Ordering::Relaxed);
+    let _ = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], (*h).port)),
+        Duration::from_millis(500),
+    );
+}
+
+/// Stops listening. Call `glass_host_wake` and let `glass_host_accept`
+/// return first.
+///
+/// # Safety
+/// `h` from `glass_host_listen` (or null), not used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn glass_host_free(h: *mut HostHandle) {
+    if !h.is_null() {
+        drop(Box::from_raw(h));
+    }
+}
+
+// A session's calls must not overlap: make them from one thread (or queue).
+
+/// The connected viewer's name. Returns its full length in bytes.
+///
+/// # Safety
+/// `s` from `glass_host_accept`; `buf` writable for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_peer_name(
+    s: *const HostSession,
+    buf: *mut c_char,
+    len: usize,
+) -> usize {
+    copy_str(&(*s).peer_name, buf, len)
+}
+
+/// The viewer's IP address.
+///
+/// # Safety
+/// As `glass_session_peer_name`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_peer_addr(
+    s: *const HostSession,
+    buf: *mut c_char,
+    len: usize,
+) -> usize {
+    copy_str(&(*s).peer_tcp.ip().to_string(), buf, len)
+}
+
+/// False once the viewer has gone.
+///
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_connected(s: *const HostSession) -> bool {
+    (*s).connected()
+}
+
+/// True once frames are being delivered (the viewer's UDP address is known).
+///
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_streaming(s: *const HostSession) -> bool {
+    (*s).streaming()
+}
+
+/// Takes a pending keyframe request: encode the next frame as an IDR.
+///
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_take_keyframe_request(s: *const HostSession) -> bool {
+    (*s).take_keyframe_request()
+}
+
+/// Latest input packet applied; stamp it on the next captured frame.
+///
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_input_seq(s: *const HostSession) -> u32 {
+    (*s).input_seq()
+}
+
+/// Seals and sends one encoded frame (Annex-B). Returns 1 if sent, 0 if the
+/// viewer's address isn't known yet (nothing sent), -1 on error.
+///
+/// # Safety
+/// `s` from `glass_host_accept`; `f` readable; `data` readable for `len`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_send_frame(
+    s: *mut HostSession,
+    f: *const OutFrame,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    match (*s).send_frame(&*f, slice(data, len)) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// Sends a new pointer image: straight-alpha RGBA, top row first,
+/// `width * height * 4` bytes (at most 96 x 96). Returns false on error.
+///
+/// # Safety
+/// `s` from `glass_host_accept`; `rgba` readable for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_send_cursor(
+    s: *mut HostSession,
+    serial: u32,
+    width: u16,
+    height: u16,
+    hot_x: u16,
+    hot_y: u16,
+    rgba: *const u8,
+    len: usize,
+) -> bool {
+    let shape = CursorShape {
+        serial,
+        width,
+        height,
+        hot_x,
+        hot_y,
+        rgba: slice(rgba, len),
+    };
+    (*s).send_cursor(&shape).is_ok()
+}
+
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_send_cursor_visible(
+    s: *mut HostSession,
+    visible: bool,
+) -> bool {
+    (*s).send_cursor_visible(visible).is_ok()
+}
+
+/// Tells the viewer about a condition (`NOTICE_*`; 0 clears it).
+///
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_send_notice(s: *mut HostSession, code: u8) -> bool {
+    (*s).send_notice(code).is_ok()
+}
+
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_counters(s: *const HostSession) -> HostCounters {
+    (*s).counters()
+}
+
+/// Ends the session (releasing any keys the viewer held) and frees it.
+///
+/// # Safety
+/// `s` from `glass_host_accept` (or null), not used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_close(s: *mut HostSession) {
+    if !s.is_null() {
+        drop(Box::from_raw(s));
+    }
+}
+
+/// HID usage -> Mac key code for the host (`keymap::hid_to_mac`); 0xFFFF if
+/// the Mac has no such key.
+#[no_mangle]
+pub extern "C" fn glass_keymap_hid_to_mac(hid: u8, iso: bool) -> u16 {
+    keymap::hid_to_mac(hid, iso).unwrap_or(0xFFFF)
+}
+
+/// Builds an Annex-B access unit from VideoToolbox output: the `prefix_count`
+/// (at most 4) raw NALs in `prefix` (VPS/SPS/PPS on keyframes), then the
+/// 4-byte length-prefixed NALs in `sample`. Returns bytes written, or -1 if
+/// the sample is malformed or `out_cap` is too small.
+///
+/// # Safety
+/// `prefix` readable for `prefix_count` entries (each a valid `Bytes`);
+/// `sample` readable for `len`; `out` writable for `out_cap`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_hevc_from_length_prefixed(
+    prefix: *const Bytes,
+    prefix_count: usize,
+    sample: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let mut nals: [&[u8]; 4] = [&[]; 4];
+    if prefix_count > nals.len() {
+        return -1;
+    }
+    for (i, n) in nals.iter_mut().enumerate().take(prefix_count) {
+        let b = *prefix.add(i);
+        *n = slice(b.ptr, b.len);
+    }
+    let out = if out.is_null() || out_cap == 0 {
+        &mut [][..]
+    } else {
+        std::slice::from_raw_parts_mut(out, out_cap)
+    };
+    annexb::from_length_prefixed(&nals[..prefix_count], slice(sample, len), out)
+        .map_or(-1, |n| n as isize)
+}
+
 // --- Replay host (tests) ----------------------------------------------------
 
 /// Serves a `.glsr` file (copied) as a live stream on `port` (0 = any free
@@ -854,5 +1323,151 @@ mod tests {
             glass_replay_stop(r);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_over_ffi() {
+        use std::sync::atomic::AtomicU64;
+        static INPUTS: AtomicU64 = AtomicU64::new(0);
+        static PINS: AtomicU64 = AtomicU64::new(0);
+        unsafe extern "C" fn on_event(_ctx: *mut c_void, e: *const HostEventC) {
+            if (*e).kind == HOST_EVENT_PAIRING_PIN {
+                assert_eq!(
+                    CStr::from_ptr((*e).pin.as_ptr()).to_str().unwrap(),
+                    "112233"
+                );
+                assert_eq!(
+                    CStr::from_ptr((*e).addr.as_ptr()).to_str().unwrap(),
+                    "127.0.0.1"
+                );
+                PINS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        unsafe extern "C" fn on_input(_ctx: *mut c_void, a: *const InputActionC) {
+            if (*a).kind == INPUT_KEY && (*a).hid == 0x04 {
+                INPUTS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let base = std::env::temp_dir().join(format!("glass-ffi-host-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let hdir = std::ffi::CString::new(base.join("h").to_str().unwrap()).unwrap();
+        let viewer = Device::open(&base.join("v"), "FFI viewer", None).unwrap();
+        unsafe {
+            let hd = glass_device_open(hdir.as_ptr(), c"FFI Mac".as_ptr());
+            let mut err = 0;
+            let h = glass_host_listen(
+                hd,
+                0,
+                c"112233".as_ptr(),
+                on_event,
+                std::ptr::null_mut(),
+                &mut err,
+            );
+            assert!(!h.is_null(), "err {err}");
+            let port = glass_host_port(h);
+            struct P(*mut HostHandle);
+            unsafe impl Send for P {}
+            let hp = P(h);
+            let info = StreamInfo {
+                codec: 1,
+                chroma: 0,
+                width: 64,
+                height: 32,
+                fps: 60,
+            };
+            let acceptor = std::thread::spawn(move || {
+                let hp = hp;
+                let mut out = Vec::new();
+                for _ in 0..3 {
+                    let mut st = 9;
+                    let s = glass_host_accept(hp.0, info, on_input, std::ptr::null_mut(), &mut st);
+                    out.push(st);
+                    if st == 1 {
+                        // Stream a few frames, then close.
+                        let mut sent = 0;
+                        for i in 0..400 {
+                            let f = OutFrame {
+                                frame_id: i,
+                                flags: crate::protocol::FLAG_IDR,
+                                ..Default::default()
+                            };
+                            let d = [0u8, 0, 1, 0x26, 1, i as u8];
+                            if glass_session_send_frame(s, &f, d.as_ptr(), d.len()) == 1 {
+                                sent += 1;
+                            }
+                            if sent >= 5 && INPUTS.load(Ordering::Relaxed) >= 2 {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        let mut name = [0 as c_char; 64];
+                        glass_session_peer_name(s, name.as_mut_ptr(), name.len());
+                        assert_eq!(
+                            CStr::from_ptr(name.as_ptr()).to_str().unwrap(),
+                            "FFI viewer"
+                        );
+                        assert!(glass_session_counters(s).frames_sent >= 5);
+                        glass_session_close(s);
+                    }
+                }
+                out
+            });
+            // Pair, then connect and send a key.
+            let p = pair_begin(&viewer, "127.0.0.1", port).unwrap();
+            assert_eq!(p.host_name(), "FFI Mac");
+            p.finish("112233").unwrap();
+            let c = Client::connect(&viewer, "127.0.0.1", port).unwrap();
+            let mut frames = 0;
+            while frames < 5 {
+                if let Wait::Frame(..) = c.wait_frame(Duration::from_secs(5)) {
+                    frames += 1;
+                    c.release_frame();
+                } else {
+                    panic!("no frames");
+                }
+            }
+            c.input_key(0x04, true);
+            c.input_key(0x04, false);
+            while INPUTS.load(Ordering::Relaxed) < 2 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(c);
+            // Third accept is woken up.
+            std::thread::sleep(Duration::from_millis(100));
+            glass_host_wake(h);
+            let statuses = acceptor.join().unwrap();
+            assert_eq!(statuses, vec![0, 1, -2]);
+            assert_eq!(PINS.load(Ordering::Relaxed), 1);
+            glass_host_free(h);
+            glass_device_free(hd);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn annexb_over_ffi() {
+        let vps = [0x40u8, 1, 0xAA];
+        let pre = [Bytes {
+            ptr: vps.as_ptr(),
+            len: vps.len(),
+        }];
+        let sample = [0u8, 0, 0, 3, 0x26, 1, 0xDD];
+        let mut out = [0u8; 32];
+        let n = unsafe {
+            glass_hevc_from_length_prefixed(
+                pre.as_ptr(),
+                1,
+                sample.as_ptr(),
+                sample.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(
+            &out[..n as usize],
+            &[0, 0, 0, 1, 0x40, 1, 0xAA, 0, 0, 0, 1, 0x26, 1, 0xDD]
+        );
+        assert_eq!(glass_keymap_hid_to_mac(0x04, false), 0x00);
+        assert_eq!(glass_keymap_hid_to_mac(0x46, false), 0xFFFF);
     }
 }

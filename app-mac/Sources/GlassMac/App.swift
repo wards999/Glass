@@ -17,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private let pairedMenu = NSMenu(title: "Paired Devices")
     private var player: Player?
     private var viewer: LiveViewer?
+    private var hostController: HostController?
     private var openedFile = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -60,6 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         pairedMenu.delegate = self
         submenu("Connection", [
             item("Connect…", #selector(showConnectAction), "n", target: self),
+            item("Share This Mac…", #selector(shareThisMac), "", target: self),
             paired,
             item("Open Recording…", #selector(openRecording), "o", target: self),
             item("Disconnect", #selector(NSWindow.performClose(_:)), "w", chord),
@@ -81,6 +83,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc private func showConnectAction() { showConnect() }
+
+    // MARK: host (M3b)
+
+    @objc private func shareThisMac() {
+        if hostController != nil { return }
+        browser.stop()
+        connectWindow?.orderOut(nil)
+        let h = HostController()
+        h.onClose = { [weak self] in
+            self?.hostController = nil
+            self?.showConnect()
+        }
+        hostController = h
+        h.open()
+    }
 
     // MARK: paired devices
 
@@ -171,7 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func buildConnectWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 230),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 230),
                          styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
         w.title = "Glass \(appVersion)"
         w.isReleasedWhenClosed = false
@@ -194,11 +211,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         connectButton = NSButton(title: "Connect", target: self, action: #selector(connect))
         connectButton.keyEquivalent = "\r"
         let open = NSButton(title: "Open Recording…", target: self, action: #selector(openRecording))
-        let note = NSTextField(labelWithString: "Paired PCs only; everything is encrypted. Opens full screen; ⌃⌥⌘F window, ⌃⌥⌘W disconnect.")
+        let share = NSButton(title: "Share This Mac…", target: self, action: #selector(shareThisMac))
+        let note = NSTextField(labelWithString: "Paired PCs only; everything is encrypted. Opens full screen; ⌃⌥⌘F window, ⌃⌥⌘W disconnect.\nTo control this Mac from a PC instead: Share This Mac.")
         note.textColor = .secondaryLabelColor
         note.font = .systemFont(ofSize: 11)
 
-        let buttons = NSStackView(views: [open, NSView(), connectButton])
+        let buttons = NSStackView(views: [open, share, NSView(), connectButton])
         buttons.orientation = .horizontal
         let stack = NSStackView(views: [foundLabel, foundPopup, label, hostField, note, buttons])
         stack.orientation = .vertical

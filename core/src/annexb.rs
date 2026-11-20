@@ -174,6 +174,38 @@ pub fn to_length_prefixed(data: &[u8], out: &mut [u8]) -> Option<usize> {
     Some(o)
 }
 
+/// Builds an Annex-B access unit from encoder output: each of `prefix` (raw
+/// NALs, e.g. VPS/SPS/PPS on a keyframe) and then every 4-byte
+/// length-prefixed NAL in `sample` (VideoToolbox's format), each behind a
+/// 4-byte start code. Returns bytes written, or `None` if `sample` is
+/// malformed or `out` is too small.
+pub fn from_length_prefixed(prefix: &[&[u8]], sample: &[u8], out: &mut [u8]) -> Option<usize> {
+    const START: [u8; 4] = [0, 0, 0, 1];
+    let mut o = 0;
+    let mut put = |nal: &[u8], o: &mut usize| -> Option<()> {
+        let end = *o + 4 + nal.len();
+        out.get_mut(*o..end)?;
+        out[*o..*o + 4].copy_from_slice(&START);
+        out[*o + 4..end].copy_from_slice(nal);
+        *o = end;
+        Some(())
+    };
+    for nal in prefix {
+        put(nal, &mut o)?;
+    }
+    let mut i = 0;
+    while i < sample.len() {
+        let len = u32::from_be_bytes(sample.get(i..i + 4)?.try_into().ok()?) as usize;
+        let nal = sample.get(i + 4..i + 4 + len)?;
+        if nal.is_empty() {
+            return None;
+        }
+        put(nal, &mut o)?;
+        i += 4 + len;
+    }
+    Some(o)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +287,29 @@ mod tests {
             &[0, 0, 0, 7, 0x26, 0x01, 0x00, 0x00, 0x03, 0x01, 0xDD]
         );
         assert_eq!(to_length_prefixed(AU, &mut out[..need - 1]), None);
+    }
+
+    #[test]
+    fn length_prefixed_round_trip() {
+        let mut lp = [0u8; 64];
+        let n = to_length_prefixed(AU, &mut lp).unwrap();
+        let ps = param_sets(AU);
+        let prefix = [ps.vps.unwrap(), ps.sps.unwrap(), ps.pps.unwrap()];
+        let mut out = [0u8; 128];
+        let m = from_length_prefixed(&prefix, &lp[..n], &mut out).unwrap();
+        let types: Vec<_> = nal_units(&out[..m]).map(nal_type).collect();
+        assert_eq!(types, [NAL_VPS, NAL_SPS, NAL_PPS, 19]);
+        assert!(param_sets(&out[..m]).complete());
+        // Same NAL bytes as the original (AUD dropped).
+        let a: Vec<_> = nal_units(AU).filter(|n| nal_type(n) != NAL_AUD).collect();
+        let b: Vec<_> = nal_units(&out[..m]).collect();
+        assert_eq!(a, b);
+        // Truncated length, short output, zero-length NAL.
+        assert_eq!(from_length_prefixed(&[], &lp[..n - 1], &mut out), None);
+        assert_eq!(
+            from_length_prefixed(&prefix, &lp[..n], &mut out[..10]),
+            None
+        );
+        assert_eq!(from_length_prefixed(&[], &[0, 0, 0, 0], &mut out), None);
     }
 }

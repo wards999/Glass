@@ -1,12 +1,15 @@
-//! D3D11 device on the NVIDIA adapter (NVENC needs it), shared by capture and encode.
+//! D3D11 devices: the NVIDIA adapter for the host (NVENC needs it, shared by
+//! capture and encode), and the default adapter for the viewer.
 
 use super::Res;
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_1};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Multithread, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_SDK_VERSION,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
 };
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
@@ -54,6 +57,39 @@ pub struct Gpu {
 }
 
 impl Gpu {
+    /// The default GPU with video decode support (any vendor): the viewer.
+    pub fn new_for_viewer() -> Res<Self> {
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
+        let adapter = unsafe { factory.EnumAdapters1(0)? };
+        let desc = unsafe { adapter.GetDesc1()? };
+        let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+        let mut device = None;
+        unsafe {
+            D3D11CreateDevice(
+                &adapter,
+                D3D_DRIVER_TYPE_UNKNOWN,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )?;
+        }
+        let device: ID3D11Device = device.ok_or("D3D11CreateDevice returned no device")?;
+        // FFmpeg's decoder and our presenter share the immediate context.
+        unsafe {
+            let _ = device
+                .cast::<ID3D11Multithread>()?
+                .SetMultithreadProtected(true);
+        }
+        Ok(Self {
+            name: String::from_utf16_lossy(&desc.Description[..len]),
+            device,
+        })
+    }
+
     pub fn new_nvidia() -> Res<Self> {
         let a = adapters()?
             .into_iter()

@@ -4,8 +4,8 @@
 //! - Mac virtual key code (`kVK_*`) -> HID, with the Ctrl/Cmd rule applied here
 //!   on the viewer side so the host only sees plain HID keys.
 //! - HID -> Windows set-1 scan code (+ extended flag) for `SendInput`.
-//!
-//! LATER(M3b): Windows scan code -> HID (Windows viewer), HID -> kVK (Mac host).
+//! - Windows scan code -> HID (Windows viewer), with its own modifier rule.
+//! - HID -> Mac key code (Mac host, `CGEvent`).
 
 /// HID modifier usages.
 pub const HID_LCTRL: u8 = 0xE0;
@@ -305,6 +305,48 @@ pub fn hid_to_win_scan(hid: u8) -> Option<(u16, bool)> {
     Some((scan, ext))
 }
 
+/// Windows set-1 scan code (+ E0 flag) -> HID usage, or 0 if unknown.
+pub fn win_scan_to_hid(scan: u16, extended: bool) -> u8 {
+    // Inverse of `hid_to_win_scan`; 0x31 and 0x32 share a scan code (0x31 wins).
+    (0u8..=0xE7)
+        .find(|&h| hid_to_win_scan(h) == Some((scan, extended)))
+        .unwrap_or(0)
+}
+
+/// How a PC keyboard's modifiers land on a Mac.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PcModifierRule {
+    /// Ctrl -> ⌘, Win -> ⌃, Alt -> ⌥ (PC shortcuts keep working: Ctrl+C copies).
+    PcStyle = 0,
+    /// Keys as labelled by position: Ctrl -> ⌃, Win -> ⌘, Alt -> ⌥.
+    MacStyle = 1,
+}
+
+/// Applies `rule` to a PC key's HID usage on its way to a Mac host.
+pub fn pc_key_for_mac(hid: u8, rule: PcModifierRule) -> u8 {
+    if rule == PcModifierRule::MacStyle {
+        return hid;
+    }
+    match hid {
+        HID_LCTRL => HID_LGUI,
+        HID_RCTRL => HID_RGUI,
+        HID_LGUI => HID_LCTRL,
+        HID_RGUI => HID_RCTRL,
+        h => h,
+    }
+}
+
+/// HID usage -> Mac `kVK_*` on the host (HID GUI = ⌘, Ctrl = ⌃). `iso`: the
+/// host Mac's keyboard is ISO, which swaps the codes of its two keys by the
+/// top-left and left Shift. None if the Mac has no such key.
+pub fn hid_to_mac(hid: u8, iso: bool) -> Option<u16> {
+    if hid == 0 {
+        return None;
+    }
+    (0u16..0x80).find(|&k| mac_to_hid(k, iso, ModifierRule::PcStyle) == hid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +409,53 @@ mod tests {
             if h != 0 {
                 if let Some(prev) = seen.insert(h, kvk) {
                     panic!("kVK {prev:#x} and {kvk:#x} both map to HID {h:#x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn windows_scan_codes_round_trip() {
+        for hid in 0u8..=0xE7 {
+            if let Some((scan, ext)) = hid_to_win_scan(hid) {
+                let back = win_scan_to_hid(scan, ext);
+                let want = if hid == 0x32 { 0x31 } else { hid };
+                assert_eq!(back, want, "HID {hid:#x}");
+            }
+        }
+        assert_eq!(win_scan_to_hid(0x1E, false), 0x04); // A
+        assert_eq!(win_scan_to_hid(0x1D, true), HID_RCTRL);
+        assert_eq!(win_scan_to_hid(0x7F, false), 0);
+    }
+
+    #[test]
+    fn pc_keys_reach_the_mac() {
+        // Ctrl+C on the PC is ⌘C on the Mac by default.
+        let ctrl = pc_key_for_mac(HID_LCTRL, PcModifierRule::PcStyle);
+        assert_eq!(ctrl, HID_LGUI);
+        assert_eq!(hid_to_mac(ctrl, false), Some(0x37)); // ⌘
+        assert_eq!(
+            hid_to_mac(pc_key_for_mac(HID_LGUI, PcModifierRule::PcStyle), false),
+            Some(0x3B)
+        ); // ⌃
+        assert_eq!(
+            pc_key_for_mac(HID_LCTRL, PcModifierRule::MacStyle),
+            HID_LCTRL
+        );
+        assert_eq!(hid_to_mac(HID_LALT, false), Some(0x3A)); // ⌥
+        assert_eq!(hid_to_mac(0x04, false), Some(0x00)); // A
+        assert_eq!(hid_to_mac(0x2A, false), Some(0x33)); // Backspace -> Delete
+                                                         // ISO: the PC's ` key (top-left) is the Mac's § key, and the PC's
+                                                         // extra key beside left Shift is the Mac's ` key.
+        assert_eq!(hid_to_mac(0x35, true), Some(0x0A));
+        assert_eq!(hid_to_mac(0x64, true), Some(0x32));
+        assert_eq!(hid_to_mac(0x35, false), Some(0x32));
+        assert_eq!(hid_to_mac(0x46, false), None); // Print Screen: no Mac key
+                                                   // Every key a PC sends that the Mac has comes back to the same HID.
+        for iso in [false, true] {
+            for hid in 1u8..=0xE7 {
+                if let Some(k) = hid_to_mac(hid, iso) {
+                    assert_eq!(mac_to_hid(k, iso, ModifierRule::PcStyle), hid);
                 }
             }
         }

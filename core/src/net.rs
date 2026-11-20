@@ -286,6 +286,7 @@ pub struct HostListener {
 
 /// Host-side counters for one session.
 #[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
 pub struct HostCounters {
     pub frames_sent: u64,
     pub packets_sent: u64,

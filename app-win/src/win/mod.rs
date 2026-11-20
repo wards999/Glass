@@ -1,13 +1,17 @@
-//! Windows-only host pieces: D3D11 device, Windows.Graphics.Capture, NVENC.
+//! Windows-only pieces. Host: D3D11 device, Windows.Graphics.Capture, NVENC,
+//! input injection. Viewer (`viewer.rs`): D3D11VA decode, flip-model present.
 
 mod blocker;
 mod capture;
 mod cursor;
 mod d3d;
+mod decode;
 pub mod dpapi;
 mod encode;
 mod inject;
 mod mdns;
+mod present;
+pub mod viewer;
 
 use glass_core::clock;
 use glass_core::identity::fingerprint_short;

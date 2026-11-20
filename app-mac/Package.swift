@@ -24,7 +24,7 @@ let package = Package(
         .executableTarget(name: "GlassMac", dependencies: ["GlassKit", "CGlassCore"]),
         .testTarget(
             name: "GlassKitTests",
-            dependencies: ["GlassKit"],
+            dependencies: ["GlassKit", "CGlassCore"],
             resources: [.copy("Fixtures")]
         ),
     ]

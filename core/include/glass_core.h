@@ -20,6 +20,32 @@
 #define GLASS_ClockSync_WINDOW 16
 
 /**
+ * `HostEventC::kind`.
+ */
+#define GLASS_HOST_EVENT_PAIRING_PIN 1
+
+#define GLASS_HOST_EVENT_PAIRED 2
+
+#define GLASS_HOST_EVENT_WRONG_PIN 3
+
+#define GLASS_HOST_EVENT_PAIRING_LOCKED 4
+
+#define GLASS_HOST_EVENT_REFUSED 5
+
+#define GLASS_HOST_EVENT_DENIED 6
+
+/**
+ * `InputActionC::kind`.
+ */
+#define GLASS_INPUT_MOVE 1
+
+#define GLASS_INPUT_BUTTON 2
+
+#define GLASS_INPUT_KEY 3
+
+#define GLASS_INPUT_SCROLL 4
+
+/**
  * We paired with it as a viewer: it's a host we trust.
  */
 #define GLASS_ROLE_HOST (1 << 0)
@@ -292,6 +318,17 @@ typedef struct GLASS_Client GLASS_Client;
 typedef struct GLASS_DeviceHandle GLASS_DeviceHandle;
 
 /**
+ * A listening host (opaque): waits for paired viewers and pairing requests.
+ */
+typedef struct GLASS_HostHandle GLASS_HostHandle;
+
+/**
+ * One connected viewer. Dropping it ends the session (and releases any
+ * keys/buttons the viewer was holding).
+ */
+typedef struct GLASS_HostSession GLASS_HostSession;
+
+/**
  * A pairing in progress: the host is showing a PIN.
  */
 typedef struct GLASS_Pairing GLASS_Pairing;
@@ -497,6 +534,109 @@ typedef struct {
   uint16_t hot_x;
   uint16_t hot_y;
 } GLASS_CursorInfo;
+
+/**
+ * Something the host's user should see (`net::HostEvent`). Strings are
+ * NUL-terminated UTF-8.
+ */
+typedef struct {
+  uint8_t kind;
+  /**
+   * PairingPin: true the first time this PIN is shown.
+   */
+  bool new_pin;
+  /**
+   * WrongPin: tries left with the current PIN.
+   */
+  uint32_t left;
+  /**
+   * Device name (PairingPin, Paired, WrongPin, Denied) or short
+   * fingerprint (Refused).
+   */
+  char device[72];
+  /**
+   * PairingPin: the 6-digit PIN.
+   */
+  char pin[8];
+  /**
+   * PairingPin, Refused: the device's IP address.
+   */
+  char addr[48];
+} GLASS_HostEventC;
+
+typedef void (*GLASS_HostEventFn)(void *ctx, const GLASS_HostEventC *event);
+
+/**
+ * One input action to inject (`input::InputAction`), in order.
+ */
+typedef struct {
+  uint8_t kind;
+  /**
+   * Button: `input::BUTTON_*`.
+   */
+  uint8_t button;
+  /**
+   * Key: HID usage (`glass_keymap_hid_to_mac` gives the Mac key code).
+   */
+  uint8_t hid;
+  bool down;
+  /**
+   * Move: normalised position on the picture, 0..=65535.
+   */
+  uint16_t x;
+  uint16_t y;
+  /**
+   * Scroll: wheel units (120 = one notch); `dy > 0` up, `dx > 0` right.
+   */
+  int16_t dy;
+  int16_t dx;
+} GLASS_InputActionC;
+
+typedef void (*GLASS_InputFn)(void *ctx, const GLASS_InputActionC *action);
+
+/**
+ * What the host knows about a frame when it sends it.
+ */
+typedef struct {
+  uint32_t frame_id;
+  uint8_t flags;
+  uint64_t capture_ts_us;
+  uint32_t encode_us;
+  /**
+   * `FrameInfo::input_seq`.
+   */
+  uint32_t input_seq;
+} GLASS_OutFrame;
+
+/**
+ * Host-side counters.
+ */
+typedef struct {
+  uint64_t packets;
+  uint64_t keys;
+  uint64_t clicks;
+  uint64_t scrolls;
+  uint64_t moves;
+  /**
+   * Keys/buttons changed by state reconciliation (their events were lost).
+   */
+  uint64_t repaired;
+} GLASS_InputCounters;
+
+/**
+ * Host-side counters for one session.
+ */
+typedef struct {
+  uint64_t frames_sent;
+  uint64_t packets_sent;
+  uint64_t bytes_sent;
+  uint32_t keyframe_requests;
+  GLASS_InputCounters input;
+  /**
+   * UDP datagrams that failed authentication or were replays.
+   */
+  uint64_t rejected_datagrams;
+} GLASS_HostCounters;
 
 /**
  * NUL-terminated core version string, e.g. "0.0.1". Static; do not free.
@@ -832,6 +972,192 @@ GLASS_CursorInfo glass_client_cursor(const GLASS_Client *c,
  * `c` must come from `glass_client_connect` (or be null) and not be used afterwards.
  */
 void glass_client_close(GLASS_Client *c);
+
+/**
+ * Starts listening on `port` (TCP and UDP; 0 = any free port) as `d`.
+ * `fixed_pin` (null = a random PIN per request) is for tests. `events`
+ * (nullable) is called on the accepting thread. Returns null on error
+ * (`*err`: 1 = port in use or no network, 10 = identity).
+ *
+ * # Safety
+ * `d` from `glass_device_open`; `fixed_pin` null or NUL-terminated; `ctx`
+ * valid for as long as the host runs; `err` null or writable.
+ */
+GLASS_HostHandle *glass_host_listen(const GLASS_DeviceHandle *d,
+                                    uint16_t port,
+                                    const char *fixed_pin,
+                                    GLASS_HostEventFn events,
+                                    void *ctx,
+                                    int32_t *err);
+
+/**
+ * The port the host listens on.
+ *
+ * # Safety
+ * `h` from `glass_host_listen`.
+ */
+uint16_t glass_host_port(const GLASS_HostHandle *h);
+
+/**
+ * Waits for one connection and handles it. Returns a session for a paired
+ * viewer (`*status` = 1). A pairing request or a refused device is handled
+ * here, reported through the events callback, and gives null with
+ * `*status` = 0; a failed attempt gives -1; after `glass_host_wake`, -2.
+ * `input` is called on core's UDP thread for every action, in order.
+ *
+ * # Safety
+ * `h` from `glass_host_listen`; `ctx` valid until the session is closed;
+ * `status` writable or null.
+ */
+GLASS_HostSession *glass_host_accept(const GLASS_HostHandle *h,
+                                     GLASS_StreamInfo info,
+                                     GLASS_InputFn input,
+                                     void *ctx,
+                                     int32_t *status);
+
+/**
+ * Makes a blocked `glass_host_accept` return (-2), and every later one.
+ *
+ * # Safety
+ * `h` from `glass_host_listen`.
+ */
+void glass_host_wake(const GLASS_HostHandle *h);
+
+/**
+ * Stops listening. Call `glass_host_wake` and let `glass_host_accept`
+ * return first.
+ *
+ * # Safety
+ * `h` from `glass_host_listen` (or null), not used afterwards.
+ */
+void glass_host_free(GLASS_HostHandle *h);
+
+/**
+ * The connected viewer's name. Returns its full length in bytes.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`; `buf` writable for `len` bytes.
+ */
+size_t glass_session_peer_name(const GLASS_HostSession *s, char *buf, size_t len);
+
+/**
+ * The viewer's IP address.
+ *
+ * # Safety
+ * As `glass_session_peer_name`.
+ */
+size_t glass_session_peer_addr(const GLASS_HostSession *s, char *buf, size_t len);
+
+/**
+ * False once the viewer has gone.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+bool glass_session_connected(const GLASS_HostSession *s);
+
+/**
+ * True once frames are being delivered (the viewer's UDP address is known).
+ *
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+bool glass_session_streaming(const GLASS_HostSession *s);
+
+/**
+ * Takes a pending keyframe request: encode the next frame as an IDR.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+bool glass_session_take_keyframe_request(const GLASS_HostSession *s);
+
+/**
+ * Latest input packet applied; stamp it on the next captured frame.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+uint32_t glass_session_input_seq(const GLASS_HostSession *s);
+
+/**
+ * Seals and sends one encoded frame (Annex-B). Returns 1 if sent, 0 if the
+ * viewer's address isn't known yet (nothing sent), -1 on error.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`; `f` readable; `data` readable for `len`.
+ */
+int32_t glass_session_send_frame(GLASS_HostSession *s,
+                                 const GLASS_OutFrame *f,
+                                 const uint8_t *data,
+                                 size_t len);
+
+/**
+ * Sends a new pointer image: straight-alpha RGBA, top row first,
+ * `width * height * 4` bytes (at most 96 x 96). Returns false on error.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`; `rgba` readable for `len` bytes.
+ */
+bool glass_session_send_cursor(GLASS_HostSession *s,
+                               uint32_t serial,
+                               uint16_t width,
+                               uint16_t height,
+                               uint16_t hot_x,
+                               uint16_t hot_y,
+                               const uint8_t *rgba,
+                               size_t len);
+
+/**
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+bool glass_session_send_cursor_visible(GLASS_HostSession *s, bool visible);
+
+/**
+ * Tells the viewer about a condition (`NOTICE_*`; 0 clears it).
+ *
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+bool glass_session_send_notice(GLASS_HostSession *s, uint8_t code);
+
+/**
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+GLASS_HostCounters glass_session_counters(const GLASS_HostSession *s);
+
+/**
+ * Ends the session (releasing any keys the viewer held) and frees it.
+ *
+ * # Safety
+ * `s` from `glass_host_accept` (or null), not used afterwards.
+ */
+void glass_session_close(GLASS_HostSession *s);
+
+/**
+ * HID usage -> Mac key code for the host (`keymap::hid_to_mac`); 0xFFFF if
+ * the Mac has no such key.
+ */
+uint16_t glass_keymap_hid_to_mac(uint8_t hid, bool iso);
+
+/**
+ * Builds an Annex-B access unit from VideoToolbox output: the `prefix_count`
+ * (at most 4) raw NALs in `prefix` (VPS/SPS/PPS on keyframes), then the
+ * 4-byte length-prefixed NALs in `sample`. Returns bytes written, or -1 if
+ * the sample is malformed or `out_cap` is too small.
+ *
+ * # Safety
+ * `prefix` readable for `prefix_count` entries (each a valid `Bytes`);
+ * `sample` readable for `len`; `out` writable for `out_cap`.
+ */
+ptrdiff_t glass_hevc_from_length_prefixed(const GLASS_Bytes *prefix,
+                                          size_t prefix_count,
+                                          const uint8_t *sample,
+                                          size_t len,
+                                          uint8_t *out,
+                                          size_t out_cap);
 
 /**
  * Serves a `.glsr` file (copied) as a live stream on `port` (0 = any free

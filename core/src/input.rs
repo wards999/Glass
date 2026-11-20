@@ -349,6 +349,7 @@ pub enum InputAction {
 
 /// Host-side counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C)]
 pub struct InputCounters {
     pub packets: u64,
     pub keys: u64,

@@ -17,6 +17,7 @@ pub const MAX_PAYLOAD: usize = MAX_DATAGRAM - VideoPacketHeader::SIZE;
 
 /// What the host knows about a frame when it sends it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
 pub struct OutFrame {
     pub frame_id: u32,
     pub flags: u8,

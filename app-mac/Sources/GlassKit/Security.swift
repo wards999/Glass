@@ -32,6 +32,24 @@ public final class GlassDevice {
 
     deinit { glass_device_free(ptr) }
 
+    /// SHA-256 of this device's certificate.
+    public var fingerprint: [UInt8] {
+        var fp = [UInt8](repeating: 0, count: 32)
+        glass_device_fingerprint(ptr, &fp)
+        return fp
+    }
+
+    /// "3f2a 91c0 77de 10ab", as the PC shows ids.
+    public var fingerprintShort: String {
+        let fp = fingerprint
+        return stride(from: 0, to: 8, by: 2).map { String(format: "%02x%02x", fp[$0], fp[$0 + 1]) }.joined(separator: " ")
+    }
+
+    /// First 8 bytes in hex (the `fp` TXT value viewers match against).
+    public var fingerprintHexPrefix: String {
+        fingerprint.prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
     public struct Peer: Equatable {
         public let fingerprint: [UInt8]
         public let name: String

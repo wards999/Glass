@@ -1,7 +1,8 @@
 Glass for Windows (test build __VERSION__)
 =========================================
 
-Needs an NVIDIA GPU (NVENC). Unzip anywhere; keep the DLLs next to glass.exe.
+Hosting (host.cmd) needs an NVIDIA GPU (NVENC); viewing (connect.cmd) works on
+any GPU that can decode HEVC. Unzip anywhere; keep the DLLs next to glass.exe.
 Windows SmartScreen may warn because the build isn't signed: click
 "More info" > "Run anyway".
 
@@ -24,6 +25,16 @@ Live stream to the Mac:
   No it still works, but Windows blocks all of the Mac's input while an admin
   window is in front. UAC prompts and the lock screen need the PC itself.
 
+View and control the Mac from this PC (connect.cmd):
+  1. On the Mac, open Glass and click "Share This Mac". It shows the Mac's
+     address (and asks for Screen Recording and Accessibility the first time).
+  2. Double-click connect.cmd and type that address. The first time, the Mac
+     shows a 6-digit PIN: type it here. The Mac opens full screen.
+     Ctrl+Alt+Shift+F   window / full screen
+     Ctrl+Alt+Shift+Q   disconnect (results print here and go to results-viewer.txt)
+  Every other key goes to the Mac. Ctrl acts as Cmd (Ctrl+C copies), Win as
+  Ctrl, Alt as Option. For a PC host instead: connect.cmd --keys labelled.
+
 M1 test (recordings): record-clips.cmd.
 
 Paired devices:
@@ -35,6 +46,7 @@ Paired devices:
 
 Commands:
   glass host [--monitor N] [--chroma 420|444] [--mbps M] [--port P] [--log FILE] [--ask]
+  glass connect [HOST[:PORT]] [--pin PIN] [--windowed] [--keys pc|labelled] [--log FILE]
   glass probe HOST [--port P] [--pin PIN] [--seconds S]  headless viewer (network check)
   glass serve FILE.glsr [--port P] [--pin PIN]            stream a recording as if live
   glass list

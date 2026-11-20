@@ -1,3 +1,4 @@
+import CGlassCore
 import CoreVideo
 import Metal
 import XCTest
@@ -233,5 +234,115 @@ final class LiveTests: XCTestCase {
         let e = Renderer.fitViewport(src: CGSize(width: 2560, height: 1440), dst: CGSize(width: 2560, height: 1440))
         XCTAssertEqual(e.width, 2560)
         XCTAssertEqual(e.originY, 0)
+    }
+}
+
+/// Mac as host (M3b): core's host through GlassKit, with a GlassClient as
+/// the viewer. Frames are sent by hand, so no encoder is needed on CI.
+final class HostTests: XCTestCase {
+    final class Recorder: GlassInputHandler {
+        private let lock = NSLock()
+        private var _keys: [UInt8] = []
+        var keys: [UInt8] { lock.withLock { _keys } }
+        func handle(_ a: GLASS_InputActionC) {
+            if Int32(a.kind) == GLASS_INPUT_KEY, a.down { lock.withLock { _keys.append(a.hid) } }
+        }
+    }
+
+    func tempDevice(_ name: String) throws -> GlassDevice {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("glass-test-\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        return try XCTUnwrap(GlassDevice(directory: dir.path, name: name))
+    }
+
+    func testHostPairsStreamsAndTakesInput() throws {
+        let hostDevice = try tempDevice("Host Mac")
+        let pinLock = NSLock()
+        var pins: [String] = []
+        let host = try GlassHost(device: hostDevice, port: 0, fixedPin: "246810") { e in
+            if e.kind == .pairingPin { pinLock.withLock { pins.append(e.pin) } }
+        }
+        let info = GLASS_StreamInfo(codec: UInt8(GLASS_CODEC_HEVC), chroma: UInt8(GLASS_CHROMA_420), width: 64, height: 32, fps: 60)
+        let rec = Recorder()
+        let ready = expectation(description: "session")
+        let sessionLock = NSLock()
+        var session: GlassHostSession?
+        let acceptor = Thread {
+            while true {
+                switch host.accept(info: info, input: rec) {
+                case .session(let s):
+                    sessionLock.withLock { session = s }
+                    ready.fulfill()
+                    return
+                case .stopped:
+                    return
+                case .handled, .failed:
+                    continue
+                }
+            }
+        }
+        acceptor.start()
+
+        let viewer = try tempDevice("PC")
+        let p = try GlassPairing(device: viewer, host: "127.0.0.1", port: host.port)
+        XCTAssertEqual(p.hostName, "Host Mac")
+        try p.finish(pin: "246810")
+        XCTAssertEqual(pinLock.withLock { pins }, ["246810"])
+        let client = try GlassClient(host: "127.0.0.1", port: host.port, device: viewer)
+        wait(for: [ready], timeout: 10)
+        let s = try XCTUnwrap(sessionLock.withLock { session })
+        XCTAssertEqual(s.peerName, "PC")
+        XCTAssertEqual(s.peerAddress, "127.0.0.1")
+
+        // Frames reach the viewer intact once its UDP punch has arrived.
+        let bytes: [UInt8] = [0, 0, 0, 1, 0x26, 1, 0xAA, 0x55]
+        var got = 0, id: UInt32 = 0
+        let deadline = Date().addingTimeInterval(10)
+        while got < 3, Date() < deadline {
+            id += 1
+            let f = GLASS_OutFrame(frame_id: id, flags: 1, capture_ts_us: GlassClock.nowUs(), encode_us: 100, input_seq: 0)
+            bytes.withUnsafeBytes { _ = s.send(f, $0) }
+            let r = client.waitFrame(timeoutMs: 50) { meta, data in
+                XCTAssertEqual(Array(data), bytes)
+                XCTAssertEqual(meta.encode_us, 100)
+            }
+            if r == .frame { got += 1 }
+        }
+        XCTAssertGreaterThanOrEqual(got, 3)
+        XCTAssertGreaterThanOrEqual(s.counters.frames_sent, 3)
+
+        // The viewer's keys arrive as HID usages, which map to Mac key codes.
+        client.key(0x04, down: true)
+        client.key(0x04, down: false)
+        let keyDeadline = Date().addingTimeInterval(5)
+        while rec.keys.isEmpty, Date() < keyDeadline { Thread.sleep(forTimeInterval: 0.01) }
+        XCTAssertEqual(rec.keys.first, 0x04)
+        XCTAssertEqual(glassMacKey(hid: 0x04, iso: false), 0x00) // A
+        XCTAssertEqual(glassMacKey(hid: 0xE3, iso: false), 0x37) // GUI -> ⌘
+        XCTAssertNil(glassMacKey(hid: 0x46, iso: false)) // Print Screen
+
+        client.close()
+        s.close()
+        host.stop()
+    }
+
+    func testAnnexBFromEncoderOutput() {
+        // VideoToolbox's length-prefixed NALs become Annex-B behind the parameter sets.
+        let vps: [UInt8] = [0x40, 1, 0xAA]
+        let sample: [UInt8] = [0, 0, 0, 3, 0x26, 1, 0xDD]
+        var out = [UInt8](repeating: 0, count: 64)
+        let n = vps.withUnsafeBufferPointer { v in
+            var pre = [GLASS_Bytes(ptr: v.baseAddress, len: v.count)]
+            return sample.withUnsafeBufferPointer { s in
+                glass_hevc_from_length_prefixed(&pre, 1, s.baseAddress, s.count, &out, out.count)
+            }
+        }
+        XCTAssertEqual(Array(out[0..<max(n, 0)]), [0, 0, 0, 1, 0x40, 1, 0xAA, 0, 0, 0, 1, 0x26, 1, 0xDD])
+    }
+
+    func testLocalAddressesAreIPv4() {
+        for a in localIPv4Addresses() {
+            XCTAssertEqual(a.split(separator: ".").count, 4, a)
+        }
     }
 }

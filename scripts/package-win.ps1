@@ -19,7 +19,7 @@ foreach ($dll in 'avcodec-62.dll', 'avutil-60.dll', 'swresample-6.dll') {
     Copy-Item (Join-Path third_party/ffmpeg/bin $dll) $dir
 }
 Copy-Item third_party/ffmpeg/LICENSE.txt (Join-Path $dir 'FFmpeg-LICENSE.txt')
-Copy-Item app-win/packaging/record-clips.cmd, app-win/packaging/host.cmd $dir
+Copy-Item app-win/packaging/record-clips.cmd, app-win/packaging/host.cmd, app-win/packaging/connect.cmd $dir
 (Get-Content app-win/packaging/README.txt -Raw).Replace('__VERSION__', $Version) |
     Set-Content -Encoding utf8 (Join-Path $dir 'README.txt')
 

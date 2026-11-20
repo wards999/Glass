@@ -143,6 +143,9 @@ jobs:
         working-directory: app-mac
         run: swift test
       - name: Package (Glass.app + dmg)
+        env:
+          MAC_SIGN_P12: ${{ secrets.MAC_SIGN_P12 }}
+          MAC_SIGN_PASSWORD: ${{ secrets.MAC_SIGN_PASSWORD }}
         run: bash scripts/package-mac.sh
       - name: decode bench (fixtures, packaged binary)
         run: |
@@ -164,6 +167,18 @@ jobs:
           GLASS_HOME=$RUNNER_TEMP/viewer perl -e "alarm 60; exec @ARGV" /tmp/glass/Glass.app/Contents/MacOS/GlassMac connect 127.0.0.1:47811 --pin 246810 --seconds 5
           hdiutil detach /tmp/glass
           kill %1 || true
+      - name: Mac host smoke test (packaged app, test pattern -> glass probe)
+        # Runners are VMs: a hardware HEVC encoder may be missing. Report, don't fail.
+        continue-on-error: true
+        run: |
+          hdiutil attach dist/*.dmg -mountpoint /tmp/glass -nobrowse
+          bin=/tmp/glass/Glass.app/Contents/MacOS/GlassMac
+          "$bin" check-444 || true
+          GLASS_HOME=$RUNNER_TEMP/machost perl -e "alarm 90; exec @ARGV" "$bin" host --test-pattern --pin 246810 --port 47812 --seconds 6 &
+          sleep 3
+          GLASS_HOME=$RUNNER_TEMP/pcviewer target/release/glass probe 127.0.0.1 --port 47812 --pin 246810 --seconds 4 --min-frames 60
+          wait %1
+          hdiutil detach /tmp/glass
       - uses: actions/upload-artifact@v4
         with:
           name: glass-mac

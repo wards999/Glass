@@ -211,10 +211,15 @@ capacity that changes as you move. Design for it:
   0–2 frames on Wi-Fi, 0–1 wired; drops late frames rather than queueing.
 - **Wi-Fi QoS:** mark media and input packets with DSCP (video CS4/AF41, audio
   and input EF) so WMM-capable routers put them in the video/voice queues.
-- **Mac Wi-Fi quirks:** AWDL (AirDrop/Continuity) makes the Mac's Wi-Fi hop
-  channels and causes periodic latency spikes. Detect the spike pattern and
-  tell the user how to avoid it (turn off AirDrop/Handoff while streaming).
-  Never change system settings ourselves.
+- **Mac Wi-Fi quirks:** AWDL (AirDrop/Continuity) can make the Mac's Wi-Fi
+  hop channels and cause periodic delay spikes. StarDesk is smooth on the
+  same Wi-Fi without touching AWDL, so Glass must absorb spikes the same way
+  (pacing, FEC, jitter buffer, adaptive bitrate) rather than switch AWDL off.
+  Only detect the pattern and report it in the stats. Never change system
+  settings.
+- **Baseline:** StarDesk on the same machines and Wi-Fi is the bar to beat.
+  Measure it once (glass-to-glass with a phone slow-motion video, both
+  directions) and keep the numbers in `docs/results/baseline-stardesk.md`.
 - **Show the link:** the overlay shows Wi-Fi delay spikes, loss and current
   bitrate, so a bad link is visible as a link problem.
 

@@ -1,6 +1,6 @@
 # M3b — The PC views and controls the Mac: results
 
-**Status: DONE.** m3b-test1 worked on the real PC and Mac (2026-11-20). `check-444` on the M4 still to come (it decides M3c).
+**Status: DONE.** m3b-test1 worked on the real PC and Mac (2026-11-20).
 **Date:** 2026-11-20 · design: ADR 0011 · protocol v4 (unchanged)
 
 ## What's in it
@@ -105,3 +105,14 @@ Problems found (fixed for the next build):
    own window.
 3. Copy Results gave no feedback: it is now **Show Results**, a window with
    Copy.
+
+## 4:4:4 (input for M3c)
+- **Mac (M4), `GlassMac check-444`:** HEVC 4:2:0 and **4:4:4 hardware
+  encode both YES**.
+- **PC (RTX 4070), tested here:** a 2560×1440 HEVC 4:4:4 stream (NVENC) sent
+  to the viewer gave 243 of 243 frames failing to decode. D3D11VA doesn't
+  offer HEVC 4:4:4 on this GPU. The Mac can send 4:4:4, but this PC can't
+  decode it through D3D11VA, so M3c needs another decode path (NVDEC) or
+  still-region refinement, and the viewer must tell the host what it can
+  decode.
+

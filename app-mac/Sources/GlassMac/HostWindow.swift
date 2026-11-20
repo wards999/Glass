@@ -21,6 +21,7 @@ final class HostController: NSObject, NSWindowDelegate {
     private var runner: HostRunner?
     private let advertiser = GlassAdvertiser()
     private var lastReport: String?
+    private var closed = false
     private var permissionTimer: Timer?
 
     func open() {
@@ -133,9 +134,15 @@ final class HostController: NSObject, NSWindowDelegate {
             }
             r.onSessionEnd = { [weak self] report in
                 print(report)
-                self?.lastReport = report
-                self?.copyButton.isEnabled = true
-                self?.statusLabel.stringValue = "Session ended. Copy Results and paste them to Claude. Waiting for the PC…"
+                // Stop Sharing during a session: the window is gone, so show
+                // the results on their own (with Copy).
+                guard let self, !self.closed else {
+                    showResults(report)
+                    return
+                }
+                self.lastReport = report
+                self.copyButton.isEnabled = true
+                self.statusLabel.stringValue = "Session ended. Copy Results and paste them to Claude. Waiting for the PC…"
             }
             runner = r
             r.start()
@@ -173,6 +180,7 @@ final class HostController: NSObject, NSWindowDelegate {
     @objc private func stopSharing() { window.close() }
 
     func windowWillClose(_ notification: Notification) {
+        closed = true
         permissionTimer?.invalidate()
         permissionTimer = nil
         advertiser.stop()

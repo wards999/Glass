@@ -574,7 +574,7 @@ Each milestone ends with a short written result in `docs/results/Mx.md` (what wo
 - 4:4:4 hardware decode support on the specific Mac (check early, in M1).
 - How much control FFmpeg's wrappers expose vs the NVENC SDK (VBV bursts, intra-refresh, ROI).
 - macOS `CAMetalLayer` presentation latency and ProMotion behaviour.
-- The UAC/secure desktop on Windows needs a SYSTEM service; out of scope until after M8.
+- Input into admin windows, UAC prompts and the lock screen on Windows needs a SYSTEM service (as RDP-style tools and TeamViewer/Jump Desktop do): the last step, after M8. Until then host.cmd asks for admin rights at start, which covers admin windows but not UAC or the lock screen (m6-test1 found that without it, an admin window in front blocks all input).
 - Mac as host: Screen Recording + Accessibility permissions, no public virtual-display API, and VideoToolbox gives less rate-control precision than NVENC (check scene-change bursts work in M3b).
 - Key mapping between Windows and macOS (Ctrl/Cmd, Alt/Option, Win key) needs a clear, configurable rule.
 - Wi-Fi is the primary network (§5d): delay spikes, bursts, loss and changing capacity are the main threat to smoothness. The adaptive buffer and bitrate must handle them without hurting the wired case. Mac AWDL channel hopping causes periodic spikes we can only detect and explain.

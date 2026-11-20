@@ -54,8 +54,18 @@ pub fn serve(args: &[String]) -> Res<()> {
         crate::banner(),
         replay.port()
     );
+    // Report input the viewer sends (logged, not injected).
+    let mut last = Default::default();
     loop {
-        std::thread::sleep(Duration::from_secs(3600));
+        std::thread::sleep(Duration::from_secs(1));
+        let c = replay.input_counters();
+        if c != last {
+            println!(
+                "input: {} packets | {} keys, {} clicks, {} scrolls, {} moves | repaired {}",
+                c.packets, c.keys, c.clicks, c.scrolls, c.moves, c.repaired
+            );
+            last = c;
+        }
     }
 }
 

@@ -5,22 +5,35 @@
 //! Frames are paced by their recorded capture timestamps and re-stamped with
 //! the current clock, so the viewer's latency numbers measure the network and
 //! client only. A keyframe request restarts from the first frame (an IDR).
+//! Input from the viewer is logged (not injected) and a test pointer shape is
+//! sent, so the input and cursor paths can be checked without a desktop.
 
 use crate::clock;
+use crate::input::{InputAction, InputCounters};
 use crate::net::{HostListener, HostSession};
 use crate::packet::OutFrame;
-use crate::protocol::StreamInfo;
+use crate::protocol::{CursorShape, StreamInfo};
 use crate::recording::{RecordingReader, CODEC_HEVC};
 use std::io;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// Most recent input actions kept for inspection.
+const INPUT_LOG_MAX: usize = 10_000;
+
+#[derive(Default)]
+struct ReplayInput {
+    log: Vec<InputAction>,
+    counters: InputCounters,
+}
 
 pub struct Replay {
     stop: Arc<AtomicBool>,
     port: u16,
+    input: Arc<Mutex<ReplayInput>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -52,21 +65,31 @@ impl Replay {
         };
         let port = listener.port();
         let stop = Arc::new(AtomicBool::new(false));
-        let st = stop.clone();
+        let input = Arc::new(Mutex::new(ReplayInput::default()));
+        let (st, inp) = (stop.clone(), input.clone());
         let thread = std::thread::spawn(move || {
             while !st.load(Ordering::Relaxed) {
-                let Ok(mut session) = listener.accept(info) else {
+                let log = inp.clone();
+                let sink = Box::new(move |a: InputAction| {
+                    let mut l = log.lock().unwrap_or_else(|e| e.into_inner());
+                    if l.log.len() < INPUT_LOG_MAX {
+                        l.log.push(a);
+                    }
+                });
+                let Ok(mut session) = listener.accept(info, sink) else {
                     continue;
                 };
                 if st.load(Ordering::Relaxed) {
                     break;
                 }
-                serve(&data, &mut session, &st);
+                serve(&data, &mut session, &st, &inp);
+                drop(session); // joins its threads, so release-all actions are logged
             }
         });
         Ok(Self {
             stop,
             port,
+            input,
             thread: Some(thread),
         })
     }
@@ -74,15 +97,55 @@ impl Replay {
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    /// Input actions received so far (all sessions, up to 10 000).
+    pub fn input_log(&self) -> Vec<InputAction> {
+        self.input
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .log
+            .clone()
+    }
+
+    /// Input counters of the current (or last) session.
+    pub fn input_counters(&self) -> InputCounters {
+        self.input
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .counters
+    }
 }
 
-fn serve(data: &[u8], session: &mut HostSession, stop: &AtomicBool) {
+/// 16x16 test pointer: white square with a black border, hotspot top-left.
+fn test_cursor() -> Vec<u8> {
+    let mut px = Vec::with_capacity(16 * 16 * 4);
+    for y in 0..16 {
+        for x in 0..16 {
+            let edge = x == 0 || y == 0 || x == 15 || y == 15;
+            let v = if edge { 0 } else { 255 };
+            px.extend_from_slice(&[v, v, v, 255]);
+        }
+    }
+    px
+}
+
+fn serve(data: &[u8], session: &mut HostSession, stop: &AtomicBool, input: &Mutex<ReplayInput>) {
     let mut frame_id = 0u32;
     let live = |s: &HostSession| s.connected() && !stop.load(Ordering::Relaxed);
     // Wait for the viewer's UDP punch so it gets the stream from the IDR.
     while live(session) && !session.streaming() {
         std::thread::sleep(Duration::from_millis(2));
     }
+    let px = test_cursor();
+    let _ = session.send_cursor(&CursorShape {
+        serial: 1,
+        width: 16,
+        height: 16,
+        hot_x: 0,
+        hot_y: 0,
+        rgba: &px,
+    });
+    let _ = session.send_cursor_visible(true);
     'outer: while live(session) {
         session.take_keyframe_request();
         let Ok(reader) = RecordingReader::new(data) else {
@@ -109,10 +172,12 @@ fn serve(data: &[u8], session: &mut HostSession, stop: &AtomicBool) {
                 flags: meta.flags,
                 capture_ts_us: clock::now_us(),
                 encode_us: meta.encode_us,
+                input_seq: session.input_seq(),
             };
             if session.send_frame(&out, bytes).is_err() {
                 break 'outer;
             }
+            input.lock().unwrap_or_else(|e| e.into_inner()).counters = session.counters().input;
             frame_id = frame_id.wrapping_add(1);
             if session.take_keyframe_request() {
                 continue 'outer; // restart from the IDR at the top
@@ -257,6 +322,92 @@ mod tests {
             assert_eq!(got.len(), 3);
             assert_eq!(got[0].1, datas[0]);
         }
+    }
+
+    #[test]
+    fn input_and_cursor_round_trip() {
+        use crate::input::{InputAction as A, BUTTON_LEFT};
+        let (file, _) = recording(240);
+        let replay = Replay::start(file, 0).unwrap();
+        let c = Client::connect("127.0.0.1", replay.port()).unwrap();
+        assert_eq!(take(&c, 2).len(), 2); // streaming
+        c.input_move(100, 200);
+        c.input_key(0xE0, true); // LCtrl
+        c.input_key(0x06, true); // C
+        c.input_key(0x06, false);
+        c.input_button(BUTTON_LEFT, true, 300, 400);
+        c.input_button(BUTTON_LEFT, false, 300, 400);
+        c.input_scroll(120, -40);
+        c.input_key(0x04, true); // A, still held when the viewer leaves
+                                 // Pointer shape arrives over TCP.
+        let mut rgba = Vec::new();
+        let deadline = clock::now_us() + 3_000_000;
+        let mut info = c.cursor(0, &mut rgba);
+        while info.width == 0 && clock::now_us() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            info = c.cursor(0, &mut rgba);
+        }
+        assert_eq!((info.width, info.height, info.visible), (16, 16, true));
+        assert_eq!(rgba.len(), 16 * 16 * 4);
+        assert_eq!(&rgba[0..4], &[0, 0, 0, 255]);
+        // Frames carry the applied input sequence.
+        let mut seq = 0;
+        for (m, _) in take(&c, 40) {
+            seq = seq.max(m.input_seq);
+        }
+        assert!(seq > 0, "no input_seq on frames");
+        assert!(c.input_sent_at(seq).is_some());
+        assert!(c.stats().input_events >= 7);
+        drop(c);
+        // The session ends: the held A and Ctrl are released.
+        let deadline = clock::now_us() + 3_000_000;
+        while !replay.input_log().contains(&A::Key {
+            hid: 0xE0,
+            down: false,
+        }) && clock::now_us() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let log = replay.input_log();
+        let want = [
+            A::MoveTo { x: 100, y: 200 },
+            A::Key {
+                hid: 0xE0,
+                down: true,
+            },
+            A::Key {
+                hid: 0x06,
+                down: true,
+            },
+            A::Key {
+                hid: 0x06,
+                down: false,
+            },
+            A::MoveTo { x: 300, y: 400 },
+            A::Button {
+                button: BUTTON_LEFT,
+                down: true,
+            },
+            A::Button {
+                button: BUTTON_LEFT,
+                down: false,
+            },
+            A::Scroll { dy: 120, dx: -40 },
+            A::Key {
+                hid: 0x04,
+                down: true,
+            },
+            A::Key {
+                hid: 0x04,
+                down: false,
+            },
+            A::Key {
+                hid: 0xE0,
+                down: false,
+            },
+        ];
+        assert_eq!(log, want);
+        assert_eq!(replay.input_counters().clicks, 1);
     }
 
     #[test]

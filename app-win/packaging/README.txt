@@ -14,6 +14,9 @@ M2 test (live stream to the Mac):
   3. When the Mac disconnects, this window prints the session's numbers and
      saves them to results-host.txt. Paste them back to Claude.
   For 4:4:4 instead of 4:2:0:  host.cmd --chroma 444
+  The Mac's mouse and keyboard control this PC while connected. To control
+  programs running as administrator, right-click host.cmd > Run as
+  administrator (Windows blocks input into them otherwise).
 
 M1 test (recordings): record-clips.cmd.
 

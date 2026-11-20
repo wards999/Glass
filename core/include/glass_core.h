@@ -19,6 +19,56 @@
 
 #define GLASS_ClockSync_WINDOW 16
 
+#define GLASS_MAX_EVENTS 16
+
+#define GLASS_MAX_KEYS 16
+
+/**
+ * Events are repeated in packets for this long after they happen.
+ */
+#define GLASS_EVENT_WINDOW_US 300000
+
+#define GLASS_HEARTBEAT_US 50000
+
+#define GLASS_MAX_INPUT_DATAGRAM ((GLASS_HEADER + GLASS_MAX_KEYS) + (GLASS_MAX_EVENTS * GLASS_EVENT_SIZE))
+
+/**
+ * Mouse buttons (bit index in the button mask).
+ */
+#define GLASS_BUTTON_LEFT 0
+
+#define GLASS_BUTTON_RIGHT 1
+
+#define GLASS_BUTTON_MIDDLE 2
+
+#define GLASS_BUTTON_BACK 3
+
+#define GLASS_BUTTON_FORWARD 4
+
+/**
+ * Windows wheel units: 120 = one notch (three lines by default).
+ */
+#define GLASS_WHEEL_DELTA 120
+
+/**
+ * HID modifier usages.
+ */
+#define GLASS_HID_LCTRL 224
+
+#define GLASS_HID_LSHIFT 225
+
+#define GLASS_HID_LALT 226
+
+#define GLASS_HID_LGUI 227
+
+#define GLASS_HID_RCTRL 228
+
+#define GLASS_HID_RSHIFT 229
+
+#define GLASS_HID_RALT 230
+
+#define GLASS_HID_RGUI 231
+
 /**
  * Whole UDP datagram, header included. Fits a 1500-byte Ethernet MTU with
  * room for IP/UDP (and, from M6, the AEAD tag).
@@ -28,9 +78,10 @@
 
 
 /**
- * Protocol version. 1 = M2: unencrypted LAN video + plain-TCP control.
+ * Protocol version. 2 = M3: v1 (M2 video + plain-TCP control) plus input
+ * datagrams, cursor messages and `FrameInfo::input_seq`.
  */
-#define GLASS_PROTOCOL_VERSION 1
+#define GLASS_PROTOCOL_VERSION 2
 
 /**
  * Default TCP control port; the host's UDP media socket uses the same number.
@@ -61,9 +112,20 @@
  */
 #define GLASS_CONTROL_MAX 32
 
+/**
+ * Largest control frame of any type (2-byte length + up to 65535).
+ */
+#define GLASS_FRAME_MAX (2 + (size_t)UINT16_MAX)
+
+/**
+ * Pointer images are capped at this size (larger ones are scaled down by the
+ * host) so a shape fits one control frame.
+ */
+#define GLASS_CURSOR_MAX_DIM 96
+
 #define GLASS_VideoPacketHeader_SIZE 24
 
-#define GLASS_FrameInfo_SIZE 8
+#define GLASS_FrameInfo_SIZE 12
 
 #define GLASS_FORMAT_VERSION 1
 
@@ -117,6 +179,7 @@ typedef int32_t GLASS_ConnectError;
 
 /**
  * A viewer connection. Exactly one thread may call `wait_frame`/`release_frame`.
+ * Input methods may be called from any thread.
  */
 typedef struct GLASS_Client GLASS_Client;
 
@@ -231,6 +294,10 @@ typedef struct {
   uint8_t flags;
   uint16_t packets;
   uint32_t encode_us;
+  /**
+   * Latest input packet the host had applied at capture (0 = none).
+   */
+  uint32_t input_seq;
   uint64_t capture_ts_us;
   uint64_t first_packet_us;
   uint64_t last_packet_us;
@@ -287,7 +354,27 @@ typedef struct {
    */
   uint32_t clock_rtt_us;
   uint32_t last_rtt_us;
+  /**
+   * Input events (keys, buttons, scrolls) and datagrams sent.
+   */
+  uint64_t input_events;
+  uint64_t input_packets;
 } GLASS_ClientStats;
+
+/**
+ * The host's pointer as last reported. `generation` changes on every update.
+ */
+typedef struct {
+  uint32_t generation;
+  bool visible;
+  /**
+   * 0 until the host has sent a shape.
+   */
+  uint16_t width;
+  uint16_t height;
+  uint16_t hot_x;
+  uint16_t hot_y;
+} GLASS_CursorInfo;
 
 /**
  * NUL-terminated core version string, e.g. "0.0.1". Static; do not free.
@@ -442,6 +529,74 @@ GLASS_ClientStats glass_client_stats(const GLASS_Client *c);
 uint64_t glass_client_host_to_local_us(const GLASS_Client *c, uint64_t host_us);
 
 /**
+ * Mac `kVK_*` key code -> HID usage (0 = not forwarded). `pc_style`: ⌘ -> Win
+ * and ⌃ -> Ctrl instead of the default ⌘ -> Ctrl, ⌃ -> Win.
+ */
+uint8_t glass_keymap_mac_to_hid(uint16_t kvk, bool iso, bool pc_style);
+
+/**
+ * # Safety
+ * `c` must come from `glass_client_connect`.
+ */
+void glass_client_input_key(const GLASS_Client *c, uint8_t hid, bool down);
+
+/**
+ * Button 0 left, 1 right, 2 middle, 3 back, 4 forward; position 0..=65535
+ * across the video picture.
+ *
+ * # Safety
+ * `c` must come from `glass_client_connect`.
+ */
+void glass_client_input_button(const GLASS_Client *c,
+                               uint8_t button,
+                               bool down,
+                               uint16_t x,
+                               uint16_t y);
+
+/**
+ * # Safety
+ * `c` must come from `glass_client_connect`.
+ */
+void glass_client_input_move(const GLASS_Client *c, uint16_t x, uint16_t y);
+
+/**
+ * Wheel units (120 = one notch); `dy > 0` scrolls up, `dx > 0` right.
+ *
+ * # Safety
+ * `c` must come from `glass_client_connect`.
+ */
+void glass_client_input_scroll(const GLASS_Client *c, int16_t dy, int16_t dx);
+
+/**
+ * # Safety
+ * `c` must come from `glass_client_connect`.
+ */
+void glass_client_input_release_all(const GLASS_Client *c);
+
+/**
+ * Local time (µs) input packet `seq` was sent, or 0 if unknown. Pair with
+ * `GLASS_LiveFrameMeta.input_seq` for input -> screen latency.
+ *
+ * # Safety
+ * `c` must come from `glass_client_connect`.
+ */
+uint64_t glass_client_input_sent_us(const GLASS_Client *c, uint32_t seq);
+
+/**
+ * The host's pointer. If its generation differs from `seen` and `rgba` has
+ * room (`cap >= width*height*4`), copies the straight-alpha RGBA image there.
+ * Always returns the current info.
+ *
+ * # Safety
+ * `c` must come from `glass_client_connect`; `rgba` must point to `cap`
+ * writable bytes (or be null with `cap == 0`).
+ */
+GLASS_CursorInfo glass_client_cursor(const GLASS_Client *c,
+                                     uint32_t seen,
+                                     uint8_t *rgba,
+                                     size_t cap);
+
+/**
  * Says goodbye, stops the threads and frees the client.
  *
  * # Safety
@@ -457,6 +612,14 @@ void glass_client_close(GLASS_Client *c);
  * `buf` must point to `len` readable bytes; `out_port` valid for writes or null.
  */
 GLASS_Replay *glass_replay_start(const uint8_t *buf, size_t len, uint16_t port, uint16_t *out_port);
+
+/**
+ * Input actions the replay host has received (all sessions, capped).
+ *
+ * # Safety
+ * `r` must come from `glass_replay_start`.
+ */
+uint64_t glass_replay_input_actions(const GLASS_Replay *r);
 
 /**
  * # Safety

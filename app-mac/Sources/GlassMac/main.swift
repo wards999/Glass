@@ -41,7 +41,7 @@ if args.first == "play", args.count >= 2 {
         exit(1)
     }
 } else if args.first == "connect", args.count >= 2 {
-    var host = args[1], port = UInt16(GLASS_DEFAULT_PORT)
+    var host = args[1], port = GlassClient.defaultPort
     if let i = host.lastIndex(of: ":"), let p = UInt16(host[host.index(after: i)...]) {
         port = p
         host = String(host[..<i])

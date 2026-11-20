@@ -7,7 +7,7 @@ final class GlassCoreTests: XCTestCase {
     func testCoreLinksAndReportsVersions() {
         XCTAssertFalse(GlassCore.version.isEmpty)
         XCTAssertEqual(GlassCore.version.split(separator: ".").count, 3)
-        XCTAssertEqual(GlassCore.protocolVersion, 1)
+        XCTAssertEqual(GlassCore.protocolVersion, 2)
     }
 }
 
@@ -131,6 +131,57 @@ final class LiveTests: XCTestCase {
             client.close()
             host.stop()
         }
+    }
+
+    func testInputAndCursorOverLoopback() throws {
+        let url = try XCTUnwrap(Bundle.module.url(forResource: "testsrc-420", withExtension: "glsr", subdirectory: "Fixtures"))
+        let host = try ReplayHost(data: try Data(contentsOf: url))
+        let client = try GlassClient(host: "127.0.0.1", port: host.port)
+        _ = client.waitFrame(timeoutMs: 2000) { _, _ in } // streaming
+        client.move(x: 1000, y: 2000)
+        client.key(GlassClient.hid(forMacKey: 0x00, iso: false, pcStyle: false), down: true) // A
+        client.key(0x04, down: false)
+        client.button(.left, down: true, x: 1000, y: 2000)
+        client.button(.left, down: false, x: 1000, y: 2000)
+        client.scroll(dy: 120, dx: 0)
+        var info = client.cursor(seen: 0)
+        let deadline = Date().addingTimeInterval(5)
+        while (info.rgba == nil || host.inputActions < 5), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+            info = client.cursor(seen: 0)
+        }
+        XCTAssertEqual(info.info.width, 16)
+        XCTAssertTrue(info.info.visible)
+        XCTAssertEqual(info.rgba?.count, 16 * 16 * 4)
+        // move, A down, A up, (move+) click down, click up, scroll
+        XCTAssertGreaterThanOrEqual(host.inputActions, 5)
+        XCTAssertGreaterThanOrEqual(client.stats.input_events, 5)
+        client.close()
+        host.stop()
+    }
+
+    func testKeyMapping() {
+        XCTAssertEqual(GlassClient.hid(forMacKey: 0x00, iso: false, pcStyle: false), 0x04) // A
+        XCTAssertEqual(GlassClient.hid(forMacKey: 0x37, iso: false, pcStyle: false), 0xE0) // ⌘ -> Ctrl
+        XCTAssertEqual(GlassClient.hid(forMacKey: 0x37, iso: false, pcStyle: true), 0xE3) // ⌘ -> Win
+        XCTAssertEqual(GlassClient.hid(forMacKey: 0x0A, iso: true, pcStyle: false), 0x35) // ISO § -> `
+        XCTAssertEqual(GlassClient.hid(forMacKey: 0x3F, iso: false, pcStyle: false), 0) // fn
+    }
+
+    func testVideoPointMapping() {
+        // 16:9 picture centred in a 16:10 drawable: bars top and bottom.
+        let vp = Renderer.fitViewport(src: CGSize(width: 2560, height: 1440), dst: CGSize(width: 2940, height: 1912))
+        let top = Renderer.videoPoint(CGPoint(x: 0, y: vp.originY), in: vp)
+        XCTAssertEqual(top.x, 0)
+        XCTAssertEqual(top.y, 0)
+        let br = Renderer.videoPoint(CGPoint(x: 2939, y: vp.originY + vp.height - 1), in: vp)
+        XCTAssertEqual(br.x, 65535)
+        XCTAssertEqual(br.y, 65535)
+        // In the bar above the picture: clamped to the top edge.
+        XCTAssertEqual(Renderer.videoPoint(CGPoint(x: 1470, y: 5), in: vp).y, 0)
+        let mid = Renderer.videoPoint(CGPoint(x: 1469.5, y: vp.originY + (vp.height - 1) / 2), in: vp)
+        XCTAssertEqual(Int(mid.x), 32768, accuracy: 2)
+        XCTAssertEqual(Int(mid.y), 32768, accuracy: 2)
     }
 
     func testConnectRefused() {

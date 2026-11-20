@@ -1,8 +1,9 @@
 //! Wire formats. `docs/protocol.md` is the source of truth; keep them in sync and
 //! bump [`PROTOCOL_VERSION`] on any change.
 
-/// Protocol version. 1 = M2: unencrypted LAN video + plain-TCP control.
-pub const PROTOCOL_VERSION: u8 = 1;
+/// Protocol version. 2 = M3: v1 (M2 video + plain-TCP control) plus input
+/// datagrams, cursor messages and `FrameInfo::input_seq`.
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Default TCP control port; the host's UDP media socket uses the same number.
 pub const DEFAULT_PORT: u16 = 47800;
@@ -91,22 +92,30 @@ pub struct FrameInfo {
     pub encode_us: u32,
     /// Length of the Annex-B data that follows.
     pub frame_len: u32,
+    /// Last input packet the host had applied when this frame was captured
+    /// (0 = none). The viewer turns it into input -> screen latency.
+    pub input_seq: u32,
 }
 
 impl FrameInfo {
-    pub const SIZE: usize = 8;
+    pub const SIZE: usize = 12;
 
     pub fn to_bytes(self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
         b[0..4].copy_from_slice(&self.encode_us.to_be_bytes());
         b[4..8].copy_from_slice(&self.frame_len.to_be_bytes());
+        b[8..12].copy_from_slice(&self.input_seq.to_be_bytes());
         b
     }
 
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        let at = |i: usize| -> Option<u32> {
+            Some(u32::from_be_bytes(b.get(i..i + 4)?.try_into().ok()?))
+        };
         Some(Self {
-            encode_us: u32::from_be_bytes(b.get(0..4)?.try_into().ok()?),
-            frame_len: u32::from_be_bytes(b.get(4..8)?.try_into().ok()?),
+            encode_us: at(0)?,
+            frame_len: at(4)?,
+            input_seq: at(8)?,
         })
     }
 }
@@ -183,6 +192,10 @@ pub enum Control {
     KeyframeRequest,
     /// Either side, before closing.
     Bye,
+    /// Host -> client: the host's pointer is shown or hidden.
+    CursorVisible {
+        visible: bool,
+    },
 }
 
 /// Largest encoded control message (including the 2-byte length).
@@ -206,6 +219,7 @@ impl Control {
             Control::Pong { .. } => 5,
             Control::KeyframeRequest => 6,
             Control::Bye => 7,
+            Control::CursorVisible { .. } => 9,
         }
     }
 
@@ -240,6 +254,7 @@ impl Control {
                 put(&session_id.to_be_bytes());
             }
             Control::Reject { reason } => put(&[reason]),
+            Control::CursorVisible { visible } => put(&[visible as u8]),
             Control::Ping { seq, client_ts } => {
                 put(&seq.to_be_bytes());
                 put(&client_ts.to_be_bytes());
@@ -260,19 +275,14 @@ impl Control {
         n
     }
 
-    /// Decodes one message from the start of `buf`; returns it and the bytes used.
+    /// Decodes one small message from the start of `buf`; returns it and the
+    /// bytes used. Cursor images need [`Message::decode`].
     pub fn decode(buf: &[u8]) -> Result<(Self, usize), ControlError> {
-        if buf.len() < 2 {
-            return Err(ControlError::Incomplete);
-        }
-        let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-        if len == 0 || len + 2 > CONTROL_MAX {
-            return Err(ControlError::Malformed);
-        }
-        if buf.len() < len + 2 {
-            return Err(ControlError::Incomplete);
-        }
-        let (kind, b) = (buf[2], &buf[3..len + 2]);
+        let (kind, b, used) = decode_frame(buf)?;
+        Self::decode_body(kind, b).map(|m| (m, used))
+    }
+
+    fn decode_body(kind: u8, b: &[u8]) -> Result<Self, ControlError> {
         let u16_at = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
         let u32_at = |i: usize| u32::from_be_bytes(b[i..i + 4].try_into().unwrap());
         let u64_at = |i: usize| u64::from_be_bytes(b[i..i + 8].try_into().unwrap());
@@ -283,6 +293,7 @@ impl Control {
             4 => 12,
             5 => 20,
             6 | 7 => 0,
+            9 => 1,
             _ => return Err(ControlError::Malformed),
         };
         if b.len() != want {
@@ -317,9 +328,106 @@ impl Control {
                 host_ts: u64_at(12),
             },
             6 => Control::KeyframeRequest,
+            9 => Control::CursorVisible { visible: b[0] != 0 },
             _ => Control::Bye,
         };
-        Ok((msg, len + 2))
+        Ok(msg)
+    }
+}
+
+/// Largest control frame of any type (2-byte length + up to 65535).
+pub const FRAME_MAX: usize = 2 + u16::MAX as usize;
+
+/// Splits one frame off the front of `buf`: (type, body, bytes used).
+pub fn decode_frame(buf: &[u8]) -> Result<(u8, &[u8], usize), ControlError> {
+    if buf.len() < 2 {
+        return Err(ControlError::Incomplete);
+    }
+    let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    if len == 0 {
+        return Err(ControlError::Malformed);
+    }
+    if buf.len() < len + 2 {
+        return Err(ControlError::Incomplete);
+    }
+    Ok((buf[2], &buf[3..len + 2], len + 2))
+}
+
+/// Pointer images are capped at this size (larger ones are scaled down by the
+/// host) so a shape fits one control frame.
+pub const CURSOR_MAX_DIM: u16 = 96;
+const KIND_CURSOR_SHAPE: u8 = 8;
+
+/// Host -> client pointer shape: straight (non-premultiplied) RGBA, rows top
+/// to bottom, hotspot in pixels from the top-left. Sent when it changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorShape<'a> {
+    pub serial: u32,
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub rgba: &'a [u8],
+}
+
+impl<'a> CursorShape<'a> {
+    const HEADER: usize = 12;
+
+    fn valid(&self) -> bool {
+        (1..=CURSOR_MAX_DIM).contains(&self.width)
+            && (1..=CURSOR_MAX_DIM).contains(&self.height)
+            && self.rgba.len() == self.width as usize * self.height as usize * 4
+    }
+
+    /// Appends the encoded frame to `out`. False (nothing written) if invalid.
+    pub fn encode(&self, out: &mut Vec<u8>) -> bool {
+        if !self.valid() {
+            return false;
+        }
+        let len = 1 + Self::HEADER + self.rgba.len();
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+        out.push(KIND_CURSOR_SHAPE);
+        out.extend_from_slice(&self.serial.to_be_bytes());
+        for v in [self.width, self.height, self.hot_x, self.hot_y] {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        out.extend_from_slice(self.rgba);
+        true
+    }
+
+    fn decode_body(b: &'a [u8]) -> Option<Self> {
+        if b.len() < Self::HEADER {
+            return None;
+        }
+        let u16_at = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
+        let c = Self {
+            serial: u32::from_be_bytes(b[0..4].try_into().ok()?),
+            width: u16_at(4),
+            height: u16_at(6),
+            hot_x: u16_at(8),
+            hot_y: u16_at(10),
+            rgba: &b[Self::HEADER..],
+        };
+        c.valid().then_some(c)
+    }
+}
+
+/// Any control-channel message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Message<'a> {
+    Control(Control),
+    Cursor(CursorShape<'a>),
+}
+
+impl<'a> Message<'a> {
+    pub fn decode(buf: &'a [u8]) -> Result<(Self, usize), ControlError> {
+        let (kind, b, used) = decode_frame(buf)?;
+        let m = if kind == KIND_CURSOR_SHAPE {
+            Message::Cursor(CursorShape::decode_body(b).ok_or(ControlError::Malformed)?)
+        } else {
+            Message::Control(Control::decode_body(kind, b)?)
+        };
+        Ok((m, used))
     }
 }
 
@@ -361,6 +469,7 @@ mod tests {
             },
             Control::KeyframeRequest,
             Control::Bye,
+            Control::CursorVisible { visible: true },
         ];
         // All messages back to back in one stream, as on TCP.
         let mut stream = Vec::new();
@@ -388,7 +497,45 @@ mod tests {
             Control::decode(&[0, 3, 4, 0, 0]),
             Err(ControlError::Malformed)
         );
-        assert_eq!(Control::decode(&[0xff, 0xff]), Err(ControlError::Malformed));
+        // Length says 65535 bytes follow: just incomplete.
+        assert_eq!(
+            Control::decode(&[0xff, 0xff]),
+            Err(ControlError::Incomplete)
+        );
+        assert_eq!(Control::decode(&[0, 0]), Err(ControlError::Malformed));
+    }
+
+    #[test]
+    fn cursor_shape_round_trip() {
+        let rgba: Vec<u8> = (0..32 * 48 * 4).map(|i| i as u8).collect();
+        let c = CursorShape {
+            serial: 9,
+            width: 32,
+            height: 48,
+            hot_x: 3,
+            hot_y: 40,
+            rgba: &rgba,
+        };
+        let mut buf = Vec::new();
+        assert!(c.encode(&mut buf));
+        let mut small = [0u8; CONTROL_MAX];
+        let n = Control::Bye.encode(&mut small);
+        buf.extend_from_slice(&small[..n]);
+        let (m, used) = Message::decode(&buf).unwrap();
+        assert_eq!(m, Message::Cursor(c));
+        assert_eq!(
+            Message::decode(&buf[used..]).unwrap().0,
+            Message::Control(Control::Bye)
+        );
+        // Wrong pixel count, oversize, and a cursor frame via Control::decode.
+        let bad = CursorShape {
+            rgba: &rgba[4..],
+            ..c
+        };
+        assert!(!bad.encode(&mut Vec::new()));
+        let big = CursorShape { width: 200, ..c };
+        assert!(!big.encode(&mut Vec::new()));
+        assert_eq!(Control::decode(&buf), Err(ControlError::Malformed));
     }
 
     #[test]
@@ -396,9 +543,10 @@ mod tests {
         let fi = FrameInfo {
             encode_us: 3_210,
             frame_len: 54_600,
+            input_seq: 77,
         };
         assert_eq!(FrameInfo::from_bytes(&fi.to_bytes()), Some(fi));
-        assert_eq!(FrameInfo::from_bytes(&[0; 7]), None);
+        assert_eq!(FrameInfo::from_bytes(&[0; 11]), None);
         assert_eq!(decode_punch(&encode_punch(42)), Some(42));
         assert_eq!(decode_punch(b"GLPX\0\0\0\x2a"), None);
     }

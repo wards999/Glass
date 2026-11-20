@@ -1,19 +1,23 @@
 //! Windows-only host pieces: D3D11 device, Windows.Graphics.Capture, NVENC.
 
 mod capture;
+mod cursor;
 mod d3d;
 mod encode;
+mod inject;
 
 use glass_core::clock;
 use glass_core::net::{HostListener, HostSession};
 use glass_core::packet::OutFrame;
-use glass_core::protocol::{StreamInfo, DEFAULT_PORT, FLAG_IDR};
+use glass_core::protocol::{CursorShape, StreamInfo, DEFAULT_PORT, FLAG_IDR};
 use glass_core::recording::{
     FrameMeta, RecordingHeader, RecordingWriter, CHROMA_420, CHROMA_444, CODEC_HEVC,
 };
 use glass_core::stats::{IntervalTracker, StatRing, Summary};
 use std::error::Error;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 pub type Res<T> = Result<T, Box<dyn Error>>;
 
@@ -289,7 +293,15 @@ impl HostRun {
     }
 
     /// Encoder output -> network. Called from inside the encode callback.
-    fn on_packet(&mut self, session: &mut HostSession, capture_us: u64, data: &[u8], key: bool) {
+    /// `input_seq`: input applied when the frame was captured.
+    fn on_packet(
+        &mut self,
+        session: &mut HostSession,
+        capture_us: u64,
+        input_seq: u32,
+        data: &[u8],
+        key: bool,
+    ) {
         let out = clock::now_us();
         let encode_us = out.saturating_sub(capture_us) as u32;
         let f = OutFrame {
@@ -297,6 +309,7 @@ impl HostRun {
             flags: if key { FLAG_IDR } else { 0 },
             capture_ts_us: capture_us,
             encode_us,
+            input_seq,
         };
         self.frame_id = self.frame_id.wrapping_add(1);
         match session.send_frame(&f, data) {
@@ -346,6 +359,7 @@ pub fn host(args: &[String]) -> Res<()> {
     let ip = lan_ip().map_or("(unknown)".to_string(), |ip| ip.to_string());
     println!("On the Mac, open Glass and connect to:  {ip}");
     println!("(Allow glass.exe through Windows Firewall on private networks if asked.)");
+    println!("(To control programs running as administrator, run host.cmd as administrator.)");
 
     loop {
         let mut cap = capture::Capture::start(&gpu, mon)?;
@@ -358,7 +372,23 @@ pub fn host(args: &[String]) -> Res<()> {
             fps: mon.refresh_hz as u16,
         };
         println!("\nWaiting for a viewer on port {} ...", listener.port());
-        let mut session = match listener.accept(info) {
+        let mut injector = inject::Injector {
+            mapper: inject::Mapper::for_monitor(inject::Rect {
+                left: mon.left,
+                top: mon.top,
+                width: mon.width as i32,
+                height: mon.height as i32,
+            }),
+            failed: 0,
+        };
+        let blocked = Arc::new(AtomicU64::new(0));
+        let b = blocked.clone();
+        let sink = Box::new(move |action| {
+            if !injector.inject(&action) {
+                b.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let mut session = match listener.accept(info, sink) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("viewer handshake failed: {e}");
@@ -366,7 +396,20 @@ pub fn host(args: &[String]) -> Res<()> {
             }
         };
         println!("Viewer connected from {}", session.peer_tcp);
-        let report = run_session(&gpu, &mut cap, &mut session, &a, (w, h), mon.refresh_hz)?;
+        let mut report = run_session(&gpu, &mut cap, &mut session, &a, (w, h), mon.refresh_hz)?;
+        let ic = session.counters().input;
+        drop(session); // releases anything the viewer still held
+        let _ = writeln!(
+            report,
+            "  input: {} packets | {} keys, {} clicks, {} scrolls, {} moves | repaired {} | blocked by Windows {}",
+            ic.packets,
+            ic.keys,
+            ic.clicks,
+            ic.scrolls,
+            ic.moves,
+            ic.repaired,
+            blocked.load(Ordering::Relaxed)
+        );
         let report = format!("{head}{report}");
         println!("{report}");
         if let Some(path) = &a.log {
@@ -402,11 +445,29 @@ fn run_session(
         },
     )?;
     let mut run = HostRun::new();
+    let mut pointer = cursor::CursorWatch::new();
     let t0 = clock::now_us();
     let mut pending_idr = true;
     while session.connected() && run.error.is_none() {
         cap.wait(5);
         pending_idr |= session.take_keyframe_request();
+        match pointer.poll() {
+            cursor::Change::Shape(s) => {
+                let _ = session.send_cursor(&CursorShape {
+                    serial: run.frame_id,
+                    width: s.width,
+                    height: s.height,
+                    hot_x: s.hot_x,
+                    hot_y: s.hot_y,
+                    rgba: &s.rgba,
+                });
+                let _ = session.send_cursor_visible(true);
+            }
+            cursor::Change::Visible(v) => {
+                let _ = session.send_cursor_visible(v);
+            }
+            cursor::Change::None => {}
+        }
         let mut got = false;
         while let Some(frame) = cap.next_frame()? {
             let arrival = clock::now_us();
@@ -417,8 +478,9 @@ fn run_session(
             got = true;
             run.intervals.tick(arrival);
             let idr = std::mem::take(&mut pending_idr);
+            let input_seq = session.input_seq();
             enc.encode(&frame.texture, arrival as i64, idr, |data, key, _| {
-                run.on_packet(session, arrival, data, key)
+                run.on_packet(session, arrival, input_seq, data, key)
             })?;
         }
         if !got && pending_idr && session.streaming() && enc.has_last() {
@@ -426,8 +488,9 @@ fn run_session(
             let now = clock::now_us();
             pending_idr = false;
             run.idle_idrs += 1;
+            let input_seq = session.input_seq();
             enc.encode_last_idr(now as i64, |data, key, _| {
-                run.on_packet(session, now, data, key)
+                run.on_packet(session, now, input_seq, data, key)
             })?;
         }
     }

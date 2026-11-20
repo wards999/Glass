@@ -6,6 +6,8 @@
 pub mod annexb;
 pub mod clock;
 pub mod ffi;
+pub mod input;
+pub mod keymap;
 pub mod net;
 pub mod packet;
 pub mod protocol;

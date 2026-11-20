@@ -95,6 +95,18 @@ public final class Renderer {
                            width: w, height: h, znear: 0, zfar: 1)
     }
 
+    /// A point in drawable pixels (top-left origin) -> normalised video
+    /// coordinates 0...65535 inside `viewport`, clamped to the picture edges
+    /// (so drags that leave the picture keep working).
+    public static func videoPoint(_ p: CGPoint, in viewport: MTLViewport) -> (x: UInt16, y: UInt16) {
+        func n(_ v: Double, _ o: Double, _ len: Double) -> UInt16 {
+            guard len > 1 else { return 0 }
+            let t = min(max((v - o) / (len - 1), 0), 1)
+            return UInt16((t * 65535).rounded())
+        }
+        return (n(Double(p.x), viewport.originX, viewport.width), n(Double(p.y), viewport.originY, viewport.height))
+    }
+
     /// Encodes the conversion draw into `cb`. With `fit`, the picture keeps its
     /// aspect ratio inside `target` with black bars; otherwise it fills it.
     /// Returns false if the planes couldn't be wrapped.

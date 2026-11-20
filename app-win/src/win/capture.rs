@@ -25,6 +25,9 @@ use windows_core::{BOOL, PCWSTR};
 
 pub struct Monitor {
     pub name: String,
+    /// Top-left in virtual-desktop pixels.
+    pub left: i32,
+    pub top: i32,
     pub width: u32,
     pub height: u32,
     pub refresh_hz: u32,
@@ -77,6 +80,8 @@ pub fn monitors() -> Res<Vec<Monitor>> {
         let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(32);
         out.push(Monitor {
             name: String::from_utf16_lossy(&info.szDevice[..len]),
+            left: r.left,
+            top: r.top,
             width: (r.right - r.left) as u32,
             height: (r.bottom - r.top) as u32,
             refresh_hz,

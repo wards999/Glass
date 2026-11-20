@@ -22,6 +22,8 @@ pub struct OutFrame {
     pub flags: u8,
     pub capture_ts_us: u64,
     pub encode_us: u32,
+    /// `FrameInfo::input_seq`.
+    pub input_seq: u32,
 }
 
 /// Number of datagrams a frame of `data_len` Annex-B bytes needs.
@@ -60,6 +62,7 @@ impl Packetiser {
         let info = FrameInfo {
             encode_us: f.encode_us,
             frame_len: data.len() as u32,
+            input_seq: f.input_seq,
         }
         .to_bytes();
         let total = FrameInfo::SIZE + data.len();
@@ -104,6 +107,7 @@ pub struct ReceivedFrame<'a> {
     pub flags: u8,
     pub capture_ts_us: u64,
     pub encode_us: u32,
+    pub input_seq: u32,
     /// Local receive time of the first and last datagram of this frame.
     pub first_packet_us: u64,
     pub last_packet_us: u64,
@@ -341,6 +345,7 @@ impl Reassembler {
             flags: s.flags,
             capture_ts_us: s.capture_ts_us,
             encode_us: info.encode_us,
+            input_seq: info.input_seq,
             first_packet_us: s.first_us,
             last_packet_us: s.last_us,
             packets: s.count,
@@ -366,6 +371,7 @@ mod tests {
             flags: if idr { FLAG_IDR } else { 0 },
             capture_ts_us: 1_000 + id as u64,
             encode_us: 2_500,
+            input_seq: id,
         };
         let n = Packetiser::default()
             .send_frame(&f, data, |p| {
@@ -386,6 +392,7 @@ mod tests {
             if let Some(f) = r.push(p, 10_000 + i as u64) {
                 assert!(f.last_packet_us >= f.first_packet_us);
                 assert_eq!(f.encode_us, 2_500);
+                assert_eq!(f.input_seq, f.frame_id);
                 assert_eq!(f.capture_ts_us, 1_000 + f.frame_id as u64);
                 got.push((f.frame_id, f.data.to_vec()));
             }

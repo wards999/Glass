@@ -10,6 +10,18 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M3 (mouse and keyboard)
+Same as M2 (run `host.cmd` on the PC, connect from the Mac), then work the PC
+from the Mac for a few minutes:
+- type fast in Notepad; ⌘C / ⌘V / ⌘Z (⌘ is Ctrl on the PC); arrows and
+  Backspace held down (they should repeat)
+- click, double-click, drag-select text, right-click menus, drag windows
+- scroll a long web page with the trackpad (both directions)
+- switch away with ⌘Tab and back: nothing should be left held down on the PC
+Watch "input → screen" in the overlay. Glass's own keys are now ⌃⌥⌘F (full
+screen), ⌃⌥⌘S (stats) and ⌃⌥⌘W (disconnect); everything else goes to the PC.
+Send back both results and how it felt (pointer, typing, scrolling).
+
 ## M2 (live stream)
 Same network for both machines; wired Ethernet on the Mac if you have an
 adapter (Wi-Fi works, but without FEC until M4 it shows more glitches).

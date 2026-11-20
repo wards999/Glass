@@ -3,7 +3,8 @@
 //! constructors and their `_free`/`_close`/`_stop` counterparts.
 
 use crate::annexb;
-use crate::net::{Client, ClientStats, ConnectError, LiveFrameMeta, Wait};
+use crate::keymap::{self, ModifierRule};
+use crate::net::{Client, ClientStats, ConnectError, CursorInfo, LiveFrameMeta, Wait};
 use crate::protocol::StreamInfo;
 use crate::recording::{self, FrameMeta, RecordingHeader};
 use crate::replay::Replay;
@@ -309,6 +310,98 @@ pub unsafe extern "C" fn glass_client_host_to_local_us(c: *const Client, host_us
     (*c).host_to_local(host_us).unwrap_or(0)
 }
 
+// --- Input (any thread) -------------------------------------------------------
+
+/// Mac `kVK_*` key code -> HID usage (0 = not forwarded). `pc_style`: ⌘ -> Win
+/// and ⌃ -> Ctrl instead of the default ⌘ -> Ctrl, ⌃ -> Win.
+#[no_mangle]
+pub extern "C" fn glass_keymap_mac_to_hid(kvk: u16, iso: bool, pc_style: bool) -> u8 {
+    let rule = if pc_style {
+        ModifierRule::PcStyle
+    } else {
+        ModifierRule::MacStyle
+    };
+    keymap::mac_to_hid(kvk, iso, rule)
+}
+
+/// # Safety
+/// `c` must come from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_input_key(c: *const Client, hid: u8, down: bool) {
+    (*c).input_key(hid, down);
+}
+
+/// Button 0 left, 1 right, 2 middle, 3 back, 4 forward; position 0..=65535
+/// across the video picture.
+///
+/// # Safety
+/// `c` must come from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_input_button(
+    c: *const Client,
+    button: u8,
+    down: bool,
+    x: u16,
+    y: u16,
+) {
+    (*c).input_button(button, down, x, y);
+}
+
+/// # Safety
+/// `c` must come from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_input_move(c: *const Client, x: u16, y: u16) {
+    (*c).input_move(x, y);
+}
+
+/// Wheel units (120 = one notch); `dy > 0` scrolls up, `dx > 0` right.
+///
+/// # Safety
+/// `c` must come from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_input_scroll(c: *const Client, dy: i16, dx: i16) {
+    (*c).input_scroll(dy, dx);
+}
+
+/// # Safety
+/// `c` must come from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_input_release_all(c: *const Client) {
+    (*c).input_release_all();
+}
+
+/// Local time (µs) input packet `seq` was sent, or 0 if unknown. Pair with
+/// `GLASS_LiveFrameMeta.input_seq` for input -> screen latency.
+///
+/// # Safety
+/// `c` must come from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_input_sent_us(c: *const Client, seq: u32) -> u64 {
+    (*c).input_sent_at(seq).unwrap_or(0)
+}
+
+/// The host's pointer. If its generation differs from `seen` and `rgba` has
+/// room (`cap >= width*height*4`), copies the straight-alpha RGBA image there.
+/// Always returns the current info.
+///
+/// # Safety
+/// `c` must come from `glass_client_connect`; `rgba` must point to `cap`
+/// writable bytes (or be null with `cap == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_cursor(
+    c: *const Client,
+    seen: u32,
+    rgba: *mut u8,
+    cap: usize,
+) -> CursorInfo {
+    let mut img = Vec::new();
+    let info = (*c).cursor(seen, &mut img);
+    if info.generation != seen && !rgba.is_null() && img.len() <= cap {
+        std::ptr::copy_nonoverlapping(img.as_ptr(), rgba, img.len());
+    }
+    info
+}
+
 /// Says goodbye, stops the threads and frees the client.
 ///
 /// # Safety
@@ -343,6 +436,15 @@ pub unsafe extern "C" fn glass_replay_start(
         }
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+/// Input actions the replay host has received (all sessions, capped).
+///
+/// # Safety
+/// `r` must come from `glass_replay_start`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_replay_input_actions(r: *const Replay) -> u64 {
+    (*r).input_log().len() as u64
 }
 
 /// # Safety

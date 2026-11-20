@@ -1,22 +1,28 @@
-//! Live-stream sessions over the LAN (M2: unencrypted).
+//! Live-stream sessions over the LAN (unencrypted until M6).
 //!
 //! - Control: one TCP connection (Hello/Welcome, ping/pong clock sync,
-//!   keyframe requests, Bye). LATER(M6): TLS 1.3 with pinned certificates.
+//!   keyframe requests, pointer shape/visibility, Bye).
+//!   LATER(M6): TLS 1.3 with pinned certificates.
 //! - Video: UDP host -> client. The client first sends a "punch" datagram to the
 //!   host's UDP port so the host learns where to send (and stateful firewalls
 //!   on the client side let the replies in).
+//! - Input: UDP client -> host on the same sockets (`input.rs`).
 //!
 //! The host side is driven by the app's capture/encode loop
-//! ([`HostSession::send_frame`]); the client side runs its own receive and
-//! control threads and hands complete frames to one consumer thread through a
-//! fixed-size queue ([`Client::wait_frame`]).
+//! ([`HostSession::send_frame`]) and injects input from a callback on its UDP
+//! thread; the client side runs its own receive and control threads and hands
+//! complete frames to one consumer thread through a fixed-size queue
+//! ([`Client::wait_frame`]).
 //! LATER(M3b): IPv6.
 
 use crate::clock::{self, ClockSync};
+use crate::input::{
+    InputAction, InputApplier, InputCounters, InputPacket, InputSender, MAX_INPUT_DATAGRAM,
+};
 use crate::packet::{OutFrame, Packetiser, Reassembler, ReassemblyStats, MAX_DATAGRAM};
 use crate::protocol::{
-    decode_punch, encode_punch, Control, ControlError, StreamInfo, CONTROL_MAX, PROTOCOL_VERSION,
-    REJECT_VERSION,
+    decode_punch, encode_punch, Control, ControlError, CursorShape, Message, StreamInfo,
+    CONTROL_MAX, FRAME_MAX, PROTOCOL_VERSION, PUNCH_SIZE, REJECT_VERSION,
 };
 use std::cell::UnsafeCell;
 use std::io::{self, Read, Write};
@@ -52,16 +58,21 @@ fn send_control(w: &mut impl Write, msg: Control) -> io::Result<()> {
     w.write_all(&buf[..n])
 }
 
-/// Accumulates TCP bytes and yields whole control messages.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Accumulates TCP bytes and yields whole control messages. The buffer holds
+/// the largest frame (a pointer image); it's allocated once per connection.
 struct ControlReader {
-    buf: [u8; 256],
+    buf: Vec<u8>,
     len: usize,
 }
 
 impl ControlReader {
     fn new() -> Self {
         Self {
-            buf: [0; 256],
+            buf: vec![0; FRAME_MAX + 1024],
             len: 0,
         }
     }
@@ -71,7 +82,7 @@ impl ControlReader {
     fn read(
         &mut self,
         s: &mut TcpStream,
-        mut on_msg: impl FnMut(Control) -> io::Result<()>,
+        mut on_msg: impl FnMut(Message<'_>) -> io::Result<()>,
     ) -> io::Result<bool> {
         match s.read(&mut self.buf[self.len..]) {
             Ok(0) => return Ok(false),
@@ -88,7 +99,7 @@ impl ControlReader {
         }
         let mut used = 0;
         loop {
-            match Control::decode(&self.buf[used..self.len]) {
+            match Message::decode(&self.buf[used..self.len]) {
                 Ok((m, n)) => {
                     used += n;
                     on_msg(m)?;
@@ -107,12 +118,14 @@ impl ControlReader {
         Ok(true)
     }
 
-    /// Blocks (up to the stream's read timeout) for exactly one message.
+    /// Blocks (up to the stream's read timeout) for exactly one small message.
     fn read_one(&mut self, s: &mut TcpStream) -> io::Result<Control> {
         let mut got = None;
         while got.is_none() {
             let open = self.read(s, |m| {
-                got.get_or_insert(m);
+                if let Message::Control(c) = m {
+                    got.get_or_insert(c);
+                }
                 Ok(())
             })?;
             if !open {
@@ -157,7 +170,11 @@ pub struct HostCounters {
     pub packets_sent: u64,
     pub bytes_sent: u64,
     pub keyframe_requests: u32,
+    pub input: InputCounters,
 }
+
+/// Called on the host's UDP thread for every input action, in order.
+pub type InputSink = Box<dyn FnMut(InputAction) + Send>;
 
 struct HostShared {
     stop: AtomicBool,
@@ -166,14 +183,20 @@ struct HostShared {
     keyframe_requests: AtomicU32,
     /// Client UDP address (IPv4 << 16 | port), 0 until the first punch.
     peer: AtomicU64,
+    /// `InputApplier::applied_seq` for `FrameInfo::input_seq`.
+    input_seq: AtomicU32,
+    input: Mutex<InputCounters>,
 }
 
-/// One connected viewer. Dropping it ends the session.
+/// One connected viewer. Dropping it ends the session (and releases any
+/// keys/buttons the viewer was holding).
 pub struct HostSession {
     shared: Arc<HostShared>,
     udp: UdpSocket,
+    tcp_out: Arc<Mutex<TcpStream>>,
     packetiser: Packetiser,
     counters: HostCounters,
+    cursor_buf: Vec<u8>,
     pub peer_tcp: SocketAddr,
     threads: Vec<JoinHandle<()>>,
 }
@@ -196,9 +219,10 @@ impl HostListener {
         self.tcp.local_addr().map(|a| a.port()).unwrap_or(0)
     }
 
-    /// Waits for a viewer and completes the handshake. A failed handshake
-    /// returns an error; call again to keep listening.
-    pub fn accept(&self, info: StreamInfo) -> io::Result<HostSession> {
+    /// Waits for a viewer and completes the handshake. Input actions go to
+    /// `on_input` (on the UDP thread). A failed handshake returns an error;
+    /// call again to keep listening.
+    pub fn accept(&self, info: StreamInfo, on_input: InputSink) -> io::Result<HostSession> {
         let (mut tcp, peer_tcp) = self.tcp.accept()?;
         tcp.set_nodelay(true)?;
         tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -236,30 +260,36 @@ impl HostListener {
             keyframe: AtomicBool::new(true),
             keyframe_requests: AtomicU32::new(0),
             peer: AtomicU64::new(0),
+            input_seq: AtomicU32::new(0),
+            input: Mutex::new(InputCounters::default()),
         });
+        let tcp_out = Arc::new(Mutex::new(tcp.try_clone()?));
         let mut threads = Vec::new();
 
         // Control: answer pings, take keyframe requests, notice disconnects.
         tcp.set_read_timeout(Some(Duration::from_millis(100)))?;
         let sh = shared.clone();
+        let out = tcp_out.clone();
         threads.push(std::thread::spawn(move || {
             let mut reader = reader;
             while !sh.stop.load(Ordering::Relaxed) {
                 let mut pong = None;
                 let r = reader.read(&mut tcp, |m| {
                     match m {
-                        Control::Ping { seq, client_ts } => {
+                        Message::Control(Control::Ping { seq, client_ts }) => {
                             pong = Some(Control::Pong {
                                 seq,
                                 client_ts,
                                 host_ts: clock::now_us(),
                             });
                         }
-                        Control::KeyframeRequest => {
+                        Message::Control(Control::KeyframeRequest) => {
                             sh.keyframe_requests.fetch_add(1, Ordering::Relaxed);
                             sh.keyframe.store(true, Ordering::Relaxed);
                         }
-                        Control::Bye => return Err(io::ErrorKind::ConnectionAborted.into()),
+                        Message::Control(Control::Bye) => {
+                            return Err(io::ErrorKind::ConnectionAborted.into())
+                        }
                         _ => {}
                     }
                     Ok(())
@@ -268,22 +298,24 @@ impl HostListener {
                     break;
                 }
                 if let Some(p) = pong {
-                    if send_control(&mut tcp, p).is_err() {
+                    if send_control(&mut *lock(&out), p).is_err() {
                         break;
                     }
                 }
             }
-            let _ = send_control(&mut tcp, Control::Bye);
+            let _ = send_control(&mut *lock(&out), Control::Bye);
             sh.connected.store(false, Ordering::Relaxed);
         }));
 
-        // Punches: learn (and follow) the client's UDP address.
+        // UDP from the viewer: punches (where to send video) and input.
         let udp = self.udp.try_clone()?;
         udp.set_read_timeout(Some(Duration::from_millis(100)))?;
         let client_ip = peer_tcp.ip();
         let sh = shared.clone();
+        let mut on_input = on_input;
         threads.push(std::thread::spawn(move || {
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; MAX_INPUT_DATAGRAM + 64];
+            let mut applier = InputApplier::new();
             while !sh.stop.load(Ordering::Relaxed) && sh.connected.load(Ordering::Relaxed) {
                 let Ok((n, from)) = udp.recv_from(&mut buf) else {
                     continue;
@@ -291,21 +323,31 @@ impl HostListener {
                 let (SocketAddr::V4(v4), true) = (from, from.ip() == client_ip) else {
                     continue;
                 };
-                if decode_punch(&buf[..n]) == Some(session_id) {
+                let d = &buf[..n];
+                if decode_punch(d) == Some(session_id) {
                     let packed = pack_v4(v4);
                     if sh.peer.swap(packed, Ordering::Relaxed) != packed {
                         // New destination: it needs a fresh IDR.
                         sh.keyframe.store(true, Ordering::Relaxed);
                     }
+                } else if let Some(p) = InputPacket::decode(d) {
+                    if p.session_id == session_id && applier.apply(&p, &mut on_input) {
+                        sh.input_seq.store(applier.applied_seq, Ordering::Release);
+                    }
+                    *lock(&sh.input) = applier.counters;
                 }
             }
+            applier.release_all(&mut on_input);
+            *lock(&sh.input) = applier.counters;
         }));
 
         Ok(HostSession {
             shared,
             udp: self.udp.try_clone()?,
+            tcp_out,
             packetiser: Packetiser::default(),
             counters: HostCounters::default(),
+            cursor_buf: Vec::with_capacity(FRAME_MAX),
             peer_tcp,
             threads,
         })
@@ -328,6 +370,11 @@ impl HostSession {
         self.shared.keyframe.swap(false, Ordering::Relaxed)
     }
 
+    /// Latest input packet applied (stamp it on the next captured frame).
+    pub fn input_seq(&self) -> u32 {
+        self.shared.input_seq.load(Ordering::Acquire)
+    }
+
     /// Sends one encoded frame. Returns `Ok(false)` (and sends nothing) while
     /// the viewer's UDP address is still unknown.
     pub fn send_frame(&mut self, f: &OutFrame, data: &[u8]) -> io::Result<bool> {
@@ -345,9 +392,26 @@ impl HostSession {
         Ok(true)
     }
 
+    /// Sends a new pointer shape (call when it changes).
+    pub fn send_cursor(&mut self, shape: &CursorShape) -> io::Result<()> {
+        self.cursor_buf.clear();
+        if !shape.encode(&mut self.cursor_buf) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad cursor"));
+        }
+        lock(&self.tcp_out).write_all(&self.cursor_buf)
+    }
+
+    pub fn send_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
+        send_control(
+            &mut *lock(&self.tcp_out),
+            Control::CursorVisible { visible },
+        )
+    }
+
     pub fn counters(&self) -> HostCounters {
         HostCounters {
             keyframe_requests: self.shared.keyframe_requests.load(Ordering::Relaxed),
+            input: *lock(&self.shared.input),
             ..self.counters
         }
     }
@@ -374,6 +438,8 @@ pub struct LiveFrameMeta {
     pub flags: u8,
     pub packets: u16,
     pub encode_us: u32,
+    /// Latest input packet the host had applied at capture (0 = none).
+    pub input_seq: u32,
     pub capture_ts_us: u64,
     pub first_packet_us: u64,
     pub last_packet_us: u64,
@@ -432,7 +498,7 @@ impl FrameQueue {
         slot.data.clear();
         slot.data.extend_from_slice(data); // grows only past the largest frame so far
         self.tail.store(tail + 1, Ordering::Release);
-        let _g = self.park.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = lock(&self.park);
         self.cv.notify_one();
         true
     }
@@ -442,7 +508,7 @@ impl FrameQueue {
     fn front(&self, timeout: Duration, alive: &AtomicBool) -> Option<&QueuedFrame> {
         let ready = |q: &Self| q.head.load(Ordering::Relaxed) != q.tail.load(Ordering::Acquire);
         if !ready(self) {
-            let g = self.park.lock().unwrap_or_else(|e| e.into_inner());
+            let g = lock(&self.park);
             if !ready(self) && alive.load(Ordering::Relaxed) {
                 let _ = self.cv.wait_timeout(g, timeout);
             }
@@ -463,7 +529,7 @@ impl FrameQueue {
     }
 
     fn wake(&self) {
-        let _g = self.park.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = lock(&self.park);
         self.cv.notify_all();
     }
 }
@@ -518,6 +584,28 @@ pub struct ClientStats {
     /// RTT of the sample behind the offset (error bound ±rtt/2), and the latest.
     pub clock_rtt_us: u32,
     pub last_rtt_us: u32,
+    /// Input events (keys, buttons, scrolls) and datagrams sent.
+    pub input_events: u64,
+    pub input_packets: u64,
+}
+
+/// The host's pointer as last reported. `generation` changes on every update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct CursorInfo {
+    pub generation: u32,
+    pub visible: bool,
+    /// 0 until the host has sent a shape.
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+}
+
+#[derive(Default)]
+struct CursorState {
+    info: CursorInfo,
+    rgba: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -557,6 +645,26 @@ impl AtomicRx {
     }
 }
 
+/// Input side of the client: builds datagrams and sends them on the media
+/// socket. Shared by the UI thread (events) and the control thread (heartbeats).
+struct InputTx {
+    sender: InputSender,
+    udp: UdpSocket,
+    dest: SocketAddrV4,
+    buf: [u8; MAX_INPUT_DATAGRAM],
+    packets: u64,
+    active: bool, // any input yet (no heartbeats before the first event)
+}
+
+impl InputTx {
+    fn flush(&mut self, now: u64) {
+        let (n, _) = self.sender.build(now, &mut self.buf);
+        let _ = self.udp.send_to(&self.buf[..n], self.dest);
+        self.packets += 1;
+        self.active = true;
+    }
+}
+
 struct ClientShared {
     stop: AtomicBool,
     connected: AtomicBool,
@@ -569,9 +677,12 @@ struct ClientShared {
     clock_rtt: AtomicU32,
     last_rtt: AtomicU32,
     queue: FrameQueue,
+    input: Mutex<InputTx>,
+    cursor: Mutex<CursorState>,
 }
 
 /// A viewer connection. Exactly one thread may call `wait_frame`/`release_frame`.
+/// Input methods may be called from any thread.
 pub struct Client {
     shared: Arc<ClientShared>,
     info: StreamInfo,
@@ -623,10 +734,10 @@ impl Client {
             _ => return Err(ConnectError::Handshake),
         };
         let host_udp = SocketAddrV4::new(*addr.ip(), udp_port);
-        let udp = udp_socket(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
-            .map_err(|_| ConnectError::Socket)?;
+        let sock = |_| ConnectError::Socket;
+        let udp = udp_socket(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).map_err(sock)?;
         udp.set_read_timeout(Some(Duration::from_millis(100)))
-            .map_err(|_| ConnectError::Socket)?;
+            .map_err(sock)?;
         let punch = encode_punch(session_id);
         let _ = udp.send_to(&punch, host_udp);
         tcp.set_read_timeout(Some(Duration::from_millis(20)))
@@ -644,6 +755,15 @@ impl Client {
             clock_rtt: AtomicU32::new(0),
             last_rtt: AtomicU32::new(0),
             queue: FrameQueue::new(),
+            input: Mutex::new(InputTx {
+                sender: InputSender::new(session_id),
+                udp: udp.try_clone().map_err(sock)?,
+                dest: host_udp,
+                buf: [0; MAX_INPUT_DATAGRAM],
+                packets: 0,
+                active: false,
+            }),
+            cursor: Mutex::new(CursorState::default()),
         });
         let threads = vec![
             spawn_receiver(shared.clone(), udp, host_udp, punch),
@@ -685,8 +805,61 @@ impl Client {
         self.shared.want_keyframe.store(true, Ordering::Relaxed);
     }
 
+    // --- input (sent at once; any thread) ---
+
+    fn input(&self, f: impl FnOnce(&mut InputSender, u64)) {
+        let now = clock::now_us();
+        let mut tx = lock(&self.shared.input);
+        f(&mut tx.sender, now);
+        tx.flush(now);
+    }
+
+    /// Key down (repeat downs for auto-repeat) or up. `hid` from `keymap`.
+    pub fn input_key(&self, hid: u8, down: bool) {
+        self.input(|s, now| s.key(now, hid, down));
+    }
+
+    /// Button down/up at normalised position (0..=65535).
+    pub fn input_button(&self, button: u8, down: bool, x: u16, y: u16) {
+        self.input(|s, now| s.button(now, button, down, x, y));
+    }
+
+    pub fn input_move(&self, x: u16, y: u16) {
+        self.input(|s, _| s.move_to(x, y));
+    }
+
+    /// Wheel units (120 = one notch); `dy > 0` up, `dx > 0` right.
+    pub fn input_scroll(&self, dy: i16, dx: i16) {
+        self.input(|s, now| s.scroll(now, dy, dx));
+    }
+
+    /// Lets go of everything held (focus lost).
+    pub fn input_release_all(&self) {
+        self.input(|s, now| s.release_all(now));
+    }
+
+    /// When input packet `seq` was sent (local µs), for input -> screen.
+    pub fn input_sent_at(&self, seq: u32) -> Option<u64> {
+        lock(&self.shared.input).sender.sent_at(seq)
+    }
+
+    /// The host's pointer. Copies the image into `rgba` (resized) if
+    /// `generation` differs from `seen`; returns the info either way.
+    pub fn cursor(&self, seen: u32, rgba: &mut Vec<u8>) -> CursorInfo {
+        let c = lock(&self.shared.cursor);
+        if c.info.generation != seen {
+            rgba.clear();
+            rgba.extend_from_slice(&c.rgba);
+        }
+        c.info
+    }
+
     pub fn stats(&self) -> ClientStats {
         let sh = &self.shared;
+        let (events, packets) = {
+            let tx = lock(&sh.input);
+            (tx.sender.events_total, tx.packets)
+        };
         ClientStats {
             rx: sh.rx.load(),
             queue_full: sh.queue_full.load(Ordering::Relaxed),
@@ -696,6 +869,8 @@ impl Client {
             clock_offset_us: sh.clock_offset.load(Ordering::Relaxed),
             clock_rtt_us: sh.clock_rtt.load(Ordering::Relaxed),
             last_rtt_us: sh.last_rtt.load(Ordering::Relaxed),
+            input_events: events,
+            input_packets: packets,
         }
     }
 
@@ -714,7 +889,7 @@ fn spawn_receiver(
     sh: Arc<ClientShared>,
     udp: UdpSocket,
     host_udp: SocketAddrV4,
-    punch: [u8; crate::protocol::PUNCH_SIZE],
+    punch: [u8; PUNCH_SIZE],
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut r = Reassembler::new();
@@ -744,6 +919,7 @@ fn spawn_receiver(
                     flags: f.flags,
                     packets: f.packets,
                     encode_us: f.encode_us,
+                    input_seq: f.input_seq,
                     capture_ts_us: f.capture_ts_us,
                     first_packet_us: f.first_packet_us,
                     last_packet_us: f.last_packet_us,
@@ -768,7 +944,8 @@ fn spawn_receiver(
     })
 }
 
-/// Pings for clock sync, keyframe requests, disconnect detection.
+/// Pings for clock sync, keyframe requests, input heartbeats, pointer
+/// updates, disconnect detection.
 fn spawn_control(
     sh: Arc<ClientShared>,
     mut tcp: TcpStream,
@@ -807,11 +984,17 @@ fn spawn_control(
                 sh.keyframe_requests.fetch_add(1, Ordering::Relaxed);
                 ok &= send_control(&mut tcp, Control::KeyframeRequest).is_ok();
             }
+            {
+                let mut tx = lock(&sh.input);
+                if tx.active && tx.sender.heartbeat_due(now) {
+                    tx.flush(now);
+                }
+            }
             let r = reader.read(&mut tcp, |m| {
                 match m {
-                    Control::Pong {
+                    Message::Control(Control::Pong {
                         client_ts, host_ts, ..
-                    } => {
+                    }) => {
                         sync.add(client_ts, host_ts, clock::now_us());
                         if let (Some(off), Some(rtt)) = (sync.offset_us(), sync.best_rtt_us()) {
                             sh.clock_offset.store(off, Ordering::Relaxed);
@@ -821,7 +1004,27 @@ fn spawn_control(
                             sh.clock_valid.store(true, Ordering::Release);
                         }
                     }
-                    Control::Bye => return Err(io::ErrorKind::ConnectionAborted.into()),
+                    Message::Control(Control::CursorVisible { visible }) => {
+                        let mut c = lock(&sh.cursor);
+                        c.info.visible = visible;
+                        c.info.generation = c.info.generation.wrapping_add(1);
+                    }
+                    Message::Cursor(shape) => {
+                        let mut c = lock(&sh.cursor);
+                        c.rgba.clear();
+                        c.rgba.extend_from_slice(shape.rgba);
+                        c.info = CursorInfo {
+                            generation: c.info.generation.wrapping_add(1),
+                            visible: c.info.visible || c.info.width == 0,
+                            width: shape.width,
+                            height: shape.height,
+                            hot_x: shape.hot_x,
+                            hot_y: shape.hot_y,
+                        };
+                    }
+                    Message::Control(Control::Bye) => {
+                        return Err(io::ErrorKind::ConnectionAborted.into())
+                    }
                     _ => {}
                 }
                 Ok(())
@@ -837,6 +1040,15 @@ fn spawn_control(
 
 impl Drop for Client {
     fn drop(&mut self) {
+        // Let go of anything held before saying goodbye.
+        {
+            let mut tx = lock(&self.shared.input);
+            if tx.active {
+                let now = clock::now_us();
+                tx.sender.release_all(now);
+                tx.flush(now);
+            }
+        }
         self.shared.stop.store(true, Ordering::Relaxed);
         self.shared.queue.wake();
         for t in self.threads.drain(..) {

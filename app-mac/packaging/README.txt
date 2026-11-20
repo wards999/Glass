@@ -14,10 +14,13 @@ Glass for Mac (test build __VERSION__)
 Live viewer (M2):
   Run host.cmd on the PC; it shows the PC's address. Open Glass.app, type the
   address, click Connect. The PC's screen opens full screen with a stats
-  overlay.
-    Ctrl+Cmd+F   full screen / window
-    Cmd+Shift+S  hide / show stats
-    Cmd+W        disconnect (then "Copy results" and paste them back to Claude)
+  overlay, and your mouse and keyboard control the PC.
+    Ctrl+Option+Cmd+F   full screen / window
+    Ctrl+Option+Cmd+S   hide / show stats
+    Ctrl+Option+Cmd+W   disconnect (then "Copy results" and paste them back)
+  Every other key goes to the PC: Cmd acts as Ctrl (Cmd+C copies), Ctrl as the
+  Windows key, Option as Alt. Connection > PC-Style Modifiers swaps Cmd/Ctrl.
+  macOS keeps Cmd+Tab, Cmd+Space and Mission Control for itself.
 
 Recordings (M1): "Open Recording..." in the connect window, or double-click a .glsr.
 

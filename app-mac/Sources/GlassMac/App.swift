@@ -46,10 +46,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return i
         }
         submenu("Glass", [item("Quit Glass", #selector(NSApplication.terminate(_:)), "q")])
+        // While viewing, every other shortcut goes to the PC, so Glass's own
+        // live-view commands use ⌃⌥⌘ (see Live.swift).
+        let chord: NSEvent.ModifierFlags = [.control, .option, .command]
+        let pcStyle = item("PC-Style Modifiers (⌘ → Win, ⌃ → Ctrl)", #selector(togglePcStyle(_:)), "", target: self)
+        pcStyle.state = UserDefaults.standard.bool(forKey: "pcStyleModifiers") ? .on : .off
         submenu("Connection", [
             item("Connect…", #selector(showConnectAction), "n", target: self),
             item("Open Recording…", #selector(openRecording), "o", target: self),
-            item("Disconnect", #selector(NSWindow.performClose(_:)), "w"),
+            item("Disconnect", #selector(NSWindow.performClose(_:)), "w", chord),
+            .separator(),
+            pcStyle,
         ])
         submenu("Edit", [
             item("Cut", #selector(NSText.cut(_:)), "x"),
@@ -58,14 +65,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             item("Select All", #selector(NSText.selectAll(_:)), "a"),
         ])
         submenu("View", [
-            item("Toggle Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.control, .command]),
-            item("Show/Hide Stats", #selector(toggleStats), "s", [.command, .shift], target: self),
+            item("Toggle Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", chord),
+            item("Show/Hide Stats", #selector(toggleStats), "s", chord, target: self),
         ])
         NSApp.mainMenu = main
     }
 
     @objc private func showConnectAction() { showConnect() }
     @objc private func toggleStats() { viewer?.toggleOverlay() }
+
+    @objc private func togglePcStyle(_ sender: NSMenuItem) {
+        let on = sender.state != .on
+        sender.state = on ? .on : .off
+        UserDefaults.standard.set(on, forKey: "pcStyleModifiers")
+        viewer?.pcStyleModifiers = on
+    }
 
     // MARK: connect window
 
@@ -93,7 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         connectButton = NSButton(title: "Connect", target: self, action: #selector(connect))
         connectButton.keyEquivalent = "\r"
         let open = NSButton(title: "Open Recording…", target: self, action: #selector(openRecording))
-        let note = NSTextField(labelWithString: "Opens full screen. ⌃⌘F toggles a window, ⌘W disconnects.")
+        let note = NSTextField(labelWithString: "Opens full screen; mouse and keyboard go to the PC. ⌃⌥⌘F window, ⌃⌥⌘W disconnect.")
         note.textColor = .secondaryLabelColor
         note.font = .systemFont(ofSize: 11)
 
@@ -131,7 +145,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let i = t.lastIndex(of: ":"), let p = UInt16(t[t.index(after: i)...]) {
             return (String(t[..<i]), p)
         }
-        return (t, UInt16(GLASS_DEFAULT_PORT))
+        return (t, GlassClient.defaultPort)
     }
 
     @objc private func connect() {

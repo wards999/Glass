@@ -31,19 +31,62 @@ func span(_ later: UInt64, _ earlier: UInt64) -> UInt32 {
     later > earlier ? UInt32(min(later - earlier, UInt64(UInt32.max))) : 0
 }
 
-/// NSView backed by a CAMetalLayer; reports size/scale changes.
+/// NSView backed by a CAMetalLayer; reports size/scale changes. With
+/// `onMouse` set it also takes the mouse (moves, all buttons, scroll) and
+/// shows `cursor` over `cursorArea`.
 final class MetalView: NSView {
     var onResize: (() -> Void)?
+    var onMouse: ((NSEvent) -> Void)?
+    var cursor: NSCursor = .arrow {
+        didSet { window?.invalidateCursorRects(for: self) }
+    }
+    /// Picture area in view points (cursor shown there; arrow over the bars).
+    var cursorArea: NSRect? {
+        didSet { window?.invalidateCursorRects(for: self) }
+    }
+    private var tracking: NSTrackingArea?
+
     override func makeBackingLayer() -> CALayer { CAMetalLayer() }
     override var wantsUpdateLayer: Bool { true }
+    override var acceptsFirstResponder: Bool { onMouse != nil }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func layout() {
         super.layout()
         onResize?()
     }
+
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         onResize?()
     }
+
+    override func resetCursorRects() {
+        guard onMouse != nil else { return }
+        addCursorRect(cursorArea ?? bounds, cursor: cursor)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let t = tracking { removeTrackingArea(t) }
+        let t = NSTrackingArea(rect: .zero, options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(t)
+        tracking = t
+    }
+
+    override func mouseMoved(with e: NSEvent) { onMouse?(e) }
+    override func mouseDragged(with e: NSEvent) { onMouse?(e) }
+    override func rightMouseDragged(with e: NSEvent) { onMouse?(e) }
+    override func otherMouseDragged(with e: NSEvent) { onMouse?(e) }
+    override func mouseDown(with e: NSEvent) { onMouse?(e) }
+    override func mouseUp(with e: NSEvent) { onMouse?(e) }
+    override func rightMouseDown(with e: NSEvent) { onMouse?(e) }
+    override func rightMouseUp(with e: NSEvent) { onMouse?(e) }
+    override func otherMouseDown(with e: NSEvent) { onMouse?(e) }
+    override func otherMouseUp(with e: NSEvent) { onMouse?(e) }
+    override func scrollWheel(with e: NSEvent) { onMouse?(e) }
+    // Right-click must not open a context menu here.
+    override func menu(for event: NSEvent) -> NSMenu? { nil }
 }
 
 /// Shows results in a selectable monospace text view with a Copy button.

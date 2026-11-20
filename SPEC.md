@@ -100,7 +100,7 @@ Why this split: networking, FEC and crypto must match exactly on both sides, so 
 - **Native resolution:** request a stream at the window's backing pixel size (`convertToBacking`). Never let the GPU scale text up if it can be avoided.
 - **Input:** capture `NSEvent` mouse, keyboard and scroll events; send them immediately over UDP with sequence numbers. Render the cursor locally (the host sends its cursor shape and position separately).
 - **Audio:** Opus decode → CoreAudio with a small jitter buffer.
-- **UI:** a minimal SwiftUI device list (mDNS discovery), pairing screen, full-screen/windowed toggle, and a stats overlay (fps, bitrate, per-stage latency, loss, jitter-buffer depth).
+- **UI:** a minimal SwiftUI device list (mDNS discovery), pairing screen, **full screen by default** (the main way to use it: it gives the most pixels for text) with a toggle to a movable window for occasional glances, and a stats overlay (fps, bitrate, per-stage latency, loss, jitter-buffer depth).
 
 ## 5b. Windows as client
 
@@ -109,6 +109,7 @@ Why this split: networking, FEC and crypto must match exactly on both sides, so 
 - **Frame pacing:** the same adaptive jitter buffer from `core`, presenting against the display's vblank (`IDXGIOutput::WaitForVBlank` / DWM timing).
 - **Native resolution:** request a stream at the window's physical pixel size (per-monitor DPI aware v2).
 - **Input:** Raw Input for mouse (relative + absolute) and a low-level keyboard hook while focused, so Win/Alt-Tab-style keys can be forwarded. Render the cursor locally.
+- **UI:** full screen by default (borderless on the chosen monitor), with a toggle to a movable window; same stats overlay as the Mac client.
 - **Audio:** Opus → WASAPI (low-latency shared mode).
 
 ## 6. Transport protocol

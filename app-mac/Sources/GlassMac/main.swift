@@ -2,19 +2,33 @@ import AppKit
 import Foundation
 import GlassKit
 import QuartzCore
+import UniformTypeIdentifiers
 
+// Two ways in:
+//  - Terminal:  GlassMac play FILE.glsr [--bench]   (prints results)
+//  - Finder:    open Glass.app (or a .glsr with it) -> pick a file -> decode bench,
+//               then windowed playback -> results window with "Copy results".
 // LATER(M6): menu-bar shell, device list, pairing UI.
 
-let banner = "Glass (macOS) | core \(GlassCore.version) | protocol v\(GlassCore.protocolVersion)"
+let banner = "Glass (macOS) \(appVersion) | core \(GlassCore.version) | protocol v\(GlassCore.protocolVersion)"
 
-func usage() {
-    print("""
-    \(banner)
+var appVersion: String {
+    Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+}
 
-    usage:
-      GlassMac play FILE.glsr            decode + render in a window, paced at capture rate
-      GlassMac play FILE.glsr --bench    decode every frame as fast as possible (no window)
-    """)
+func systemInfo() -> String {
+    var size = 0
+    sysctlbyname("hw.model", nil, &size, nil, 0)
+    var model = [CChar](repeating: 0, count: max(size, 1))
+    sysctlbyname("hw.model", &model, &size, nil, 0)
+    var chip = [CChar](repeating: 0, count: 128)
+    var chipSize = chip.count
+    sysctlbyname("machdep.cpu.brand_string", &chip, &chipSize, nil, 0)
+    let screen = NSScreen.main.map {
+        let px = $0.convertRectToBacking($0.frame).size
+        return "\(Int(px.width))x\(Int(px.height)) @ \($0.maximumFramesPerSecond) Hz"
+    } ?? "no screen"
+    return "Mac: \(String(cString: model)) (\(String(cString: chip))), \(ProcessInfo.processInfo.operatingSystemVersionString), display \(screen)"
 }
 
 func describe(_ rec: Recording) -> String {
@@ -22,7 +36,7 @@ func describe(_ rec: Recording) -> String {
 }
 
 /// Decode-only benchmark: every frame, synchronously, back to back.
-func bench(_ rec: Recording) throws {
+func bench(_ rec: Recording) throws -> String {
     let dec = HEVCDecoder(chroma444: rec.is444)
     let decode = Stats()
     var decoded = 0
@@ -37,17 +51,18 @@ func bench(_ rec: Recording) throws {
         }
     }
     let wall = CACurrentMediaTime() - t0
-    print("Decoded \(decoded)/\(rec.frames.count) frames in \(String(format: "%.2f", wall)) s (\(String(format: "%.0f", Double(decoded) / wall)) fps)")
-    print("  decoder: \(dec.usingHardware ? "hardware" : "SOFTWARE")\(rec.is444 ? "  <- HEVC 4:4:4 hardware decode: \(dec.usingHardware ? "YES" : "NO")" : "")")
+    var out = ["Bench: decoded \(decoded)/\(rec.frames.count) frames in \(String(format: "%.2f", wall)) s (\(String(format: "%.0f", Double(decoded) / wall)) fps)"]
+    out.append("  decoder: \(dec.usingHardware ? "hardware" : "SOFTWARE")\(rec.is444 ? "  <- HEVC 4:4:4 hardware decode: \(dec.usingHardware ? "YES" : "NO")" : "")")
     if let pb = first {
         let fmt = CVPixelBufferGetPixelFormatType(pb)
         let fourcc = String(bytes: [24, 16, 8, 0].map { UInt8((fmt >> $0) & 0xff) }, encoding: .ascii) ?? "?"
-        print("  output: \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) '\(fourcc)' IOSurface=\(CVPixelBufferGetIOSurface(pb) != nil) matrix=\(Renderer.isBT709(pb) ? "BT.709" : "BT.601")")
+        out.append("  output: \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) '\(fourcc)' IOSurface=\(CVPixelBufferGetIOSurface(pb) != nil) matrix=\(Renderer.isBT709(pb) ? "BT.709" : "BT.601")")
     }
-    print(decode.line("decode"))
+    out.append(decode.line("decode"))
     let enc = Stats()
     for f in rec.frames where f.meta.encode_us > 0 { enc.push(f.meta.encode_us) }
-    if enc.summary.count > 0 { print(enc.line("encode (host)")) }
+    if enc.summary.count > 0 { out.append(enc.line("encode (host)")) }
+    return out.joined(separator: "\n")
 }
 
 final class MetalView: NSView {
@@ -57,10 +72,11 @@ final class MetalView: NSView {
 
 /// Windowed playback: CADisplayLink-paced, decoding every frame due by now and
 /// presenting the latest. LATER(M5): adaptive jitter buffer + display-linked pacing from core.
-final class Player: NSObject, NSApplicationDelegate {
+final class Player: NSObject {
     let rec: Recording
     let dec: HEVCDecoder
     let renderer: Renderer
+    var onFinish: (String) -> Void = { _ in }
     var window: NSWindow!
     var layer: CAMetalLayer!
     var link: CADisplayLink?
@@ -81,13 +97,14 @@ final class Player: NSObject, NSApplicationDelegate {
         renderer = try Renderer()
     }
 
-    func applicationDidFinishLaunching(_ note: Notification) {
+    func open() {
         let scale = NSScreen.main?.backingScaleFactor ?? 2
         let w = CGFloat(rec.header.width), h = CGFloat(rec.header.height)
         // Window sized so one video pixel = one screen pixel.
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: w / scale, height: h / scale),
                           styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
         window.title = "Glass — \(describe(rec))"
+        window.isReleasedWhenClosed = false
         let view = MetalView(frame: window.contentLayoutRect)
         view.wantsLayer = true
         layer = (view.layer as! CAMetalLayer)
@@ -110,7 +127,7 @@ final class Player: NSObject, NSApplicationDelegate {
     @objc func tick(_ link: CADisplayLink) {
         let now = CACurrentMediaTime()
         if let done = finishedAt {
-            if now - done > 0.5 { finish() }
+            if now - done > 0.5 { finish(nil) }
             return
         }
         if startHost == 0, let f = rec.frames.first {
@@ -130,8 +147,7 @@ final class Player: NSObject, NSApplicationDelegate {
                 next += 1
             }
         } catch {
-            print("error: \(error)")
-            finish()
+            finish("error: \(error)")
             return
         }
         if let pb = latest { present(pb) }
@@ -157,36 +173,118 @@ final class Player: NSObject, NSApplicationDelegate {
         cb.commit()
     }
 
-    func finish() {
+    func finish(_ error: String?) {
+        guard link != nil else { return }
         link?.invalidate()
         link = nil
-        print("Played \(describe(rec)); presented \(presented), superseded \(dropped)")
-        print("  decoder: \(dec.usingHardware ? "hardware" : "SOFTWARE")")
-        print(decode.line("decode"))
-        print(render.line("render+present"))
-        print(presentInterval.line("present interval"))
-        NSApp.terminate(nil)
+        window.orderOut(nil)
+        var out = ["Playback: presented \(presented), superseded \(dropped)"]
+        if let error { out.append(error) }
+        out.append("  decoder: \(dec.usingHardware ? "hardware" : "SOFTWARE")")
+        out.append(decode.line("decode"))
+        out.append(render.line("render+present"))
+        out.append(presentInterval.line("present interval"))
+        onFinish(out.joined(separator: "\n"))
     }
 }
 
-let args = Array(CommandLine.arguments.dropFirst())
-guard args.first == "play", args.count >= 2 else {
-    usage()
-    exit(0)
-}
-do {
-    let rec = try Recording(contentsOf: URL(fileURLWithPath: args[1]))
-    print("\(banner)\n\(args[1]): \(describe(rec))")
-    if args.contains("--bench") {
-        try bench(rec)
-    } else {
-        let player = try Player(rec)
-        let app = NSApplication.shared
-        app.setActivationPolicy(.regular)
-        app.delegate = player
-        withExtendedLifetime(player) { app.run() }
+/// Shows results in a selectable monospace text view with a Copy button.
+func showResults(_ text: String) {
+    let alert = NSAlert()
+    alert.messageText = "Glass test results"
+    alert.informativeText = "Copy these and paste them back to Claude."
+    let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 760, height: 300))
+    scroll.hasVerticalScroller = true
+    let tv = NSTextView(frame: scroll.bounds)
+    tv.isEditable = false
+    tv.isSelectable = true
+    tv.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+    tv.string = text
+    scroll.documentView = tv
+    alert.accessoryView = scroll
+    alert.addButton(withTitle: "Copy results")
+    alert.addButton(withTitle: "Close")
+    if alert.runModal() == .alertFirstButtonReturn {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
-} catch {
-    print("error: \(error)")
-    exit(1)
+}
+
+/// Finder / double-click mode.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    var player: Player?
+    var gotFile = false
+
+    func application(_ app: NSApplication, open urls: [URL]) {
+        gotFile = true
+        if let url = urls.first { run(url) }
+    }
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async { if !self.gotFile { self.pick() } }
+    }
+
+    func pick() {
+        let panel = NSOpenPanel()
+        panel.message = "Choose a Glass recording (.glsr) to test"
+        panel.allowedContentTypes = [UTType(filenameExtension: "glsr") ?? .data]
+        panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+        if panel.runModal() == .OK, let url = panel.url { run(url) } else { NSApp.terminate(nil) }
+    }
+
+    func run(_ url: URL) {
+        var report = "\(banner)\n\(systemInfo())\n\(url.lastPathComponent): "
+        do {
+            let rec = try Recording(contentsOf: url)
+            report += describe(rec) + "\n" + (try bench(rec))
+            let player = try Player(rec)
+            player.onFinish = { [weak self] playback in
+                showResults(report + "\n" + playback)
+                self?.player = nil
+                NSApp.terminate(nil)
+            }
+            self.player = player
+            player.open()
+        } catch {
+            showResults(report + "\nerror: \(error)")
+            NSApp.terminate(nil)
+        }
+    }
+}
+
+let args = Array(CommandLine.arguments.dropFirst()).filter { !$0.hasPrefix("-psn_") }
+let app = NSApplication.shared
+
+if args.first == "play", args.count >= 2 {
+    do {
+        let rec = try Recording(contentsOf: URL(fileURLWithPath: args[1]))
+        print("\(banner)\n\(systemInfo())\n\(args[1]): \(describe(rec))")
+        print(try bench(rec))
+        if !args.contains("--bench") {
+            let player = try Player(rec)
+            player.onFinish = { print($0); exit(0) }
+            app.setActivationPolicy(.regular)
+            player.open()
+            withExtendedLifetime(player) { app.run() }
+        }
+    } catch {
+        print("error: \(error)")
+        exit(1)
+    }
+} else if !args.isEmpty || Bundle.main.bundleIdentifier == nil {
+    // Bare binary (not inside Glass.app), or unknown arguments: print usage.
+    print("""
+    \(banner)
+
+    usage:
+      GlassMac play FILE.glsr            decode bench, then playback in a window
+      GlassMac play FILE.glsr --bench    decode bench only (no window)
+    Or open Glass.app and pick a .glsr file.
+    """)
+} else {
+    let delegate = AppDelegate()
+    app.setActivationPolicy(.regular)
+    app.delegate = delegate
+    withExtendedLifetime(delegate) { app.run() }
 }

@@ -9,6 +9,12 @@
 //! LATER(M3b): client decode (D3D11VA) -> flip-model present, Raw Input.
 //! LATER(M6): tray shell, device list, pairing UI.
 
+/// Build version: the test-build tag when packaged, else the crate version.
+const VERSION: &str = match option_env!("GLASS_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[cfg(windows)]
 mod win;
 
@@ -21,7 +27,7 @@ usage:
   glass record [--monitor N] [--seconds S] [--chroma 420|444] [--mbps M] out.glsr
   glass dump in.glsr out.h265
   glass pack in.h265 out.glsr WIDTH HEIGHT FPS 420|444",
-        ver = env!("CARGO_PKG_VERSION"),
+        ver = VERSION,
         core = glass_core::VERSION,
         proto = glass_core::protocol::PROTOCOL_VERSION,
     );
@@ -105,7 +111,7 @@ fn main() {
         Some("--version") => {
             println!(
                 "Glass (Windows) {} | core {} | protocol v{}",
-                env!("CARGO_PKG_VERSION"),
+                VERSION,
                 glass_core::VERSION,
                 glass_core::protocol::PROTOCOL_VERSION
             );

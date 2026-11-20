@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    # Test builds: push a tag like m1-test1 to publish a prerelease with the
+    # Windows zip and Mac dmg.
+    tags: ['m*-test*']
   pull_request:
 
 env:
@@ -35,6 +38,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # git describe for the build version
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -48,11 +53,11 @@ jobs:
         run: ./scripts/fetch-ffmpeg.ps1
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - run: cargo build -p glass-win --release
+      - name: Package
+        run: ./scripts/package-win.ps1
       - name: Smoke test (no GPU/capture on runners)
         shell: bash
         run: |
-          ls target/release/*.dll || echo "no FFmpeg DLLs copied next to glass.exe"
           export PATH="$PWD/third_party/ffmpeg/bin:$PATH"
           target/release/glass.exe --version
           for c in 420 444; do
@@ -61,24 +66,59 @@ jobs:
             target/release/glass.exe pack t$c.h265 rt$c.glsr 320 192 60 $c
             cmp $f rt$c.glsr
           done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glass-win
+          path: dist/*.zip
+          if-no-files-found: error
 
   app-mac:
     name: app-mac (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p glass-core --release
-      - name: swift build
-        working-directory: app-mac
-        run: swift build -c release
       - name: swift test
         working-directory: app-mac
         run: swift test
-      - name: decode bench (fixtures)
-        working-directory: app-mac
+      - name: Package (Glass.app + dmg)
+        run: bash scripts/package-mac.sh
+      - name: decode bench (fixtures, packaged binary)
         run: |
-          swift run -c release GlassMac
-          swift run -c release GlassMac play Tests/GlassKitTests/Fixtures/testsrc-420.glsr --bench
-          swift run -c release GlassMac play Tests/GlassKitTests/Fixtures/testsrc-444.glsr --bench
+          hdiutil attach dist/*.dmg -mountpoint /tmp/glass -nobrowse
+          bin=/tmp/glass/Glass.app/Contents/MacOS/GlassMac
+          codesign --verify --deep --strict /tmp/glass/Glass.app
+          for c in 420 444; do
+            "$bin" play app-mac/Tests/GlassKitTests/Fixtures/testsrc-$c.glsr --bench
+          done
+          hdiutil detach /tmp/glass
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glass-mac
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    name: Publish test build
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [core, app-win, app-mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --prerelease \
+            --title "Glass $GITHUB_REF_NAME (test build)" \
+            --notes "Test build from $GITHUB_SHA. Instructions: docs/testing.md."

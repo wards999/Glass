@@ -2,6 +2,7 @@
 
 fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+    println!("cargo:rerun-if-env-changed=GLASS_VERSION");
     if std::env::var("CARGO_CFG_WINDOWS").is_err() {
         return;
     }

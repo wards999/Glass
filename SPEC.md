@@ -174,3 +174,4 @@ Each milestone ends with a short written result in `docs/results/Mx.md` (what wo
 - Mac as host: Screen Recording + Accessibility permissions, no public virtual-display API, and VideoToolbox gives less rate-control precision than NVENC (check scene-change bursts work in M3b).
 - Key mapping between Windows and macOS (Ctrl/Cmd, Alt/Option, Win key) needs a clear, configurable rule.
 - Wi-Fi jitter: the adaptive buffer must handle it without hurting the wired case.
+- Aspect mismatch: the Mac panel is 16:10 (2940×1912) and the PC monitor 16:9 (2560×1440). PC → Mac full screen shows bars top and bottom; Mac → PC shows bars at the sides, and the Mac's Retina image is scaled to ~75%, so text gets small. Bars-free, 1:1 needs the host to render at the client's shape: a virtual display (Windows IddCx driver, Mac `CGVirtualDisplay`) or a matching host mode (M7/M8).

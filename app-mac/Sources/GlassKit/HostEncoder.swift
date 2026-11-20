@@ -29,6 +29,9 @@ public final class HEVCEncoder {
 
     public let config: Config
     public private(set) var usingHardware = false
+    /// Created with "hardware only", so it is hardware even if the session
+    /// doesn't report it (the low-latency encoder doesn't).
+    private var requiredHardware = false
     public private(set) var lowLatencyRateControl = false
     private var session: VTCompressionSession?
     private var out: UnsafeMutableRawPointer
@@ -69,6 +72,7 @@ public final class HEVCEncoder {
             if lastStatus == noErr, let s {
                 session = s
                 lowLatencyRateControl = i == 0
+                requiredHardware = i < 2
                 break
             }
         }
@@ -100,7 +104,7 @@ public final class HEVCEncoder {
         var hw: CFBoolean?
         VTSessionCopyProperty(session, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
                               allocator: kCFAllocatorDefault, valueOut: &hw)
-        usingHardware = hw.map { CFBooleanGetValue($0) } ?? false
+        usingHardware = requiredHardware || (hw.map { CFBooleanGetValue($0) } ?? false)
     }
 
     deinit {

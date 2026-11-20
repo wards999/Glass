@@ -99,6 +99,8 @@ public final class HostRunner {
             : ScreenSource(display: display)
         let q = source.queue
         let encode = Stats(), send = Stats(), interval = Stats()
+        // encode = delivery (ScreenCaptureKit: frame time -> our callback) + VideoToolbox.
+        let delivery = Stats(), vtEncode = Stats()
         var frames = 0, idrs = 0, notSent = 0, idleIDRs = 0, bytes = 0, frameId: UInt32 = 0
         var lastCapture: UInt64 = 0
         var lastFrame: (CVPixelBuffer, UInt64)?
@@ -117,6 +119,8 @@ public final class HostRunner {
 
         // On q only.
         func encodeAndSend(_ pb: CVPixelBuffer, _ captureUs: UInt64, forceKey: Bool) {
+            let arrival = GlassClock.nowUs()
+            delivery.push(UInt32(clamping: arrival &- captureUs))
             let key = s.takeKeyframeRequest() || forceKey
             let inputSeq = s.inputSeq
             do {
@@ -128,6 +132,7 @@ public final class HostRunner {
                     let r = s.send(f, data)
                     let sent = GlassClock.nowUs()
                     encode.push(UInt32(clamping: now &- captureUs))
+                    vtEncode.push(UInt32(clamping: now &- arrival))
                     send.push(UInt32(clamping: sent &- now))
                     if r == 1 {
                         frames += 1
@@ -214,6 +219,8 @@ public final class HostRunner {
                               frames, Double(frames) / secs, idrs, idleIDRs, Int(counters.keyframe_requests), notSent))
             out.append(String(format: "  bitrate %.1f Mbps avg | %ld packets", Double(bytes) * 8 / secs / 1e6, Int(counters.packets_sent)))
             out.append(encode.line("encode"))
+            out.append(delivery.line("  capture delivery"))
+            out.append(vtEncode.line("  VideoToolbox"))
             out.append(send.line("send (packetise)"))
             out.append(interval.line("capture interval"))
             out.append("  input: \(inp.packets) packets | \(inp.keys) keys, \(inp.clicks) clicks, \(inp.scrolls) scrolls, \(inp.moves) moves | repaired \(inp.repaired)\(options.testPattern ? " (test pattern: not injected)" : "")")

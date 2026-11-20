@@ -219,6 +219,26 @@ test of smoothness.
   stddev **< 1 ms**, p99 **< 1.5 refresh periods**. The adaptive jitter buffer
   may spend up to 2 frames to get there; glass-to-glass and input → screen
   stay in the §8 Wi-Fi budget. Wired runs are reported for comparison.
+- **Even cadence: every shown frame is one game frame, shown exactly once, on
+  an even beat.** A 60 Hz panel can't show 144 distinct frames a second;
+  dropping the extras unevenly (2, then 3, then 2 game frames per refresh) is
+  what makes animation judder. So:
+  - The host samples at the viewer's refresh, phase-locked to the viewer's
+    vsync (the viewer reports its vsync timing), instead of forwarding
+    whatever the game produced last.
+  - Best result: the game renders at the viewer's rate. In M7 the Windows
+    host streams games from a virtual display (IddCx) set to the viewer's
+    refresh (60 Hz for the MacBook Air, 120 for a ProMotion Mac). The game's
+    own V-Sync then locks to it and every game frame becomes one Mac refresh,
+    perfectly even, with the PC's monitor unaffected. Until then Glass detects
+    a mismatched game rate and suggests a 60 fps cap (game setting or the NVIDIA
+    frame limiter). Applying the cap automatically through NVAPI is optional,
+    later, and opt-in.
+  - The viewer presents each received frame exactly once, on the next refresh,
+    with the jitter buffer absorbing Wi-Fi timing so no refresh repeats a frame.
+  - Measured as **cadence error**: the spread of game-frame time between
+    consecutive shown frames (0 when every refresh advances by one game frame).
+    Target: on 99% of refreshes the picture advances by exactly one frame interval.
 - **Host capture rate = viewer refresh rate** (e.g. 60 Hz for the MacBook
   Air), aligned to the viewer's vsync phase where possible, instead of the
   host monitor's own rate (e.g. 144–165 Hz). The
@@ -405,9 +425,9 @@ numbers give the order. (Reordered 2026-11-20, ADR 0007.)
 6. **M3c – Sharp text, Mac → PC (use case A):** 2560×1440 virtual display on the Mac (`CGVirtualDisplay`, fallback to the physical display), shown 1:1 on the PC; native-resolution negotiation (viewer sends its size in `Hello`); resolution and shape choices with render-don't-shrink on the Mac and GPU scaling elsewhere (§5e), with mid-stream size changes; 4:4:4 or still-region refinement; a clarity test card and PSNR measurement against the §0 still-content target (≤ 150 ms to visually lossless). Pulled forward from M7.
 7. **M4 – Robustness (Wi-Fi):** FEC (adaptive, interleaved, sized for Wi-Fi), send pacing, DSCP marking, packet-loss simulator in `/tools` with Wi-Fi-like burst loss and delay spikes (replayed from M2/M3 measurements). Both directions.
 8. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation on both viewers, capture rate matched to the viewer's refresh, adaptive bitrate with the Auto resolution ladder (§5e), frame-interval metrics against the §5c pacing target on Wi-Fi. StarDesk baseline measured before it (§5d). Compare against StarDesk and Moonlight.
-9. **M5b – Gaming (use case B):** audio (Opus, A/V sync), game controller (GameController → ViGEmBus), relative mouse mode, game-mode overlay. Measured with a real Steam game (§5c). The opt-in low-latency Wi-Fi toggle (§5d) goes here if M5 still shows AWDL spikes.
+9. **M5b – Gaming (use case B):** audio (Opus, A/V sync), game controller (GameController → ViGEmBus), relative mouse mode, game-mode overlay, even cadence (vsync-locked sampling, cadence-error metric, frame-cap hint; §5c). Measured with a real Steam game (§5c). The opt-in low-latency Wi-Fi toggle (§5d) goes here if M5 still shows AWDL spikes.
 10. **M6 – Security:** mDNS discovery, PIN pairing, pinned mutual TLS, encrypted UDP. Code-signing as in §7b.
-11. **M7 – Clarity (rest):** native resolution for PC → Mac (Windows virtual display, IddCx), scene-change burst, still-region refinement on the Windows host.
+11. **M7 – Clarity (rest):** native resolution for PC → Mac (Windows virtual display, IddCx, at the viewer's size **and refresh**, so games lock to the Mac's rate), scene-change burst, still-region refinement on the Windows host.
 12. **M8 – Extras:** clipboard, direct NVENC SDK path, audio and controller for the Mac-host direction.
 
 Each milestone ends with a short written result in `docs/results/Mx.md` (what works, measured numbers, known issues).

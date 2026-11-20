@@ -283,8 +283,9 @@ capacity that changes as you move. Design for it:
   and back up when the link recovers (with hysteresis, so it doesn't flap).
 - **Jitter buffer** (M5) adapts to the measured arrival jitter, typically
   0–2 frames on Wi-Fi, 0–1 wired; drops late frames rather than queueing.
-- **Wi-Fi QoS:** mark media and input packets with DSCP (video CS4/AF41, audio
-  and input EF) so WMM-capable routers put them in the video/voice queues.
+- **Wi-Fi QoS:** mark media and input packets so WMM-capable routers and the
+  hosts' own Wi-Fi drivers put them in the video/voice queues (details and
+  per-OS caveats in §6b).
 - **Mac Wi-Fi quirks:** AWDL (AirDrop/Continuity) can make the Mac's Wi-Fi
   hop channels and cause periodic delay spikes. StarDesk is smooth on the
   same Wi-Fi without touching AWDL, so Glass must absorb spikes the same way
@@ -353,6 +354,140 @@ offers, per connection (remembered per host):
 - **FEC:** Reed-Solomon over packet groups, with a configurable percentage (default 10–20%). Request a keyframe over the control channel only if FEC can't recover.
 - **Clock sync:** NTP-style ping exchange over the control channel so the client can calculate true host-to-display latency.
 - **Spec:** keep `docs/protocol.md` as the source of truth, versioned.
+
+## 6b. Network design (Wi-Fi, in detail)
+
+What the link actually does, and what Glass does about each part. Numbers are
+starting points to tune from measurements, not fixed constants.
+
+### The path
+- **Count the wireless hops.** Mac (Wi-Fi) → router → PC (Wi-Fi) is two
+  wireless hops: twice the airtime, two sets of retries, two chances of a
+  spike. Mac (Wi-Fi) → router → PC (Ethernet) is one. Both are supported,
+  but the setup check and README recommend a cable on whichever machine can
+  have one (usually the PC). A mesh system adds a wireless backhaul hop:
+  connect both to the same node where possible.
+- **Band and width:** prefer 5 GHz or 6 GHz, 80 MHz or wider, good signal
+  (RSSI better than about −65 dBm). 2.4 GHz works but is warned about. DFS
+  channels can go silent for a minute after radar detection; report it if it
+  happens.
+- **Router features that break Glass:** client/AP isolation and guest
+  networks block device-to-device traffic, and multicast filtering breaks
+  mDNS (M6). Detect "can't reach the peer" and name these as likely causes; a
+  typed address always works as a fallback.
+- **Pick the right interface.** Machines have extra adapters (VPNs such as
+  Tailscale, Hyper-V/WSL vEthernet, Bluetooth PAN, link-local 169.254.x). Bind
+  to, and advertise, the interface on the same subnet as the peer. Warn if a
+  VPN is routing local traffic or lowering the MTU.
+
+### What Wi-Fi does to packets
+- **Loss is mostly hidden as delay.** 802.11 retries at the MAC layer, so
+  instead of losing a packet the link often delivers it several ms late. True
+  loss comes in bursts (interference, roaming, a scan). So delay variation
+  matters more than loss rate, and loss must be handled as bursts.
+- **Aggregation (A-MPDU) and block-ack** batch packets, so arrivals are bursty
+  even when sending is smooth. The jitter buffer sizes itself from measured
+  arrival jitter, not from send timing.
+- **Background scans and power save cause periodic spikes:**
+  - Windows WLAN AutoConfig scans roughly every 60 s, and Wi-Fi adapters
+    have power-saving modes that add wake-up delay. Glass measures spike
+    periodicity per machine, names the likely cause in the stats (AWDL about
+    1 s on the Mac, scans about 60 s on Windows) and gives guidance (e.g. the
+    adapter's power-saving setting). It never changes settings without an
+    opt-in (same pattern as the §5d AWDL toggle).
+  - **Keep the radios awake.** During a session, both sides send at least a
+    small packet every ~10 ms (input heartbeats and receiver reports already
+    do this), so neither radio drops into power save between frames.
+- **Roaming** between access points causes a gap of tens to hundreds of ms.
+  Detect it (the BSSID changes where the OS reports it), keep the session
+  alive, and request an IDR or refresh afterwards.
+
+### Recovering from loss without adding delay
+At home LAN RTTs (1–5 ms, below one frame interval) **retransmission is
+cheap**, so Glass uses both FEC and NACK, as WebRTC does:
+- **NACK first.** The viewer notices a missing packet (sequence gap or a
+  short timeout) and immediately asks for it again; the host keeps the last
+  ~100 ms of sent packets to answer. Used when RTT plus the remaining frame
+  deadline allows it.
+- **FEC for what NACK can't fix in time.** Systematic Reed–Solomon (or
+  similar) over each frame's packets, with redundancy adapted to the measured
+  burst-loss pattern. Interleave across a frame so one burst doesn't take
+  out a whole group. Small frames get a minimum of protection, not a
+  percentage. No FEC on input (it is already repeated, ADR 0004).
+- **Never a full IDR if it can be avoided.** On unrecoverable loss: NVENC
+  **reference-frame invalidation** (the next frame references the last frame
+  the viewer has), or a rolling **intra refresh** that spreads the cost over
+  several frames. A full IDR only as a last resort, paced. Check what
+  VideoToolbox supports for the Mac host (M3b) and fall back accordingly.
+- The loss simulator (`/tools/losssim`) uses a **Gilbert–Elliott burst
+  model** plus delay spikes and aggregation-style batching, with parameters
+  fitted to real M2/M3/M4 traces, not just uniform random loss.
+
+### Congestion and bitrate control
+- **Delay-based**, like WebRTC's GCC. The viewer sends a receiver report
+  every ~20–50 ms: per-frame arrival times, one-way delay trend (from the
+  synced clocks), loss and recovery counts, jitter. The host treats a rising
+  one-way delay as the queue starting to build and backs off **before** loss
+  happens. Back off fast, ramp up slowly, and probe up carefully (padding or
+  FEC as the probe).
+- **The encoder bitrate follows the controller per frame** (NVENC and
+  VideoToolbox both accept bitrate changes without an IDR).
+- **What gives way first** follows the overriding rules: desktop → frame rate
+  before sharpness; game → bitrate (and with Auto, resolution) before
+  smoothness.
+- **Other traffic in the house** (downloads, video calls) shares the airtime;
+  the controller is what keeps Glass from turning that into lag.
+
+### Pacing and send path
+- **Pace every frame's packets** with a token bucket at about 1.5× the
+  current bitrate, so a frame leaves well within its interval (e.g. a 55 KB
+  frame at 50 Mbps → ~6 ms) instead of as one burst. Big frames (IDR, scene
+  change) are paced over up to two frame intervals.
+- **Priority:** input > audio > video, and newest video first. A late frame's
+  remaining packets are dropped if a newer frame is ready (never queue).
+- **Timers:** Windows needs high-resolution waitable timers (or a 1 ms
+  timer period) for sub-ms pacing; macOS uses `mach_wait_until`. Pacing runs
+  on its own thread, not the capture/encode thread (the M2 send time showed it
+  belongs off that thread).
+- **Fewer syscalls:** batch sends (Windows UDP send offload `UDP_SEND_MSG_SIZE`
+  / RIO; `sendmsg_x` batching on macOS) once measurements show syscall
+  cost matters (M2: ~22 µs per datagram on the PC's NIC).
+
+### Packet marking (QoS)
+- **Classes:** input and audio as voice (DSCP EF/46 → WMM AC_VO); video as
+  video (DSCP CS4/32 or AF41/34 → WMM AC_VI); control and bulk as best effort.
+- **macOS:** set `SO_NET_SERVICE_TYPE` (`NET_SERVICE_TYPE_VO` / `NET_SERVICE_TYPE_RV`)
+  so the Mac's own Wi-Fi driver queues them right, plus `IP_TOS` for the router.
+- **Windows:** `IP_TOS` from an app is ignored by default. Use the qWAVE API
+  (`QOSAddSocketToFlow` with `QOSTrafficTypeVoice`/`AudioVideo`), which
+  works without admin rights for these traffic types. Verify by packet capture.
+- Routers that ignore or strip DSCP are common; marking must help where it
+  works and never hurt where it doesn't.
+
+### Sizes, MTU and buffers
+- Datagrams ≤ 1400 bytes with the DF bit set; no IP fragmentation, ever.
+  At connect, probe that a full-size datagram gets through (VPNs and some
+  mesh systems lower the path MTU) and drop to 1200 if not.
+- Socket buffers large enough for a paced IDR plus jitter (4 MB requested),
+  but the jitter buffer, not the socket, is where delay is allowed to live.
+- IPv4 now; IPv6 link-local later (M6).
+
+### Clock sync
+- Keep re-estimating the offset (min-RTT filter over a sliding window) and
+  also track **drift**: QPC and `mach_absolute_time` drift by a few ppm, which
+  over a long session adds up to milliseconds. Fit offset plus drift, and
+  report the error bound.
+- One-way delay trends (for congestion control) need only drift-corrected
+  relative timing, not perfect absolute sync.
+
+### Visibility
+- **Wi-Fi link stats in the overlay and results:** band/channel/width, RSSI,
+  PHY rate, from the OS (Windows WLAN API, macOS CoreWLAN where it's allowed
+  without extra permission).
+- Per session: one-way delay p50/p99, spike count and periodicity, burst-loss
+  stats, NACK and FEC recoveries, bitrate changes, IDR/RFI count.
+- **Optional packet-timing trace** (timestamps only, no content) to feed the
+  loss simulator and to diagnose a bad session after the fact.
 
 ## 7. Security
 
@@ -423,8 +558,8 @@ numbers give the order. (Reordered 2026-11-20, ADR 0007.)
 4. **M3 – Input:** mouse and keyboard back-channel, local cursor. Usable PC → Mac remote desktop.
 5. **M3b – Reverse direction (use case A):** first check whether VideoToolbox can hardware-encode HEVC 4:4:4 on the M4 (decides the clarity approach). Then the Mac host (ScreenCaptureKit + VideoToolbox encode + CGEvent, with Screen Recording/Accessibility permission checks) and the Windows viewer (D3D11VA decode + flip-model swap chain + Raw Input/keyboard hook + local pointer), full screen on the PC. Same protocol, with no changes to `core` beyond bug fixes. Role selection in both apps.
 6. **M3c – Sharp text, Mac → PC (use case A):** 2560×1440 virtual display on the Mac (`CGVirtualDisplay`, fallback to the physical display), shown 1:1 on the PC; native-resolution negotiation (viewer sends its size in `Hello`); resolution and shape choices with render-don't-shrink on the Mac and GPU scaling elsewhere (§5e), with mid-stream size changes; 4:4:4 or still-region refinement; a clarity test card and PSNR measurement against the §0 still-content target (≤ 150 ms to visually lossless). Pulled forward from M7.
-7. **M4 – Robustness (Wi-Fi):** FEC (adaptive, interleaved, sized for Wi-Fi), send pacing, DSCP marking, packet-loss simulator in `/tools` with Wi-Fi-like burst loss and delay spikes (replayed from M2/M3 measurements). Both directions.
-8. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation on both viewers, capture rate matched to the viewer's refresh, adaptive bitrate with the Auto resolution ladder (§5e), frame-interval metrics against the §5c pacing target on Wi-Fi. StarDesk baseline measured before it (§5d). Compare against StarDesk and Moonlight.
+7. **M4 – Robustness (Wi-Fi, §6b):** NACK retransmission plus adaptive interleaved FEC, reference-frame invalidation / intra refresh instead of IDRs, paced sending on its own thread, QoS marking (qWAVE on Windows, service types on macOS), MTU probe, interface selection, radio keep-awake, receiver reports, Wi-Fi link stats and spike classification, loss simulator with a Gilbert–Elliott burst model fitted to real traces. Both directions.
+8. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation on both viewers, capture rate matched to the viewer's refresh, delay-based congestion control and adaptive bitrate with the Auto resolution ladder (§5e, §6b), clock drift tracking, frame-interval metrics against the §5c pacing target on Wi-Fi. StarDesk baseline measured before it (§5d). Compare against StarDesk and Moonlight.
 9. **M5b – Gaming (use case B):** audio (Opus, A/V sync), game controller (GameController → ViGEmBus), relative mouse mode, game-mode overlay, even cadence (vsync-locked sampling, cadence-error metric, frame-cap hint; §5c). Measured with a real Steam game (§5c). The opt-in low-latency Wi-Fi toggle (§5d) goes here if M5 still shows AWDL spikes.
 10. **M6 – Security:** mDNS discovery, PIN pairing, pinned mutual TLS, encrypted UDP. Code-signing as in §7b.
 11. **M7 – Clarity (rest):** native resolution for PC → Mac (Windows virtual display, IddCx, at the viewer's size **and refresh**, so games lock to the Mac's rate), scene-change burst, still-region refinement on the Windows host.

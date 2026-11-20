@@ -85,7 +85,11 @@ final class PipelineTests: XCTestCase {
         XCTAssertNil(cb.error)
         var px = [UInt8](repeating: 0, count: 320 * 192 * 4)
         target.getBytes(&px, bytesPerRow: 320 * 4, from: MTLRegionMake2D(0, 0, 320, 192), mipmapLevel: 0)
-        let distinct = Set(stride(from: 0, to: px.count, by: 4 * 97).map { Int(px[$0]) << 16 | Int(px[$0 + 1]) << 8 | Int(px[$0 + 2]) })
+        var distinct = Set<UInt32>()
+        for i in stride(from: 0, to: px.count, by: 4 * 97) {
+            let b = UInt32(px[i]), g = UInt32(px[i + 1]), r = UInt32(px[i + 2])
+            distinct.insert((r << 16) | (g << 8) | b)
+        }
         XCTAssertGreaterThan(distinct.count, 8, "expected a colourful test pattern")
     }
 }

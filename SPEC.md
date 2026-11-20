@@ -244,7 +244,16 @@ offers, per connection (remembered per host):
 
 - **Shape:** *Fit this screen* (default: the host renders at the viewer's
   shape, no bars), or *Host's own shape* (e.g. the Mac's 16:10 desktop on the
-  16:9 PC monitor, with black bars at the sides).
+  16:9 PC monitor, with black bars at the sides). Either shape stays
+  **locked** for the session: the aspect ratio never changes on its own, and
+  black bars are the expected result, not a problem to fix. Auto (below) only
+  changes the size within the locked shape.
+- **Never send more pixels than the viewer can show.** In the host's own
+  shape, the stream is the largest size of that shape that fits the viewer's
+  screen, and the host renders at that size. Example: the Mac's 2940×1912
+  panel (≈1.54:1) on the 2560×1440 PC monitor is streamed at **2214×1440**
+  (bars of 173 px each side), not 2940×1912. That's about 43% fewer pixels, and
+  it's still 1:1 on the PC.
 - **Resolution:** *Native* (default for use case A), a ladder of lower sizes
   in that shape (e.g. for 16:9: 2560×1440, 1920×1080, 1600×900, 1280×720), and
   *Auto* (start native, step down only when §5d's bitrate floor can't keep

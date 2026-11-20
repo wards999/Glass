@@ -8,8 +8,8 @@ Both use cases run **over home Wi-Fi** (§5d). If Glass doesn't beat the
 existing tools on the criteria below, there's no reason to build it, so every
 milestone reports against them.
 
-The current test setup: Windows PC with an RTX 4070 and a 2560×1440 @ 165 Hz
-monitor; MacBook Air M4 with a 2940×1912 @ 60 Hz built-in display. The numbers
+The current test setup: Windows PC with an RTX 4070 and a 2560×1440 monitor
+rated 144 Hz (Windows reported 165 Hz in M1–M3 tests, so it may be overclocked); MacBook Air M4 with a 2940×1912 @ 60 Hz built-in display. The numbers
 in this spec use that setup as the example, but **nothing is hardwired to it**:
 
 - At every connection the viewer reports its display (pixel size, refresh
@@ -43,7 +43,10 @@ Desktop work: reading and writing text, code, web, documents.
     shape (bars at the sides) are user choices (§5e), still as sharp as
     possible.
 - **Very responsive:** input → screen **p50 ≤ 30 ms, p99 ≤ 60 ms** on Wi-Fi
-  (PC display at 165 Hz, Mac capturing at up to 120 Hz). The pointer is drawn
+  The Mac's own panel is 60 Hz, but the stream comes from the virtual display,
+  which runs at the **PC's refresh rate** (e.g. 144 Hz) if the Mac's capture and
+  hardware encoder keep up (measured in M3b; otherwise the highest rate they
+  sustain). So Mac → PC isn't limited to 60 Hz. The pointer is drawn
   locally on the PC, so it always moves with zero lag.
 
 ### B. Secondary: the Mac shows the PC, often a Steam game (Windows host → Mac viewer)
@@ -149,7 +152,7 @@ Why this split: networking, FEC and crypto must match exactly on both sides, so 
 - **Encode:** VideoToolbox `VTCompressionSession` (HEVC, hardware) with real-time and low-latency rate control (`kVTVideoEncoderSpecification_EnableLowLatencyRateControl`), no frame reordering, and a short max frame delay. 4:4:4 where supported. Scene-change bursts and still-region refinement use the same `core` rate-control logic as Windows, applied through per-frame bitrate/keyframe properties.
 - **Input injection:** `CGEvent` posting (mouse, keyboard, scroll). Needs the **Accessibility** permission. Map Windows key codes to macOS key codes, and Ctrl ↔ Cmd by configurable rule.
 - **Audio:** ScreenCaptureKit system-audio capture (macOS 13+) → Opus.
-- **Virtual display (required for use case A, §0):** create a display at the viewer's exact pixel size (2560×1440 for the PC monitor, at 1× so one Mac pixel = one PC pixel; up to 120 Hz) and stream that, so the PC never scales. macOS has no public API: use the private `CGVirtualDisplay` approach used by open-source tools (e.g. BetterDisplay, DeskPad), behind a fallback that streams the physical display (scaled, with bars) if it ever breaks.
+- **Virtual display (required for use case A, §0):** create a display at the viewer's exact pixel size (e.g. 2560×1440 for the PC monitor, at 1× so one Mac pixel = one PC pixel) at the viewer's refresh rate (e.g. 144 Hz), capped at what ScreenCaptureKit and VideoToolbox sustain and stream that, so the PC never scales. macOS has no public API: use the private `CGVirtualDisplay` approach used by open-source tools (e.g. BetterDisplay, DeskPad), behind a fallback that streams the physical display (scaled, with bars) if it ever breaks.
 - **Text clarity on the Mac host:** check first (start of M3b) whether VideoToolbox can hardware-encode HEVC 4:4:4 on the M4. If not, use 4:2:0 for motion plus still-region refinement (re-encode unchanged areas at very low QP, or send them in a lossless 4:4:4 side path) to meet the §0 still-content target.
 - **Unattended access:** run as a login item. The login window / locked screen is out of scope for v1.
 
@@ -185,8 +188,9 @@ test of smoothness.
   stddev **< 1 ms**, p99 **< 1.5 refresh periods**. The adaptive jitter buffer
   may spend up to 2 frames to get there; glass-to-glass and input → screen
   stay in the §8 Wi-Fi budget. Wired runs are reported for comparison.
-- **Host capture rate = viewer refresh rate** (60 or 120 Hz), aligned to the
-  viewer's vsync phase where possible, instead of the host's 165 Hz. The
+- **Host capture rate = viewer refresh rate** (e.g. 60 Hz for the MacBook
+  Air), aligned to the viewer's vsync phase where possible, instead of the
+  host monitor's own rate (e.g. 144–165 Hz). The
   viewer reports its refresh rate in `Hello`.
 - **Audio:** WASAPI loopback → Opus (10 ms frames, 48 kHz stereo) → UDP with
   its own sequence numbers and FEC; the viewer plays it through CoreAudio with

@@ -271,19 +271,24 @@ display queue, which M5 removes.
 
 ## 9. Milestones
 
-Build PC → Mac first through M3, then add the reverse direction (M3b) before hardening, so `core` is proven symmetric early. §0 sets the priorities: use case A (PC views the Mac) is primary.
+PC → Mac was built first through M3. From there the order follows §0: use
+case A (the PC views the Mac, text always sharp) comes next, then Wi-Fi
+robustness and smoothness, which both use cases need, then gaming (use case B).
+Milestone names are kept stable so earlier results and ADRs still match; the
+numbers give the order. (Reordered 2026-11-20, ADR 0007.)
 
 1. **M0 – Skeleton:** repo layout, `core` crate building for Windows and macOS, Swift app linking `core`, CI build for both.
 2. **M1 – Offline pipeline:** PC captures and encodes to an HEVC file; Mac decodes and renders that file with Metal. Measure encode/decode times.
 3. **M2 – Live stream (unencrypted, LAN):** UDP packetiser, no FEC; live PC video on the Mac. Stats overlay with in-band latency.
 4. **M3 – Input:** mouse and keyboard back-channel, local cursor. Usable PC → Mac remote desktop.
-5. **M3b – Reverse direction:** Mac host (ScreenCaptureKit + VideoToolbox encode + CGEvent) and Windows client (D3D11VA decode + flip-model swap chain + Raw Input). Same protocol, with no changes to `core` beyond bug fixes. Role selection in both apps.
-6. **M4 – Robustness:** FEC (adaptive, interleaved, sized for Wi-Fi), send pacing, DSCP marking, packet-loss simulator in `/tools` with Wi-Fi-like burst loss and delay spikes (replayed from M2/M3 measurements).
-7. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation, capture rate matched to the viewer's refresh, adaptive bitrate, frame-interval metrics against the §5c pacing target on Wi-Fi. Compare against Moonlight and StarDesk.
-   - **M5b – Gaming:** audio (Opus, A/V sync), game controller (GameController → ViGEmBus), relative mouse mode, game-mode overlay. Measured with a real game (§5c).
-8. **M6 – Security:** mDNS discovery, PIN pairing, pinned mutual TLS, encrypted UDP.
-9. **M7 – Clarity:** native-resolution negotiation, 4:4:4 path, scene-change burst, still-region refinement.
-10. **M8 – Extras:** clipboard, virtual display driver integration, direct NVENC SDK path, audio and controller for the Mac-host direction.
+5. **M3b – Reverse direction (use case A):** first check whether VideoToolbox can hardware-encode HEVC 4:4:4 on the M4 (decides the clarity approach). Then the Mac host (ScreenCaptureKit + VideoToolbox encode + CGEvent, with Screen Recording/Accessibility permission checks) and the Windows viewer (D3D11VA decode + flip-model swap chain + Raw Input/keyboard hook + local pointer), full screen on the PC. Same protocol, with no changes to `core` beyond bug fixes. Role selection in both apps.
+6. **M3c – Sharp text, Mac → PC (use case A):** 2560×1440 virtual display on the Mac (`CGVirtualDisplay`, fallback to the physical display), shown 1:1 on the PC; native-resolution negotiation (viewer sends its size in `Hello`); 4:4:4 or still-region refinement; a clarity test card and PSNR measurement against the §0 still-content target (≤ 150 ms to visually lossless). Pulled forward from M7.
+7. **M4 – Robustness (Wi-Fi):** FEC (adaptive, interleaved, sized for Wi-Fi), send pacing, DSCP marking, packet-loss simulator in `/tools` with Wi-Fi-like burst loss and delay spikes (replayed from M2/M3 measurements). Both directions.
+8. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation on both viewers, capture rate matched to the viewer's refresh, adaptive bitrate, frame-interval metrics against the §5c pacing target on Wi-Fi. StarDesk baseline measured before it (§5d). Compare against StarDesk and Moonlight.
+9. **M5b – Gaming (use case B):** audio (Opus, A/V sync), game controller (GameController → ViGEmBus), relative mouse mode, game-mode overlay. Measured with a real Steam game (§5c). The opt-in low-latency Wi-Fi toggle (§5d) goes here if M5 still shows AWDL spikes.
+10. **M6 – Security:** mDNS discovery, PIN pairing, pinned mutual TLS, encrypted UDP. Developer ID signing for both apps.
+11. **M7 – Clarity (rest):** native resolution for PC → Mac (Windows virtual display, IddCx), scene-change burst, still-region refinement on the Windows host.
+12. **M8 – Extras:** clipboard, direct NVENC SDK path, audio and controller for the Mac-host direction.
 
 Each milestone ends with a short written result in `docs/results/Mx.md` (what works, measured numbers, known issues).
 

@@ -77,7 +77,7 @@ final class HostController: NSObject, NSWindowDelegate {
         let permNote = label("After allowing Screen Recording, quit Glass (⌘Q) and open it again.", size: 11)
         permNote.textColor = .secondaryLabelColor
 
-        copyButton = NSButton(title: "Copy Results", target: self, action: #selector(copyResults))
+        copyButton = NSButton(title: "Show Results", target: self, action: #selector(copyResults))
         copyButton.isEnabled = false
         let stop = NSButton(title: "Stop Sharing", target: self, action: #selector(stopSharing))
         let buttons = NSStackView(views: [copyButton, NSView(), stop])
@@ -142,7 +142,7 @@ final class HostController: NSObject, NSWindowDelegate {
                 }
                 self.lastReport = report
                 self.copyButton.isEnabled = true
-                self.statusLabel.stringValue = "Session ended. Copy Results and paste them to Claude. Waiting for the PC…"
+                self.statusLabel.stringValue = "Session ended. Show Results, then Copy results and paste them to Claude. Waiting for the PC…"
             }
             runner = r
             r.start()
@@ -173,8 +173,10 @@ final class HostController: NSObject, NSWindowDelegate {
 
     @objc private func copyResults() {
         guard let r = lastReport else { return }
+        // Show them too: a silent copy looked like nothing happened.
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(r, forType: .string)
+        showResults(r)
     }
 
     @objc private func stopSharing() { window.close() }

@@ -1,5 +1,12 @@
 @echo off
 cd /d "%~dp0"
+if not exist glass.exe (
+  echo glass.exe isn't next to this file. Windows runs a .cmd straight from a zip
+  echo without the rest of it: right-click the zip, Extract All, then run it from
+  echo the extracted folder.
+  pause
+  exit /b 1
+)
 echo Glass: view and control your Mac from this PC.
 echo On the Mac: open Glass and click "Share This Mac". It shows the Mac's address.
 echo The first time, the Mac shows a 6-digit PIN to type here.

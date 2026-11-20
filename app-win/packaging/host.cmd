@@ -1,5 +1,12 @@
 @echo off
 cd /d "%~dp0"
+if not exist glass.exe (
+  echo glass.exe isn't next to this file. Windows runs a .cmd straight from a zip
+  echo without the rest of it: right-click the zip, Extract All, then run it from
+  echo the extracted folder.
+  pause
+  exit /b 1
+)
 rem Ask for administrator rights once, so the Mac can also control admin
 rem windows (Task Manager, installers): Windows drops input into them from a
 rem program that isn't elevated. If the user says No, carry on without.

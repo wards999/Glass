@@ -10,7 +10,8 @@ A **two-way** remote desktop tool between a Windows PC and a Mac on the same LAN
 - keeps **text sharp** enough to read (desktop work, not just games),
 - is good enough to **play games on the PC from the Mac**: no micro-stutter, audio in sync, a game controller and mouse-look work (§5c),
 - shows **clean frames straight away on big screen changes** (minimise/restore, app switching),
-- stays at **very low latency**: about 8–15 ms glass-to-glass on wired gigabit at 120 Hz,
+- works first and best on **home Wi-Fi** (the primary setup; wired is a bonus),
+- stays at **very low latency**: about 20–30 ms glass-to-glass on good 5/6 GHz Wi-Fi at 60 Hz (8–15 ms on wired gigabit at 120 Hz; see §8),
 - needs **no cloud account**: devices pair once and trust each other directly.
 
 ### Non-goals (v1)
@@ -118,12 +119,13 @@ Why this split: networking, FEC and crypto must match exactly on both sides, so 
 Playing a PC game from the Mac is a first-class use case, and the strictest
 test of smoothness.
 
-- **Frame pacing target (measured, not felt):** with the host's capture rate
-  matched to the Mac's refresh, over a 5-minute wired session: **no more than
-  1 in 1000 refreshes without a new frame while the game is producing frames**
-  ("missed refresh"), present-interval stddev **< 1 ms**, p99 **< 1.5 refresh
-  periods**. Glass-to-glass and input → screen stay in the §8 budget. On Wi-Fi,
-  report the same numbers; the adaptive jitter buffer may add up to one frame.
+- **Frame pacing target (measured, not felt), on Wi-Fi:** with the host's
+  capture rate matched to the Mac's refresh, over a 5-minute session on the
+  user's home Wi-Fi: **no more than 1 in 1000 refreshes without a new frame
+  while the game is producing frames** ("missed refresh"), present-interval
+  stddev **< 1 ms**, p99 **< 1.5 refresh periods**. The adaptive jitter buffer
+  may spend up to 2 frames to get there; glass-to-glass and input → screen
+  stay in the §8 Wi-Fi budget. Wired runs are reported for comparison.
 - **Host capture rate = viewer refresh rate** (60 or 120 Hz), aligned to the
   viewer's vsync phase where possible, instead of the host's 165 Hz. The
   viewer reports its refresh rate in `Hello`.
@@ -147,6 +149,33 @@ test of smoothness.
 - Out of scope: anti-cheat that blocks injected input or virtual
   controllers; HDR (later).
 
+## 5d. Wi-Fi first
+
+Home Wi-Fi is the primary network. It adds delay spikes (tens to 100+ ms,
+seen in M2), bursty delivery (frames held then released together), loss, and
+capacity that changes as you move. Design for it:
+
+- **Smooth, don't burst.** Pace each frame's datagrams over a few ms instead
+  of sending ~150 at once (an IDR at 1440p), and keep frame sizes even: cap
+  bursts (scene changes, IDRs) with the rate control, and prefer intra-refresh
+  over full IDRs for recovery where the encoder supports it.
+- **FEC sized for Wi-Fi** (M4): adaptive redundancy driven by measured loss,
+  with interleaving so a short burst of loss doesn't wipe a whole group.
+- **Adaptive bitrate** (M5): the viewer reports loss, delay growth and jitter;
+  the host lowers or raises the target bitrate (and the 4:4:4 → 4:2:0 choice)
+  so the stream fits the link's current capacity instead of building queues.
+  Default ceiling 40–60 Mbps on Wi-Fi.
+- **Jitter buffer** (M5) adapts to the measured arrival jitter, typically
+  0–2 frames on Wi-Fi, 0–1 wired; drops late frames rather than queueing.
+- **Wi-Fi QoS:** mark media and input packets with DSCP (video CS4/AF41, audio
+  and input EF) so WMM-capable routers put them in the video/voice queues.
+- **Mac Wi-Fi quirks:** AWDL (AirDrop/Continuity) makes the Mac's Wi-Fi hop
+  channels and causes periodic latency spikes. Detect the spike pattern and
+  tell the user how to avoid it (turn off AirDrop/Handoff while streaming).
+  Never change system settings ourselves.
+- **Show the link:** the overlay shows Wi-Fi delay spikes, loss and current
+  bitrate, so a bad link is visible as a link problem.
+
 ## 6. Transport protocol
 
 - **Control channel:** TCP + TLS 1.3 using mutual authentication against pinned certificates (rustls on the host, Network.framework or `core` on the client).
@@ -166,17 +195,20 @@ test of smoothness.
 - Host-side setting: "require confirmation for each connection" vs unattended access.
 - Clipboard and audio are off until enabled per paired device.
 
-## 8. Latency budget (targets, wired LAN, 120 Hz)
+## 8. Latency budget (targets)
 
-| Stage | Target |
-|---|---|
-| Capture | 1–2 ms |
-| Encode | 2–5 ms |
-| Packetise + network + FEC | < 1 ms |
-| Jitter buffer | 0–8 ms (adaptive) |
-| Decode | 2–4 ms |
-| Render + scanout | 0–8 ms (refresh-dependent) |
-| **Glass-to-glass** | **≈ 8–15 ms typical** |
+| Stage | Wi-Fi (primary), 60 Hz Mac | Wired gigabit, 120 Hz |
+|---|---|---|
+| Capture | 1–2 ms | 1–2 ms |
+| Encode | 2–5 ms | 2–5 ms |
+| Packetise + pacing + network + FEC | 3–8 ms | < 1 ms |
+| Jitter buffer | 0–33 ms (adaptive, typically one frame) | 0–8 ms |
+| Decode | 2–4 ms | 2–4 ms |
+| Render + scanout | 0–17 ms (refresh-dependent) | 0–8 ms |
+| **Glass-to-glass** | **≈ 20–30 ms typical, p99 < 50 ms** | **≈ 8–15 ms typical** |
+
+M2 measured 48 ms p50 on Wi-Fi at 60 Hz; most of that (32 ms) was the Mac's
+display queue, which M5 removes.
 
 ### Measuring latency
 - In-band: capture timestamp → client present timestamp (clock-synced), shown in the overlay and logged.
@@ -192,8 +224,8 @@ Build PC → Mac first through M3, then add the reverse direction (M3b) before h
 3. **M2 – Live stream (unencrypted, LAN):** UDP packetiser, no FEC; live PC video on the Mac. Stats overlay with in-band latency.
 4. **M3 – Input:** mouse and keyboard back-channel, local cursor. Usable PC → Mac remote desktop.
 5. **M3b – Reverse direction:** Mac host (ScreenCaptureKit + VideoToolbox encode + CGEvent) and Windows client (D3D11VA decode + flip-model swap chain + Raw Input). Same protocol, with no changes to `core` beyond bug fixes. Role selection in both apps.
-6. **M4 – Robustness:** FEC, keyframe requests, packet-loss simulator in `/tools`.
-7. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation, capture rate matched to the viewer's refresh, frame-interval metrics against the §5c pacing target. Compare against Moonlight and StarDesk.
+6. **M4 – Robustness:** FEC (adaptive, interleaved, sized for Wi-Fi), send pacing, DSCP marking, packet-loss simulator in `/tools` with Wi-Fi-like burst loss and delay spikes (replayed from M2/M3 measurements).
+7. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation, capture rate matched to the viewer's refresh, adaptive bitrate, frame-interval metrics against the §5c pacing target on Wi-Fi. Compare against Moonlight and StarDesk.
    - **M5b – Gaming:** audio (Opus, A/V sync), game controller (GameController → ViGEmBus), relative mouse mode, game-mode overlay. Measured with a real game (§5c).
 8. **M6 – Security:** mDNS discovery, PIN pairing, pinned mutual TLS, encrypted UDP.
 9. **M7 – Clarity:** native-resolution negotiation, 4:4:4 path, scene-change burst, still-region refinement.
@@ -209,6 +241,6 @@ Each milestone ends with a short written result in `docs/results/Mx.md` (what wo
 - The UAC/secure desktop on Windows needs a SYSTEM service; out of scope until after M8.
 - Mac as host: Screen Recording + Accessibility permissions, no public virtual-display API, and VideoToolbox gives less rate-control precision than NVENC (check scene-change bursts work in M3b).
 - Key mapping between Windows and macOS (Ctrl/Cmd, Alt/Option, Win key) needs a clear, configurable rule.
-- Wi-Fi jitter: the adaptive buffer must handle it without hurting the wired case.
+- Wi-Fi is the primary network (§5d): delay spikes, bursts, loss and changing capacity are the main threat to smoothness. The adaptive buffer and bitrate must handle them without hurting the wired case. Mac AWDL channel hopping causes periodic spikes we can only detect and explain.
 - Gaming: ViGEmBus is a third-party driver that is no longer actively developed; if it stops installing, look at alternatives (e.g. a UMDF virtual HID device). Some games' anti-cheat rejects injected input or virtual pads. Games that change resolution or go exclusive-fullscreen can interrupt capture (M7's resolution handling).
 - Aspect mismatch: the Mac panel is 16:10 (2940×1912) and the PC monitor 16:9 (2560×1440). PC → Mac full screen shows bars top and bottom; Mac → PC shows bars at the sides, and the Mac's Retina image is scaled to ~75%, so text gets small. Bars-free, 1:1 needs the host to render at the client's shape: a virtual display (Windows IddCx driver, Mac `CGVirtualDisplay`) or a matching host mode (M7/M8).

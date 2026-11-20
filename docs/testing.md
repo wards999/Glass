@@ -23,8 +23,8 @@ screen), ⌃⌥⌘S (stats) and ⌃⌥⌘W (disconnect); everything else goes to
 Send back both results and how it felt (pointer, typing, scrolling).
 
 ## M2 (live stream)
-Same network for both machines; wired Ethernet on the Mac if you have an
-adapter (Wi-Fi works, but without FEC until M4 it shows more glitches).
+Same network for both machines. Wi-Fi is the main setup (5 or 6 GHz if the
+router has it); a wired run is useful only as a comparison.
 1. Windows: unzip, double-click `host.cmd`. Allow glass.exe through Windows
    Firewall on Private networks if asked. Note the address it prints.
 2. Mac: open `Glass.app`, allow Local Network access if asked, type the address,

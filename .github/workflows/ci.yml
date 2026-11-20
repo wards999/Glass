@@ -1,17 +1,54 @@
 name: CI
 
+# Actions minutes are limited (private repo: macOS minutes count 10x, Windows
+# 2x). So: docs-only pushes don't run CI, a newer push cancels an older run,
+# and the Windows/macOS jobs run only when their code (or core) changed.
+# Test-build tags always build and publish everything.
 on:
   push:
     branches: [main]
     # Test builds: push a tag like m1-test1 to publish a prerelease with the
     # Windows zip and Mac dmg.
     tags: ['m*-test*']
+    paths-ignore: ['docs/**', '**/*.md']
   pull_request:
+    paths-ignore: ['docs/**', '**/*.md']
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: what changed
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    outputs:
+      win: ${{ steps.f.outputs.win }}
+      mac: ${{ steps.f.outputs.mac }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: f
+        with:
+          filters: |
+            win:
+              - 'core/**'
+              - 'app-win/**'
+              - 'Cargo.*'
+              - 'scripts/*win*'
+              - 'scripts/fetch-ffmpeg.ps1'
+              - '.github/workflows/**'
+            mac:
+              - 'core/**'
+              - 'app-mac/**'
+              - 'Cargo.*'
+              - 'scripts/*mac*'
+              - '.github/workflows/**'
+
   core:
     name: core (Linux)
     runs-on: ubuntu-latest
@@ -35,6 +72,8 @@ jobs:
 
   app-win:
     name: app-win (Windows)
+    needs: changes
+    if: ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/') || needs.changes.outputs.win == 'true') }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -83,6 +122,8 @@ jobs:
 
   app-mac:
     name: app-mac (macOS)
+    needs: changes
+    if: ${{ !cancelled() && (startsWith(github.ref, 'refs/tags/') || needs.changes.outputs.mac == 'true') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5

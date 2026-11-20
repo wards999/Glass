@@ -58,6 +58,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private var latest: (CVPixelBuffer, FrameTiming)?
     private var stopReason: String?
     private var superseded = 0
+    private var submittedCount = 0 // handed to Core Animation (presented = confirmed on screen)
     private var decodeErrors = 0
     private var usingHardware = false
     private var lastPresentedUs: UInt64 = 0
@@ -181,7 +182,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                     for s in [session, recent] {
                         s.frames += 1
                         s.bytes += bytes.count
-                        s.decode.push(span(t1, t0))
+                        // VideoToolbox time only (as in M1); t0...t1 also covers session setup.
+                        s.decode.push(UInt32(min(dec.lastDecodeSeconds * 1e6, Double(UInt32.max))))
                         s.queue.push(span(t0, meta.last_packet_us))
                         if capture > 0 {
                             s.encode.push(meta.encode_us)
@@ -220,6 +222,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         guard let drawable = layer.nextDrawable(), let cb = renderer.queue.makeCommandBuffer() else { return }
         renderer.encode(pb, to: drawable.texture, in: cb, fit: true)
         let submitted = GlassClock.nowUs()
+        lock.withLock { submittedCount += 1 }
         drawable.addPresentedHandler { [weak self] d in
             guard let self, d.presentedTime > 0 else { return }
             let shown = GlassClock.us(fromMediaTime: d.presentedTime)
@@ -282,8 +285,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             let s = session
             var out = [banner, systemInfo()]
             out.append("Live: \(client.host):\(client.port)  \(streamDesc), \(String(format: "%.1f", secs)) s (ended: \(reason))")
-            out.append(String(format: "  received %ld frames (%.1f fps), presented %ld (%.1f fps), superseded %ld, decode errors %ld",
-                              s.frames, Double(s.frames) / secs, s.presented, Double(s.presented) / secs, superseded, decodeErrors))
+            out.append(String(format: "  received %ld frames (%.1f fps), submitted %ld, presented %ld (%.1f fps), superseded %ld, decode errors %ld",
+                              s.frames, Double(s.frames) / secs, submittedCount, s.presented, Double(s.presented) / secs, superseded, decodeErrors))
             out.append("  packets \(st.rx.packets) | lost frames \(st.rx.frames_lost) | skipped \(st.rx.frames_skipped) | late \(st.rx.late) | dup \(st.rx.duplicates) | bad \(st.rx.bad) | queue full \(st.queue_full) | keyframe requests \(st.keyframe_requests)")
             out.append(String(format: "  bitrate %.1f Mbps avg | clock sync %@ (best RTT %.2f ms, last %.2f ms)",
                               Double(s.bytes) * 8 / secs / 1e6, st.clock_valid ? "ok" : "NOT SYNCED",

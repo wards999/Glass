@@ -536,7 +536,12 @@ fn render_loop(
         if c.info_changes() != seen_changes {
             seen_changes = c.info_changes();
             let new = c.info();
-            if new.chroma != info.chroma || matches!(dec, Dec::Nv(_)) != (new.chroma == CHROMA_444)
+            // A new decoder for every change: NVDEC can't grow past the
+            // size it was opened at (m3c-test3: 2560x1440 -> 2940x1912 failed).
+            let size_changed = new.width != info.width || new.height != info.height;
+            if size_changed
+                || new.chroma != info.chroma
+                || matches!(dec, Dec::Nv(_)) != (new.chroma == CHROMA_444)
             {
                 match make(&new) {
                     Ok(d) => dec = d,

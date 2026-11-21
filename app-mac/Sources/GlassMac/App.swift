@@ -1,7 +1,7 @@
 import AppKit
 import CGlassCore
 import Foundation
-import Symbols
+import QuartzCore
 import GlassKit
 import UniformTypeIdentifiers
 
@@ -897,34 +897,115 @@ final class DeviceRow: LayerView {
     }
 }
 
-/// Shown while no device has been found.
+/// Shown while no device has been found: the same radar as the Windows app
+/// (three rings growing from 24 to 68 pt and fading, a 2.2 s cycle) around
+/// a monitor in a soft accent circle.
 final class EmptyState: LayerView {
     init() {
         super.init()
-        let ring = LayerView(fill: NSColor.controlAccentColor.withAlphaComponent(0.13), stroke: nil, radius: 28)
-        let img = NSImageView(image: NSImage(systemSymbolName: "dot.radiowaves.left.and.right", accessibilityDescription: nil) ?? NSImage())
-        img.symbolConfiguration = .init(pointSize: 22, weight: .regular)
-        img.contentTintColor = .controlAccentColor
-        img.addSymbolEffect(.variableColor.iterative)
-        center(img, in: ring, size: 56)
+        let radar = RadarView()
         let title = NSTextField(labelWithString: "Looking for devices\u{2026}")
-        title.font = .systemFont(ofSize: 14, weight: .semibold)
+        title.font = .systemFont(ofSize: 15, weight: .semibold)
         let note = NSTextField(labelWithString: "Turn on sharing on your Mac or PC and it appears here.")
         note.font = .systemFont(ofSize: 12)
         note.textColor = .secondaryLabelColor
-        let stack = NSStackView(views: [ring, title, note])
+        let stack = NSStackView(views: [radar, title, note])
         stack.orientation = .vertical
         stack.alignment = .centerX
-        stack.spacing = 6
-        stack.setCustomSpacing(14, after: ring)
+        stack.spacing = 8
+        stack.setCustomSpacing(4, after: radar)
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 190),
+            heightAnchor.constraint(equalToConstant: 210),
             stack.centerXAnchor.constraint(equalTo: centerXAnchor),
-            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 8),
         ])
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+}
+
+/// Expanding, fading rings (Core Animation, so no timers or redraws).
+final class RadarView: NSView {
+    private static let side: CGFloat = 140
+    private static let period: CFTimeInterval = 1 / 0.45
+    private let rings = (0..<3).map { _ in CAShapeLayer() }
+    private let dot = CAShapeLayer()
+
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: Self.side, height: Self.side))
+        wantsLayer = true
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: Self.side).isActive = true
+        heightAnchor.constraint(equalToConstant: Self.side).isActive = true
+        layer?.addSublayer(dot)
+        for r in rings {
+            r.fillColor = nil
+            r.lineWidth = 1.5
+            r.opacity = 0
+            layer?.addSublayer(r)
+        }
+        let img = NSImageView(image: NSImage(systemSymbolName: "desktopcomputer", accessibilityDescription: nil) ?? NSImage())
+        img.symbolConfiguration = .init(pointSize: 18, weight: .regular)
+        img.contentTintColor = .controlAccentColor
+        img.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(img)
+        img.centerXAnchor.constraint(equalTo: centerXAnchor).isActive = true
+        img.centerYAnchor.constraint(equalTo: centerYAnchor).isActive = true
+        applyColours()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    private func circle(_ radius: CGFloat) -> CGPath {
+        let c = CGPoint(x: bounds.midX, y: bounds.midY)
+        return CGPath(ellipseIn: CGRect(x: c.x - radius, y: c.y - radius, width: radius * 2, height: radius * 2), transform: nil)
+    }
+
+    private var laidOut = CGRect.null
+
+    override func layout() {
+        super.layout()
+        guard bounds != laidOut else { return }
+        laidOut = bounds
+        dot.frame = bounds
+        dot.path = circle(24)
+        for r in rings { r.frame = bounds }
+        startAnimating()
+    }
+
+    private func startAnimating() {
+        let now = CACurrentMediaTime()
+        for (i, r) in rings.enumerated() {
+            r.removeAllAnimations()
+            let grow = CABasicAnimation(keyPath: "path")
+            grow.fromValue = circle(24)
+            grow.toValue = circle(68)
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 0.55
+            fade.toValue = 0
+            let group = CAAnimationGroup()
+            group.animations = [grow, fade]
+            group.duration = Self.period
+            group.repeatCount = .infinity
+            group.timingFunction = CAMediaTimingFunction(name: .linear)
+            // Staggered by a third so the rings are evenly spaced from the start.
+            group.beginTime = now - Self.period * Double(i) / 3
+            r.add(group, forKey: "radar")
+        }
+    }
+
+    private func applyColours() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let accent = NSColor.controlAccentColor
+            dot.fillColor = accent.withAlphaComponent(0.14).cgColor
+            for r in rings { r.strokeColor = accent.cgColor }
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColours()
+    }
 }

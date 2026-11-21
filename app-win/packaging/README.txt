@@ -6,6 +6,18 @@ any GPU that can decode HEVC. Unzip anywhere; keep the DLLs next to glass.exe.
 Windows SmartScreen may warn because the build isn't signed: click
 "More info" > "Run anyway".
 
+The Glass window (new in this build): double-click glass.exe.
+  - Machines with Glass on your network are listed (Macs and PCs, paired or
+    not). Double-click one, or type an address and press Connect.
+  - The first time, the other machine shows a 6-digit PIN: type it in the box.
+  - Share this PC lets another machine view this one (the window shows the
+    PIN when it pairs). Closing the window while sharing keeps Glass in the
+    tray (bottom right); right-click the tray icon to stop or quit.
+  - Paired devices... lists and forgets pairings.
+  - Restart as administrator: lets the viewer control admin windows too.
+  - Results of each session are saved next to glass.exe and shown at the end.
+  host.cmd and connect.cmd below still work the same way.
+
 Live stream to the Mac:
   1. Double-click host.cmd. It prints this PC's name and address, e.g.
      192.168.1.20. If Windows Firewall asks, allow glass.exe on Private

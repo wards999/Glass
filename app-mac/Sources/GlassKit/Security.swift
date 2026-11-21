@@ -135,6 +135,9 @@ public struct DiscoveredHost: Equatable {
     /// First 8 bytes of the host's certificate fingerprint, hex (from TXT).
     public let fingerprintPrefix: String?
     public let version: String?
+    /// "mac" or "windows" (older builds don't say).
+    public let os: String?
+    public var kind: String { os == "mac" ? "Mac" : os == "windows" ? "PC" : "?" }
 }
 
 /// Lists Glass hosts via Bonjour. Typing an address always works too; some
@@ -154,7 +157,7 @@ public final class GlassBrowser {
                       case let .bonjour(txt) = r.metadata,
                       let ip = txt["ip"] else { return nil }
                 let port = txt["port"].flatMap { UInt16($0) } ?? GlassClient.defaultPort
-                return DiscoveredHost(name: name, address: ip, port: port, fingerprintPrefix: txt["fp"], version: txt["v"])
+                return DiscoveredHost(name: name, address: ip, port: port, fingerprintPrefix: txt["fp"], version: txt["v"], os: txt["os"])
             }.sorted { $0.name < $1.name }
             self?.onChange?(hosts)
         }

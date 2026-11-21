@@ -12,8 +12,9 @@ BIN="$(cd app-mac && swift build -c release --show-bin-path)/GlassMac"
 
 STAGE="$(mktemp -d)"
 APP="$STAGE/Glass.app"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/GlassMac"
+cp app-mac/packaging/Glass.icns "$APP/Contents/Resources/Glass.icns"
 sed -e "s/__VERSION__/$VERSION/" -e "s/__BUILD__/$BUILD/" app-mac/packaging/Info.plist > "$APP/Contents/Info.plist"
 sed -e "s/__VERSION__/$VERSION/" app-mac/packaging/README.txt > "$STAGE/README.txt"
 # Signature: with MAC_SIGN_P12 / MAC_SIGN_PASSWORD (CI secrets) a stable

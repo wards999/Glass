@@ -6,6 +6,7 @@
     <key>CFBundleDisplayName</key><string>Glass</string>
     <key>CFBundleIdentifier</key><string>local.glass.Glass</string>
     <key>CFBundleExecutable</key><string>GlassMac</string>
+    <key>CFBundleIconFile</key><string>Glass</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>__VERSION__</string>
     <key>CFBundleVersion</key><string>__BUILD__</string>

@@ -263,7 +263,18 @@ fn pack(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Double-clicked (no arguments, nobody else on this console): the
+    // Glass window, without a console window behind it.
+    #[cfg(windows)]
+    if args.is_empty() && launched_by_double_click() {
+        if let Err(e) = win::app::run(false) {
+            win_message(&format!("Glass couldn't start: {e}"));
+        }
+        return;
+    }
     let result = match args.first().map(String::as_str) {
+        #[cfg(windows)]
+        Some("app") => win::app::run(args.iter().any(|a| a == "--share")),
         Some("dump") if args.len() == 3 => dump(&args[1], &args[2]),
         Some("pack") => pack(&args[1..]),
         Some("probe") => probe::probe(&args[1..]),
@@ -289,5 +300,37 @@ fn main() {
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// True when this process got a console of its own (Explorer double-click),
+/// in which case it's let go so no black window stays open.
+#[cfg(windows)]
+fn launched_by_double_click() -> bool {
+    use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    let mut ids = [0u32; 4];
+    let n = unsafe { GetConsoleProcessList(&mut ids) };
+    if n == 1 {
+        unsafe {
+            let _ = FreeConsole();
+        }
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn win_message(text: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let t: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(t.as_ptr()),
+            windows::core::w!("Glass"),
+            MB_OK | MB_ICONERROR,
+        );
     }
 }

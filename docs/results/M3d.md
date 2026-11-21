@@ -60,3 +60,28 @@ settings; the Mac menu-bar icon; the Mac viewer's bar; the app icon.
   - After the PC disconnects, Mac → PC works.
 - Also fixed: the Mac viewer's report showed "0x0" after the session closed.
 
+## m3d-test4: the Glass window on Windows, icon, machine list
+- **Double-clicking glass.exe opens the Glass window.** Its console is
+  released, so no black window stays open. Arguments still run the command
+  line.
+- **The window:**
+  - A list of Glass machines on the network, found with DnsServiceBrowse /
+    Resolve. Each row shows name, Mac/PC, address, and paired or not; this PC
+    itself is left out.
+  - An address box, Connect, Refresh.
+  - Share this PC (with the PIN shown large while pairing), Paired
+    devices… (Forget), Restart as administrator.
+  - Session results are shown, can be copied, and are saved next to
+    glass.exe.
+  - A tray icon: closing the window while sharing keeps Glass running; the
+    tray menu has Open, Share/Stop, Quit.
+- **The app icon** (`scripts/make-icons.py`, from the chosen design) is built
+  into glass.exe and Glass.app.
+- **The Mac's list** shows every Glass machine (Mac or PC) and leaves out
+  this Mac. Hosts announce `os` in TXT.
+- `glass find` lists hosts from the command line.
+- Checked here: the window opens, finds a local host and shows it as a
+  paired PC; captured with `GLASS_DEBUG_SHOT`:
+
+![Glass window](img/m3d-app-window.png)
+

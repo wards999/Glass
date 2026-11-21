@@ -10,6 +10,22 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M3d test 4 (the Glass window, machine list, no loops)
+Use the zip and dmg from the same test build (protocol v7). Extract the zip
+on both PCs.
+1. **PC:** double-click **glass.exe**. The Glass window opens (no console),
+   with the icon. The Mac (sharing) and the other PC (if sharing) appear in
+   the list.
+2. **Connect** by double-clicking the Mac in the list. The PIN dialog
+   appears the first time. Use the bar, then disconnect: the results appear.
+3. **Share this PC** in the window. Connect from the Mac (its list now says
+   "(PC)"). Close the PC window while sharing: Glass stays in the tray.
+4. **No loops:** while the PC views the Mac, on the Mac (in the remote view)
+   connect back to the PC. It must refuse with "that would make a loop".
+5. **PC → PC** with the second PC: Share this PC on one, connect from the
+   other's list.
+6. Send the results (copied from the windows) and anything that felt wrong.
+
 ## M3d test 2 (control bar both ways, any pair)
 Use the zip and dmg from the same test build (protocol v6).
 1. **PC views the Mac** (connect.cmd):

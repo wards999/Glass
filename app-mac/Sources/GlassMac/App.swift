@@ -172,11 +172,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             return
         }
         foundPopup.isEnabled = true
-        foundPopup.addItem(withTitle: "Choose a PC…")
+        foundPopup.addItem(withTitle: "Choose a machine…")
         for h in found {
             let paired = GlassDevice.shared?.pairedHost(prefix: h.fingerprintPrefix) != nil
             let v = h.version.map { $0 == String(glass_protocol_version()) ? "" : "  (different Glass version)" } ?? ""
-            foundPopup.addItem(withTitle: "\(h.name) — \(h.address)\(paired ? "  ✓ paired" : "")\(v)")
+            foundPopup.addItem(withTitle: "\(h.name) (\(h.kind)) — \(h.address)\(paired ? "  ✓ paired" : "")\(v)")
         }
     }
 
@@ -194,12 +194,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         w.isReleasedWhenClosed = false
         w.delegate = self
 
-        let foundLabel = NSTextField(labelWithString: "PCs running Glass on this network:")
+        let foundLabel = NSTextField(labelWithString: "Machines with Glass on this network:")
         foundPopup = NSPopUpButton(frame: .zero, pullsDown: false)
         foundPopup.target = self
         foundPopup.action = #selector(pickFound(_:))
         browser.onChange = { [weak self] hosts in
-            self?.found = hosts
+            // Not this Mac itself.
+            let mine = GlassDevice.shared?.fingerprintHexPrefix ?? "-"
+            self?.found = hosts.filter { $0.fingerprintPrefix?.lowercased() != mine }
             self?.refreshFound()
         }
         let label = NSTextField(labelWithString: "Or the PC's address (host.cmd on the PC shows it):")

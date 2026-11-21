@@ -1,6 +1,7 @@
 //! Windows-only pieces. Host: D3D11 device, Windows.Graphics.Capture, NVENC,
 //! input injection. Viewer (`viewer.rs`): D3D11VA decode, flip-model present.
 
+pub mod app;
 mod bar;
 mod blocker;
 pub mod browse;

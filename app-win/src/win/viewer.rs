@@ -126,14 +126,14 @@ thread_local! {
 }
 
 /// Saves the top 300 px of `hwnd`'s area on screen as a 24-bit BMP (debug).
-unsafe fn save_shot(hwnd: HWND, path: &std::path::Path) {
+pub(super) unsafe fn save_shot(hwnd: HWND, path: &std::path::Path) {
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetDIBits, ReleaseDC,
         SelectObject, BITMAPINFOHEADER, BI_RGB, SRCCOPY,
     };
     let mut r = RECT::default();
     let _ = GetWindowRect(hwnd, &mut r);
-    let (w, h) = (r.right - r.left, (r.bottom - r.top).min(300));
+    let (w, h) = (r.right - r.left, (r.bottom - r.top).min(800));
     if w <= 0 || h <= 0 {
         return;
     }

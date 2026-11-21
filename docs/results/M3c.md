@@ -78,6 +78,41 @@ picture was ready.
 2. **Wrapped timings:** frame times ahead of the clock wrapped to 4294967 ms
    in encode p99 and capture delivery. Fixed by saturating at 0.
 
-## Measured — m3c-test2
-_Pending: 4:4:4 for real, the user's preferred view, and whether the Mac's
-screen returns to normal._
+## Measured — m3c-test2 / test3
+- **test2:** still 4:2:0. The session used the low-latency encoder, which
+  only does 4:2:0. Fixed in test3 by using the plain hardware encoder for
+  4:4:4, plus a self-check that switches to 4:2:0 if the encoder makes it
+  anyway.
+- **test3:** real 4:4:4 at 2560×1440, then failures when the Mac's own
+  2940×1912 view came back (NVDEC can't grow past its first size). Fixed in
+  test4: a new decoder on every size change.
+- The user confirmed the Mac's screen returns to normal after sharing.
+  Asked which view was best: no clear difference, except that "fit" filling
+  the PC screen without black bars was good, so it is now the default.
+
+## Measured — m3c-test4 (194 s; 4:4:4 in every view)
+4:4:4 held through three rounds of all four views: **0 decode errors, 0 lost
+frames**, NVDEC on the PC. But it costs a lot:
+
+| | 4:2:0 (test3) | 4:4:4 (test4) |
+|---|---|---|
+| Mac: capture delivery p50 | ~0 ms | **17.8 ms** (p99 75 ms) |
+| Mac: VideoToolbox p50 | 12.6 ms (low-latency RC) | 13.7 ms (plain) |
+| PC decode p50 | 1.7 ms | 4.2 ms |
+| capture → screen p50 | 19.0 ms | **43.1 ms** |
+| input → screen p50 | 32.9 ms | 30.5 ms |
+| bitrate avg | 4.9 Mbps | **27.6 Mbps** |
+| sharpness: luma PSNR p50 / ≥ 45 dB | 49.9 dB / 91 % | **38.8 dB / 23 %** |
+
+- **The encoder isn't the problem:** only about 1 ms slower.
+- **Capture is the problem:** ScreenCaptureKit hands over full-colour (BGRA)
+  frames about a frame later than 4:2:0 ones, because it has no 4:4:4 YCbCr
+  output.
+- **Sharpness drops:** 4:4:4 at the same 40 Mbps cap has more data per frame
+  to compress, so PSNR falls during changes. Without still-region refinement
+  the last frame's quality stays on screen.
+- **Conclusion:** at these settings 4:4:4 is slower and not sharper per
+  frame. Default 4:2:0; 4:4:4 is a choice (`--colour`, Ctrl+Alt+Shift+C).
+- **What would make 4:4:4 worth it:** a faster capture path, a higher bitrate
+  or refinement while the screen is still (M5, or M7 for still-region
+  refinement).

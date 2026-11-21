@@ -15,8 +15,9 @@ frames failed.
     the mode it wants. `SetMode` changes the mode mid-session, and the host
     answers with `StreamChange` plus an IDR.
   - The modes are:
-    - **0, the host's own screen:** as in M3b, and the default.
+    - **0, the host's own screen:** as in M3b.
     - **1, fit like now:** a HiDPI virtual display, "looks like" viewer ÷ 1.5.
+      The default for a new host (user's choice after m3c-test1: no black bars).
     - **2, more space:** 1×.
     - **3, larger:** 2×.
   - Modes 1–3 are captured at the viewer's exact pixel size, so the PC shows

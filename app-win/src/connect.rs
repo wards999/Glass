@@ -1,7 +1,7 @@
 //! `glass connect`: pair with a host if needed, then view and control it.
 //!
 //! `glass connect [HOST[:PORT]] [--pin PIN] [--seconds S] [--windowed]
-//!                [--keys pc|labelled] [--log FILE]`
+//!                [--keys pc|labelled] [--view mac|fit|space|larger] [--log FILE]`
 //!
 //! View modes (M3c): Ctrl+Alt+Shift+R while viewing cycles the host's own
 //! screen and three "fit to this PC" sizes; the last one is remembered per
@@ -40,6 +40,7 @@ fn parse_address(s: &str) -> Res<(String, u16)> {
 
 pub fn connect(args: &[String]) -> Res<()> {
     let (mut addr, mut pin, mut seconds, mut log) = (None, None, None, None);
+    let mut view: Option<u8> = None;
     let mut opts = Options {
         windowed: false,
         seconds: None,
@@ -53,6 +54,15 @@ pub fn connect(args: &[String]) -> Res<()> {
             "--seconds" => seconds = Some(val()?.parse::<f64>()?),
             "--log" => log = Some(val()?.clone()),
             "--windowed" => opts.windowed = true,
+            "--view" => {
+                view = Some(match val()?.as_str() {
+                    "mac" | "host" => 0,
+                    "fit" => 1,
+                    "space" => 2,
+                    "larger" => 3,
+                    v => return Err(format!("--view {v}: use mac, fit, space or larger").into()),
+                })
+            }
             "--keys" => {
                 opts.rule = match val()?.as_str() {
                     "pc" => PcModifierRule::PcStyle,
@@ -97,7 +107,8 @@ pub fn connect(args: &[String]) -> Res<()> {
     let (host, port) = parse_address(&addr)?;
     let err = |e: ConnectError| -> Box<dyn Error> { format!("{host}:{port}: {e}").into() };
     let modes_file = default_dir().unwrap_or_default().join("view-modes.txt");
-    let mode = saved_mode(&modes_file, &addr);
+    // --view wins; otherwise the view last used with this host.
+    let mode = view.unwrap_or_else(|| saved_mode(&modes_file, &addr));
     let prep = viewer::prepare(mode)?;
     let hello = prep.hello;
 
@@ -167,7 +178,8 @@ pub fn connect(args: &[String]) -> Res<()> {
     Ok(())
 }
 
-/// The view mode last used with `addr` (0 = the host's own screen).
+/// The view mode last used with `addr`; new hosts start in "fit" (fills
+/// this screen, no black bars).
 fn saved_mode(file: &std::path::Path, addr: &str) -> u8 {
     std::fs::read_to_string(file)
         .unwrap_or_default()
@@ -175,7 +187,7 @@ fn saved_mode(file: &std::path::Path, addr: &str) -> u8 {
         .filter_map(|l| l.rsplit_once(' '))
         .find(|(a, _)| *a == addr)
         .and_then(|(_, m)| m.parse().ok())
-        .unwrap_or(0)
+        .unwrap_or(glass_core::protocol::MODE_FIT)
 }
 
 fn save_mode(file: &std::path::Path, addr: &str, mode: u8) {
@@ -197,7 +209,7 @@ mod tests {
     fn modes_are_remembered_per_address() {
         let f = std::env::temp_dir().join(format!("glass-modes-{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&f);
-        assert_eq!(saved_mode(&f, "192.168.4.28"), 0);
+        assert_eq!(saved_mode(&f, "192.168.4.28"), 1); // new host: fit
         save_mode(&f, "192.168.4.28", 2);
         save_mode(&f, "mac.local:47811", 1);
         save_mode(&f, "192.168.4.28", 3);

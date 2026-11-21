@@ -33,6 +33,7 @@ View and control the Mac from this PC (connect.cmd):
      Ctrl+Alt+Shift+F   window / full screen
      Ctrl+Alt+Shift+R   view: the Mac's screen, or fit to this PC (like now /
                         more space / larger); remembered for that Mac
+  To start in a particular view:  connect.cmd --view mac   (or fit, space, larger)
      Ctrl+Alt+Shift+Q   disconnect (results print here and go to results-viewer.txt)
   Every other key goes to the Mac. Ctrl acts as Cmd (Ctrl+C copies), Win as
   Ctrl, Alt as Option. For a PC host instead: connect.cmd --keys labelled.

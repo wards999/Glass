@@ -568,6 +568,8 @@ machine, so nothing unpaired may connect.)
 12. **M5b – Gaming (use case B):** audio (Opus, A/V sync), game controller (GameController → ViGEmBus), relative mouse mode, game-mode overlay, even cadence (vsync-locked sampling, cadence-error metric, frame-cap hint; §5c). Measured with a real Steam game (§5c). The opt-in low-latency Wi-Fi toggle (§5d) goes here if M5 still shows AWDL spikes.
 13. **M7 – Clarity (rest):** native resolution for PC → Mac (Windows virtual display, IddCx, at the viewer's size **and refresh**, so games lock to the Mac's rate), scene-change burst, still-region refinement on the Windows host.
 14. **M8 – Extras:** direct NVENC SDK path, audio and controller for the Mac-host direction.
+15. **M9 – iPad viewer (future):** view and control a Mac or PC host from an iPad. Reuses `core` (Rust, built for iOS) and the Mac viewer's Swift pieces (VideoToolbox decode, Metal, the control bar); touch mapped to pointer gestures (tap = click, two-finger scroll, long press = right click, drag), on-screen and hardware keyboards, Magic Keyboard/trackpad and Pencil as pointer. Pairing and encryption as everywhere. Viewer only: iPadOS can't be remote-controlled.
+16. **M10 – Android viewer (future, maybe):** the same for Android phones and tablets: `core` via JNI, MediaCodec decode, touch and keyboard input. Viewer only.
 
 Each milestone ends with a short written result in `docs/results/Mx.md` (what works, measured numbers, known issues).
 

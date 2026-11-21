@@ -1470,17 +1470,15 @@ impl GlassApp {
                         .corner_radius(CornerRadius::same(10))
                         .inner_margin(Margin::same(12))
                         .show(ui, |ui| {
-                            egui::ScrollArea::both()
-                                .max_height(320.0)
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(text.as_str()).monospace().size(12.0),
-                                        )
-                                        .extend()
-                                        .selectable(true),
-                                    );
-                                });
+                            egui::ScrollArea::both().max_height(320.0).show(ui, |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(text.as_str()).monospace().size(12.0),
+                                    )
+                                    .extend()
+                                    .selectable(true),
+                                );
+                            });
                         });
                     ui.add_space(8.0);
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

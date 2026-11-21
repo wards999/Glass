@@ -1,4 +1,4 @@
-// Windows resources for glass.exe: the app icon (resource 1, also used for
+// Windows resources for Glass.exe (the app): the app icon (resource 1, also used for
 // windows and the tray) and the manifest (modern controls, per-monitor DPI).
 1 ICON "packaging/glass.ico"
 1 24 "glass.manifest"

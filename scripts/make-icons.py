@@ -49,6 +49,17 @@ SMALL = [
 ]
 
 
+# glass-cli.exe: the same pane with a terminal badge (">_") in the corner, so
+# it can't be mistaken for Glass.exe.
+CLI_BADGE = [
+    ('rrect', (500, 540, 400, 360, 70), '#0E1726', 1.0, False),
+    ('ring', ((500, 540, 400, 360, 70), (518, 558, 364, 324, 52)), '#DDEEFF', 0.9, False),
+    ('quad', [(585, 640), (640, 640), (725, 730), (670, 730)], '#FFFFFF', 1.0, False),
+    ('quad', [(670, 730), (725, 730), (640, 820), (585, 820)], '#FFFFFF', 1.0, False),
+    ('rrect', (735, 786, 125, 36, 8), '#FFFFFF', 1.0, False),
+]
+
+
 def rrect_mask(X, Y, g):
     x, y, w, h, r = g
     cx, cy = x + w / 2, y + h / 2
@@ -138,6 +149,21 @@ def main():
     with open(path, 'wb') as f:
         f.write(ico + entries + b''.join(pngs))
     print('wrote', path)
+
+    # glass-cli.exe: the same sizes with the terminal badge.
+    cli = [png(render(s, (SMALL if s <= 32 else FULL) + CLI_BADGE, win_crop)) for s in sizes]
+    ico = struct.pack('<HHH', 0, 1, len(sizes))
+    offset = 6 + 16 * len(sizes)
+    entries = b''
+    for s, p in zip(sizes, cli):
+        entries += struct.pack('<BBBBHHII', s % 256, s % 256, 0, 0, 1, 32, len(p), offset)
+        offset += len(p)
+    path = os.path.join(ROOT, 'app-win', 'packaging', 'glass-cli.ico')
+    with open(path, 'wb') as f:
+        f.write(ico + entries + b''.join(cli))
+    print('wrote', path)
+    with open(os.path.join(ROOT, 'design', 'icon', 'glass-cli-icon-256.png'), 'wb') as f:
+        f.write(png(render(256, FULL + CLI_BADGE, win_crop)))
 
     # macOS: the full 1024 grid (the design already keeps Apple's margin).
     mac_crop = (0, 0, 1024, 1024)

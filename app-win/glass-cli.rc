@@ -1,0 +1,4 @@
+// Windows resources for glass-cli.exe: its own icon (the pane with a terminal
+// badge, so it isn't mistaken for Glass.exe) and the same manifest.
+1 ICON "packaging/glass-cli.ico"
+1 24 "glass.manifest"

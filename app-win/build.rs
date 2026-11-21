@@ -10,7 +10,12 @@ fn main() {
     println!("cargo:rerun-if-changed=glass.rc");
     println!("cargo:rerun-if-changed=glass.manifest");
     println!("cargo:rerun-if-changed=packaging/glass.ico");
-    let _ = embed_resource::compile("glass.rc", embed_resource::NONE);
+    println!("cargo:rerun-if-changed=glass-cli.rc");
+    println!("cargo:rerun-if-changed=packaging/glass-cli.ico");
+    // Each exe its own icon: Glass.exe the app's, glass-cli.exe with a
+    // terminal badge.
+    let _ = embed_resource::compile_for("glass.rc", ["Glass"], embed_resource::NONE);
+    let _ = embed_resource::compile_for("glass-cli.rc", ["glass-cli"], embed_resource::NONE);
     let Ok(dir) = std::env::var("FFMPEG_DIR") else {
         return;
     };

@@ -7,7 +7,7 @@
 //! - UI thread: the window, a low-level keyboard hook (so Win, Alt+Tab and
 //!   friends go to the host while the window is in front), mouse messages,
 //!   and the host's pointer shape as this PC's own cursor (no round trip).
-//! - A control bar drops down from the top edge (`bar.rs`): view, colour,
+//! - A control bar drops down from a floating handle (`bar.rs`): view, colour,
 //!   full screen, pin, disconnect, status.
 //! - Local chords, never sent: Ctrl+Alt+Shift+F full screen/window,
 //!   Ctrl+Alt+Shift+R next view mode (M3c), Ctrl+Alt+Shift+Q disconnect.
@@ -16,7 +16,7 @@
 //!
 //! LATER(M5): on-screen stats overlay; display-linked pacing.
 
-use super::bar::{self, Bar};
+use super::bar::{self, Bar, Handle};
 use super::decode::{Decoder, Picture};
 use super::decode444::{self, CudaDecoder, Planar};
 use super::present::{fit, Presenter};
@@ -257,6 +257,7 @@ struct Ui {
     notice: u8,
     /// The drop-down control bar, and when the pointer was last on it.
     bar: Option<Bar>,
+    handle: Option<Handle>,
     bar_seen_us: u64,
     last_bar_status_us: u64,
 }
@@ -828,6 +829,7 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
             render_done: false,
             notice: NOTICE_NONE,
             bar: Bar::new(hwnd).ok(),
+            handle: Handle::new(hwnd, load_handle_frac()).ok(),
             bar_seen_us: 0,
             last_bar_status_us: 0,
         })
@@ -852,6 +854,20 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
     }
     SetTimer(Some(hwnd), TIMER_CURSOR, 15, None);
     Ok(hwnd)
+}
+
+/// Where the bar's handle sits across the top (0..1), kept between sessions.
+fn load_handle_frac() -> f64 {
+    glass_core::identity::default_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("bar-handle.txt")).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0.5)
+}
+
+fn save_handle_frac(f: f64) {
+    if let Some(d) = glass_core::identity::default_dir() {
+        let _ = std::fs::write(d.join("bar-handle.txt"), format!("{f:.3}"));
+    }
 }
 
 impl Ui {
@@ -912,10 +928,23 @@ impl Ui {
     fn show_bar(&mut self) {
         self.update_bar();
         let r = self.client_on_screen();
+        let centre = self
+            .handle
+            .as_ref()
+            .map_or((r.left + r.right) / 2, |h| h.centre_x());
         if let Some(bar) = &mut self.bar {
-            bar.show(r);
+            bar.show(r, centre);
+        }
+        if let Some(h) = &mut self.handle {
+            h.hide();
         }
         self.bar_seen_us = clock::now_us();
+    }
+
+    fn hide_bar(&mut self) {
+        if let Some(b) = &mut self.bar {
+            b.hide();
+        }
     }
 
     /// Hides the bar once the pointer has left it for a moment (unless pinned).
@@ -926,6 +955,11 @@ impl Ui {
             None => return,
         };
         if !visible {
+            // The handle follows the window (moves, resizes, full screen).
+            let c = self.client_on_screen();
+            if let Some(h) = &mut self.handle {
+                h.place(c);
+            }
             return;
         }
         if now.saturating_sub(self.last_bar_status_us) > 500_000 {
@@ -942,9 +976,7 @@ impl Ui {
         if near || pinned {
             self.bar_seen_us = now;
         } else if now.saturating_sub(self.bar_seen_us) > 700_000 {
-            if let Some(b) = &mut self.bar {
-                b.hide();
-            }
+            self.hide_bar();
         }
     }
 
@@ -972,6 +1004,20 @@ impl Ui {
                 self.toggle_fullscreen();
                 if self.bar.as_ref().is_some_and(|b| b.visible) {
                     self.show_bar();
+                }
+            }
+            bar::ID_HANDLE => {
+                if self.bar.as_ref().is_some_and(|b| b.visible) {
+                    self.hide_bar();
+                } else {
+                    self.show_bar();
+                }
+            }
+            bar::ID_HANDLE_MOVED => {
+                let c = self.client_on_screen();
+                if let Some(h) = &mut self.handle {
+                    h.moved(c);
+                    save_handle_frac(h.frac);
                 }
             }
             bar::ID_PIN => {
@@ -1202,10 +1248,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (x, y) = xy(lparam);
                 let (nx, ny) = ui.to_host(x, y);
                 c.input_move(nx, ny);
-                // Pointer at the very top edge: show the control bar.
-                if y <= 1 && ui.buttons == 0 && !ui.bar.as_ref().is_some_and(|b| b.visible) {
-                    ui.show_bar();
-                }
                 Some(LRESULT(0))
             }
             bar::WM_BAR_COMMAND => {

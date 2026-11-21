@@ -66,6 +66,8 @@ struct Args {
     local: bool,
     /// Ask on the console before each (paired) viewer connects.
     ask: bool,
+    /// A fixed pairing PIN (tests and local checks only).
+    pin: Option<String>,
     out: String,
 }
 
@@ -79,6 +81,7 @@ fn parse(args: &[String]) -> Res<Args> {
         log: None,
         local: false,
         ask: false,
+        pin: None,
         out: String::new(),
     };
     let mut it = args.iter();
@@ -92,6 +95,7 @@ fn parse(args: &[String]) -> Res<Args> {
             "--log" => a.log = Some(val()?.to_string()),
             "--local" => a.local = true,
             "--ask" => a.ask = true,
+            "--pin" => a.pin = Some(val()?.to_string()),
             "--chroma" => {
                 a.chroma444 = match val()?.as_str() {
                     "444" => true,
@@ -425,7 +429,7 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
         None
     };
     let opts = HostOptions {
-        fixed_pin: None,
+        fixed_pin: a.pin.clone(),
         ask,
         events: event,
         host_os: glass_core::protocol::HOST_OS_WINDOWS,

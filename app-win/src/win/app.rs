@@ -1563,7 +1563,7 @@ impl GlassApp {
                         p,
                     );
                     ui.label(
-                        RichText::new("Fast has the lowest lag. Full colour is exact but adds some lag. Both can be switched while viewing, from the bar at the top edge.")
+                        RichText::new("Fast has the lowest lag. Full colour is exact but adds some lag. Both can be switched while viewing, from the handle at the top of the viewer.")
                             .size(12.5)
                             .color(p.weak),
                     );

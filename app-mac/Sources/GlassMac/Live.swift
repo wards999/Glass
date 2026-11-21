@@ -60,6 +60,12 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     /// ⌘ -> Win, ⌃ -> Ctrl instead of the default ⌘ -> Ctrl, ⌃ -> Win.
     var pcStyleModifiers = UserDefaults.standard.bool(forKey: "pcStyleModifiers")
     private var bar: ControlBar?
+    private var handle: BarHandle?
+    private var barCentre: NSLayoutConstraint?
+    private var handleFrac: CGFloat = {
+        let v = UserDefaults.standard.object(forKey: "barHandleFrac") as? Double
+        return CGFloat(v ?? 0.5)
+    }()
     private var barSeen: UInt64 = 0
     private var lastBarUpdate: UInt64 = 0
     private var seenChanges: UInt32 = 0 // main thread
@@ -163,11 +169,32 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         bar.isHidden = true
         bar.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(bar)
+        // Centred under the handle, but always inside the view.
+        let barCentre = bar.centerXAnchor.constraint(equalTo: view.centerXAnchor)
+        barCentre.priority = .defaultHigh
         NSLayoutConstraint.activate([
-            bar.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            barCentre,
+            bar.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor),
+            bar.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor),
             bar.topAnchor.constraint(equalTo: view.topAnchor, constant: 0),
         ])
         self.bar = bar
+        self.barCentre = barCentre
+
+        let handle = BarHandle()
+        view.addSubview(handle)
+        let centre = handle.centerXAnchor.constraint(equalTo: view.centerXAnchor)
+        handle.centre = centre
+        NSLayoutConstraint.activate([centre, handle.topAnchor.constraint(equalTo: view.topAnchor, constant: 6)])
+        handle.onClick = { [weak self] in
+            guard let self, let bar = self.bar else { return }
+            if bar.isHidden { self.showBar() } else { self.hideBar() }
+        }
+        handle.onMoved = { [weak self] f in
+            self?.handleFrac = f
+            UserDefaults.standard.set(Double(f), forKey: "barHandleFrac")
+        }
+        self.handle = handle
 
         window.contentView = view
         window.center()
@@ -194,10 +221,12 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         t.start()
     }
 
-    private var statsHidden = false
+    /// Stats are off unless chosen (bar or ⌃⌥⌘S); the choice is kept.
+    private var statsHidden = !UserDefaults.standard.bool(forKey: "showStats")
 
     func toggleOverlay() {
         statsHidden.toggle()
+        UserDefaults.standard.set(!statsHidden, forKey: "showStats")
         overlay?.isHidden = statsHidden
     }
 
@@ -222,6 +251,13 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         stop("viewer closed")
     }
 
+    /// Full screen without macOS's menu bar sliding down at the top edge (it
+    /// covered the control bar); the handle and bar give full screen,
+    /// disconnect and the rest.
+    func window(_ window: NSWindow, willUseFullScreenPresentationOptions proposedOptions: NSApplication.PresentationOptions = []) -> NSApplication.PresentationOptions {
+        [.fullScreen, .hideDock, .hideMenuBar]
+    }
+
     /// Switching away (⌘Tab, another window): let go of everything on the PC.
     func windowDidResignKey(_ notification: Notification) {
         keysHeldWithCommand.removeAll()
@@ -231,6 +267,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private func updateDrawableSize() {
         guard let layer, let view else { return }
         layer.contentsScale = view.window?.backingScaleFactor ?? layer.contentsScale
+        // Keep the handle at its place across the (new) width.
+        handle?.centre?.constant = (handleFrac - 0.5) * max(0, view.bounds.width - BarHandle.size.width)
         let px = view.convertToBacking(view.bounds).size
         if px.width >= 1, px.height >= 1, layer.drawableSize != px { layer.drawableSize = px }
         // Picture rect in view points, for the cursor area.
@@ -257,8 +295,6 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         switch e.type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             client.move(x: x, y: y)
-            // Pointer at the top edge: drop the control bar down.
-            if e.type == .mouseMoved, view.bounds.height - p.y <= 3, let bar, bar.isHidden { showBar() }
         case .leftMouseDown, .leftMouseUp:
             // ⌃-click is a right-click on a Mac; on the PC it's Win+click, so don't translate.
             client.button(.left, down: e.type == .leftMouseDown, x: x, y: y)
@@ -425,8 +461,15 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private func showBar() {
         guard let bar else { return }
         updateBar()
+        barCentre?.constant = handle?.centre?.constant ?? 0
         bar.isHidden = false
+        handle?.isHidden = true
         barSeen = GlassClock.nowUs()
+    }
+
+    private func hideBar() {
+        bar?.isHidden = true
+        handle?.isHidden = false
     }
 
     private func tickBar() {
@@ -437,7 +480,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             if bar.bounds.insetBy(dx: -12, dy: -12).contains(p) || bar.pinned { barSeen = now }
         }
         if now &- barSeen > 700_000 {
-            bar.isHidden = true
+            hideBar()
         } else if now &- lastBarUpdate > 500_000 {
             updateBar()
         }

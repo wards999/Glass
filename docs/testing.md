@@ -50,13 +50,13 @@ on both PCs.
 ## M3d test 2 (control bar both ways, any pair)
 Use the zip and dmg from the same test build (protocol v6).
 1. **PC views the Mac** (connect.cmd):
-   - Open the bar from the top edge.
+   - Open the bar from the handle at the top.
    - Views and both colour modes should work.
    - Keys: Ctrl acts as ⌘.
    - Drag windows for a minute or two in each colour mode; the lag must stay
      steady.
 2. **Mac views the PC** (Glass on the Mac ▸ Connect; host.cmd on the PC):
-   - Move the pointer to the top edge to open the bar.
+   - Click the handle at the top to open the bar.
    - The fit views are greyed out (a PC can only show its own screen).
    - Fast ↔ Full colour should switch, and the PC window says "Viewer
      switched to …".

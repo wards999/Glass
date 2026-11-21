@@ -246,7 +246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                                         target: self, action: #selector(pickColour(_:)))
         colour.selectedSegment = UserDefaults.standard.bool(forKey: "fullColour") ? 1 : 0
         colour.segmentDistribution = .fillEqually
-        let note = NSTextField(wrappingLabelWithString: "Fast has the lowest lag. Full colour is exact but adds some lag. Both can be switched while viewing, from the bar at the top edge.")
+        let note = NSTextField(wrappingLabelWithString: "Fast has the lowest lag. Full colour is exact but adds some lag. Both can be switched while viewing, from the handle at the top of the viewer.")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
         var views: [NSView] = [heading("Settings", 17), heading("Appearance"), theme,

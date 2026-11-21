@@ -1301,20 +1301,27 @@ impl eframe::App for GlassApp {
                 }
 
                 // A typed address, tucked away.
+                // The link stays and toggles it (same as the Mac); Esc closes it too.
                 ui.add_space(2.0);
-                if !self.show_address {
-                    let link = ui.add(
-                        egui::Label::new(
-                            RichText::new("+  Connect by address")
-                                .size(13.5)
-                                .color(p.accent),
-                        )
-                        .sense(Sense::click()),
-                    );
-                    if link.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                        self.show_address = true;
-                    }
-                } else {
+                let link = ui.add(
+                    egui::Label::new(
+                        RichText::new(if self.show_address {
+                            "\u{2212}  Connect by address"
+                        } else {
+                            "+  Connect by address"
+                        })
+                        .size(13.5)
+                        .color(p.accent),
+                    )
+                    .sense(Sense::click()),
+                );
+                if link.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    self.show_address = !self.show_address;
+                }
+                if self.show_address && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.show_address = false;
+                }
+                if self.show_address {
                     ui.horizontal(|ui| {
                         let r = ui.add(
                             egui::TextEdit::singleline(&mut self.address)

@@ -25,6 +25,7 @@ pub const ID_420: usize = 110;
 pub const ID_444: usize = 111;
 pub const ID_FULLSCREEN: usize = 120;
 pub const ID_PIN: usize = 121;
+pub const ID_STATS: usize = 123;
 pub const ID_DISCONNECT: usize = 122;
 const ID_STATUS: usize = 130;
 
@@ -185,6 +186,7 @@ impl Bar {
         )?;
         x.set(x.get() + px(10));
         add("Full screen", ID_FULLSCREEN, 90, BS_PUSHBUTTON, true)?;
+        add("Stats", ID_STATS, 56, BS_AUTOCHECKBOX | BS_PUSHLIKE, true)?;
         add("Pin", ID_PIN, 44, BS_AUTOCHECKBOX | BS_PUSHLIKE, true)?;
         add("Disconnect", ID_DISCONNECT, 90, BS_PUSHBUTTON, true)?;
         x.set(x.get() + px(8));
@@ -241,6 +243,7 @@ impl Bar {
         can_444: bool,
         views_ok: bool,
         fullscreen: bool,
+        stats: bool,
         status: &str,
         host_screen: &str,
     ) {
@@ -250,6 +253,7 @@ impl Bar {
         self.check(ID_420, !full_colour);
         self.check(ID_444, full_colour);
         self.check(ID_PIN, self.pinned);
+        self.check(ID_STATS, stats);
         unsafe {
             if let Ok(c) = GetDlgItem(Some(self.hwnd), ID_444 as i32) {
                 let _ = EnableWindow(c, can_444);

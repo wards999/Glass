@@ -20,6 +20,7 @@ use super::bar::{self, Bar, Handle};
 use super::decode::{Decoder, Picture};
 use super::decode444::{self, CudaDecoder, Planar};
 use super::present::{fit, Presenter};
+use super::stats_box::StatsBox;
 use super::{d3d, Res};
 use glass_core::clock;
 use glass_core::input::{BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT};
@@ -33,7 +34,7 @@ use glass_core::recording::CHROMA_444;
 use glass_core::stats::{StatRing, Summary};
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use windows::core::{w, PCWSTR};
@@ -46,7 +47,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, VK_C, VK_F, VK_Q, VK_R, VK_W,
+    ReleaseCapture, SetCapture, VK_C, VK_F, VK_Q, VK_R, VK_S, VK_W,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -194,6 +195,10 @@ struct Shared {
     /// Client size, `w << 32 | h` (UI -> render).
     size: AtomicU64,
     rule: PcModifierRule,
+    /// The on-screen stats are on (UI), and their latest text (render).
+    show_stats: AtomicBool,
+    stats_text: Mutex<String>,
+    stats_gen: AtomicU32,
 }
 
 impl Shared {
@@ -258,6 +263,8 @@ struct Ui {
     /// The drop-down control bar, and when the pointer was last on it.
     bar: Option<Bar>,
     handle: Option<Handle>,
+    stats_box: Option<StatsBox>,
+    stats_seen: u32,
     bar_seen_us: u64,
     last_bar_status_us: u64,
 }
@@ -355,6 +362,9 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         stop: AtomicBool::new(false),
         reason: Mutex::new(None),
         size: AtomicU64::new(0),
+        show_stats: AtomicBool::new(load_stats_pref()),
+        stats_text: Mutex::new(String::new()),
+        stats_gen: AtomicU32::new(0),
         rule: opts.rule.unwrap_or(if client_os == HOST_OS_MAC {
             PcModifierRule::PcStyle
         } else {
@@ -531,6 +541,118 @@ enum Pic {
     Nv(Planar),
 }
 
+/// Rates for the on-screen stats, over the last second or so.
+#[derive(Default)]
+struct Rates {
+    t: u64,
+    frames: u64,
+    presented: u64,
+    bytes: u64,
+    rx: f64,
+    shown: f64,
+    mbps: f64,
+}
+
+/// The on-screen stats text (the same lines as the Mac viewer's).
+fn overlay_text(
+    sh: &Shared,
+    r: &Report,
+    info: &glass_core::protocol::StreamInfo,
+    dec: &Dec,
+    rates: &mut Rates,
+    now: u64,
+) -> String {
+    let c = &sh.client;
+    let st = c.stats();
+    if rates.t == 0 || now.saturating_sub(rates.t) >= 1_000_000 {
+        if rates.t != 0 {
+            let s = (now - rates.t) as f64 / 1e6;
+            rates.rx = (r.frames - rates.frames) as f64 / s;
+            rates.shown = (r.presented - rates.presented) as f64 / s;
+            rates.mbps = (r.bytes - rates.bytes) as f64 * 8.0 / s / 1e6;
+        }
+        rates.t = now;
+        rates.frames = r.frames;
+        rates.presented = r.presented;
+        rates.bytes = r.bytes;
+    }
+    let p50 = |s: &StatRing| {
+        let x = s.summary();
+        if x.count == 0 {
+            "-".to_string()
+        } else {
+            format!("{:.1}", x.p50_us as f64 / 1e3)
+        }
+    };
+    let both = |s: &StatRing| {
+        let x = s.summary();
+        (x.count > 0).then(|| {
+            format!(
+                "p50 {:.1}  p99 {:.1} ms",
+                x.p50_us as f64 / 1e3,
+                x.p99_us as f64 / 1e3
+            )
+        })
+    };
+    let mut lines = Vec::with_capacity(8);
+    if st.host_notice != NOTICE_NONE {
+        lines.push("\u{26A0} The host isn't taking input right now (see the host).".to_string());
+    }
+    lines.push(format!(
+        "Glass  {}  {}",
+        c.peer().name,
+        view_line(info, dec)
+    ));
+    lines.push(format!(
+        "shown {:.0} fps  received {:.0} fps  {:.1} Mbps",
+        rates.shown, rates.rx, rates.mbps
+    ));
+    lines.push(format!(
+        "capture \u{2192} screen  {}",
+        both(&r.total).unwrap_or_else(|| if st.clock_valid {
+            "(waiting for frames)".into()
+        } else {
+            "(syncing clocks \u{2026})".into()
+        })
+    ));
+    lines.push(format!(
+        "input \u{2192} screen    {}",
+        both(&r.input).unwrap_or_else(|| "(move or type to measure)".into())
+    ));
+    lines.push(format!(
+        "  encode {} | network {} | queue {} | decode {} | wait {} | present {}   (p50 ms)",
+        p50(&r.encode),
+        p50(&r.network),
+        p50(&r.queue),
+        p50(&r.decode),
+        p50(&r.wait),
+        p50(&r.present)
+    ));
+    lines.push(format!(
+        "lost {}  skipped {}  keyframe req {}  decode err {}  RTT {:.1} ms",
+        st.rx.frames_lost,
+        st.rx.frames_skipped,
+        st.keyframe_requests,
+        r.decode_errors,
+        st.last_rtt_us as f64 / 1e3
+    ));
+    lines.push("Ctrl+Alt+Shift+S hide stats \u{00B7} +F full screen \u{00B7} +Q disconnect".into());
+    lines.join("\n")
+}
+
+/// Whether the on-screen stats are on, kept between sessions.
+fn load_stats_pref() -> bool {
+    glass_core::identity::default_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("viewer-stats.txt")).ok())
+        .is_some_and(|s| s.trim() == "1")
+}
+
+fn save_stats_pref(on: bool) {
+    if let Some(d) = glass_core::identity::default_dir() {
+        let _ = std::fs::write(d.join("viewer-stats.txt"), if on { "1" } else { "0" });
+    }
+}
+
 fn view_line(info: &glass_core::protocol::StreamInfo, dec: &Dec) -> String {
     format!(
         "{} {}x{} {} ({})",
@@ -590,6 +712,8 @@ fn render_loop(
     let mut last_input = 0u32;
     let mut stats_failures = 0u32;
     let end = seconds.map(|s| clock::now_us() + (s * 1e6) as u64);
+    let mut next_stats = 0u64;
+    let mut rates = Rates::default();
     // Frames that queued up while the window and decoder were being made
     // are stale: drop them and start from a fresh keyframe.
     while let Wait::Frame(..) = c.wait_frame(Duration::ZERO) {
@@ -725,6 +849,15 @@ fn render_loop(
             });
         }
 
+        // The on-screen stats, four times a second while they're shown.
+        let now = clock::now_us();
+        if now >= next_stats && sh.show_stats.load(Ordering::Relaxed) {
+            next_stats = now + 250_000;
+            let text = overlay_text(sh, r, &info, &dec, &mut rates, now);
+            *sh.stats_text.lock().unwrap_or_else(|e| e.into_inner()) = text;
+            sh.stats_gen.fetch_add(1, Ordering::Relaxed);
+        }
+
         // Resolve on-screen times.
         match pres.displayed() {
             Some((count, shown)) => {
@@ -830,6 +963,8 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
             notice: NOTICE_NONE,
             bar: Bar::new(hwnd).ok(),
             handle: Handle::new(hwnd, load_handle_frac()).ok(),
+            stats_box: StatsBox::new(hwnd).ok(),
+            stats_seen: 0,
             bar_seen_us: 0,
             last_bar_status_us: 0,
         })
@@ -915,6 +1050,7 @@ impl Ui {
             self.sh.can_444.load(Ordering::Relaxed) && caps & HOST_CAP_444 != 0,
             caps & HOST_CAP_VIEW_MODES != 0,
             self.fullscreen,
+            self.sh.show_stats.load(Ordering::Relaxed),
             &status,
             match c.host_os() {
                 HOST_OS_MAC => "Mac's screen",
@@ -939,6 +1075,29 @@ impl Ui {
             h.hide();
         }
         self.bar_seen_us = clock::now_us();
+    }
+
+    /// Shows, moves or hides the on-screen stats, with the latest text.
+    fn tick_stats(&mut self) {
+        let show = self.sh.show_stats.load(Ordering::Relaxed);
+        let c = self.client_on_screen();
+        let Some(b) = &mut self.stats_box else { return };
+        if !show {
+            b.hide();
+            return;
+        }
+        let g = self.sh.stats_gen.load(Ordering::Relaxed);
+        if g != self.stats_seen {
+            self.stats_seen = g;
+            let t = self
+                .sh
+                .stats_text
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            b.set_text(&t);
+        }
+        b.place(c);
     }
 
     fn hide_bar(&mut self) {
@@ -1019,6 +1178,12 @@ impl Ui {
                     h.moved(c);
                     save_handle_frac(h.frac);
                 }
+            }
+            bar::ID_STATS => {
+                let on = !self.sh.show_stats.load(Ordering::Relaxed);
+                self.sh.show_stats.store(on, Ordering::Relaxed);
+                save_stats_pref(on);
+                self.tick_stats();
             }
             bar::ID_PIN => {
                 if let Some(b) = &mut self.bar {
@@ -1305,6 +1470,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_TIMER if wparam.0 == TIMER_CURSOR => {
                 ui.poll_cursor();
                 ui.tick_bar();
+                ui.tick_stats();
                 let notice = c.stats().host_notice;
                 if notice != ui.notice {
                     ui.notice = notice;
@@ -1427,6 +1593,14 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                         Some(WM_TOGGLE_FULLSCREEN)
                     } else if vk == VK_C.0 {
                         Some(WM_TOGGLE_444)
+                    } else if vk == VK_S.0 {
+                        let _ = PostMessageW(
+                            Some(ui.hwnd),
+                            bar::WM_BAR_COMMAND,
+                            WPARAM(bar::ID_STATS),
+                            LPARAM(0),
+                        );
+                        return true;
                     } else if vk == VK_R.0 {
                         Some(WM_NEXT_MODE)
                     } else if vk == VK_Q.0 || vk == VK_W.0 {

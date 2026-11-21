@@ -16,6 +16,7 @@ mod encode;
 mod inject;
 mod mdns;
 mod present;
+mod stats_box;
 pub mod viewer;
 
 use glass_core::clock;

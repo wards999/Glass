@@ -8,7 +8,7 @@ import UniformTypeIdentifiers
 /// Finder / double-click mode: connect window -> (pairing) -> live viewer (or
 /// a recording) -> results window -> back to the connect window.
 /// LATER: menu-bar shell.
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate, NSTextFieldDelegate {
     private var connectWindow: NSWindow?
     private var hostField: NSTextField!
     private var connectButton: NSButton!
@@ -368,6 +368,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if !addressRow.isHidden { connectWindow?.makeFirstResponder(hostField) }
     }
 
+    /// Esc in the address field closes it (as on the PC).
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard control === hostField, commandSelector == #selector(NSResponder.cancelOperation(_:)) else { return false }
+        if !addressRow.isHidden { toggleAddress() }
+        return true
+    }
+
     @objc private func shareSwitched(_ sender: NSSwitch) {
         if sender.state == .on { shareThisMac() } else { stopSharing() }
     }
@@ -433,7 +440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
         scroll.documentView = doc
-        scroll.setContentHuggingPriority(.defaultLow, for: .vertical)
+        scroll.setContentHuggingPriority(.defaultHigh, for: .vertical)
         NSLayoutConstraint.activate([
             listStack.topAnchor.constraint(equalTo: doc.topAnchor),
             listStack.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
@@ -442,7 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
             doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
             doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 150),
+            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 80),
         ])
         browser.onChange = { [weak self] hosts in
             // Not this Mac itself.
@@ -461,6 +468,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         hostField.controlSize = .large
         hostField.target = self
         hostField.action = #selector(connect)
+        hostField.delegate = self
         connectButton = NSButton(title: "Connect", target: self, action: #selector(connect))
         connectButton.keyEquivalent = "\r"
         connectButton.controlSize = .large
@@ -502,7 +510,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         shareStack = shareBody
         let shareCard = Card(shareBody)
 
-        let stack = NSStackView(views: [header, devicesHeader, scroll, addressLink!, addressRow!, shareCard])
+        // The list is as tall as its rows (up to the space there is), so the
+        // address link sits right under it; the spare space goes below.
+        let fit = scroll.heightAnchor.constraint(equalTo: doc.heightAnchor)
+        fit.priority = .defaultHigh
+        fit.isActive = true
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(1), for: .vertical)
+        spacer.setContentCompressionResistancePriority(.init(1), for: .vertical)
+        let stack = NSStackView(views: [header, devicesHeader, scroll, addressLink!, addressRow!, spacer, shareCard])
+        stack.distribution = .fill
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8

@@ -92,10 +92,10 @@ pub fn prepare(mode: u8) -> Res<Prepared> {
 /// "Mac's screen", "fit to this PC", ...
 pub fn mode_name(m: u8) -> &'static str {
     match m {
-        MODE_FIT => "fit to this PC (like the Mac's own screen)",
-        MODE_FIT_MORE_SPACE => "fit to this PC, more space (1:1, smaller text)",
-        MODE_FIT_LARGER => "fit to this PC, larger",
-        _ => "the host's own screen (scaled to fit)",
+        MODE_FIT => "View 1 of 4: Fit (fills this screen, text as on the Mac)",
+        MODE_FIT_MORE_SPACE => "View 2 of 4: More space (smaller text)",
+        MODE_FIT_LARGER => "View 3 of 4: Larger (bigger text)",
+        _ => "View 4 of 4: Mac's screen (as on the Mac, black bars)",
     }
 }
 

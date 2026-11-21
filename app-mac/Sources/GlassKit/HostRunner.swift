@@ -155,12 +155,15 @@ private final class HostSessionRun {
 
     static func modeName(_ m: UInt8) -> String {
         switch Int32(m) {
-        case GLASS_MODE_FIT: return "fit to viewer"
-        case GLASS_MODE_FIT_MORE_SPACE: return "fit, more space"
-        case GLASS_MODE_FIT_LARGER: return "fit, larger"
+        case GLASS_MODE_FIT: return "Fit"
+        case GLASS_MODE_FIT_MORE_SPACE: return "More space"
+        case GLASS_MODE_FIT_LARGER: return "Larger"
         default: return "Mac's screen"
         }
     }
+
+    /// Position in the PC's Ctrl+Alt+Shift+R cycle (Fit is 1).
+    static func viewNumber(_ m: UInt8) -> Int { Int(m) == 0 ? 4 : Int(m) }
 
     /// Sets up capture and encode for `mode`; tells the viewer if the stream
     /// changes. On the accept thread, with no pipeline running.
@@ -216,7 +219,9 @@ private final class HostSessionRun {
         let line = "\(Self.modeName(actual)) \(disp.width)x\(disp.height) \(use444 ? "4:4:4" : "4:2:0")\(note)"
         history.append(line)
         let r = runner
-        DispatchQueue.main.async { r.onStreamChanged(line) }
+        // Short, easy name for the test card banner and the Share window.
+        let short = "View \(Self.viewNumber(actual)) of 4: \(Self.modeName(actual))  ·  \(disp.width)x\(disp.height)  ·  \(use444 ? "full colour 4:4:4" : "4:2:0")"
+        DispatchQueue.main.async { r.onStreamChanged(short) }
         let changed = info.width != current.width || info.height != current.height
             || info.chroma != current.chroma || info.mode != current.mode
         if changed { q.sync { _ = s.sendStreamChange(info) } }

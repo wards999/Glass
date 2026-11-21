@@ -5,7 +5,7 @@
 //!
 //! TXT: `v` protocol version, `fp` first 8 bytes of the certificate
 //! fingerprint (hex, for "is this the PC I paired with?"), `ip` and `port`
-//! where the viewer should connect.
+//! where the viewer should connect, `os` (`windows` / `mac`).
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -51,6 +51,7 @@ pub fn advertise(
         ),
         ("fp".into(), fp_short.replace(' ', "").into()),
         ("port".into(), port.to_string().into()),
+        ("os".into(), "windows".into()),
     ];
     if let Some(ip) = ip {
         kv.push(("ip".into(), ip.to_string().into()));
@@ -74,7 +75,7 @@ pub fn advertise(
         if inst.is_null() {
             return Err("DnsServiceConstructInstance failed".into());
         }
-        // Must stay valid until the registration completes; it's once per run.
+        // Must stay valid while registered (and for DnsServiceDeRegister).
         let req = Box::leak(Box::new(DNS_SERVICE_REGISTER_REQUEST {
             Version: DNS_QUERY_REQUEST_VERSION1,
             InterfaceIndex: 0,
@@ -83,10 +84,27 @@ pub fn advertise(
             ..Default::default()
         }));
         match DnsServiceRegister(req, None) {
-            DNS_REQUEST_PENDING => Ok(()),
+            DNS_REQUEST_PENDING => {
+                *REGISTERED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Req(req));
+                Ok(())
+            }
             e => Err(format!("DnsServiceRegister error {e}")),
         }
     }
+}
+
+struct Req(&'static mut DNS_SERVICE_REGISTER_REQUEST);
+unsafe impl Send for Req {}
+static REGISTERED: std::sync::Mutex<Option<Req>> = std::sync::Mutex::new(None);
+
+/// Stops advertising (sharing stopped).
+pub fn unadvertise() {
+    if let Some(Req(req)) = REGISTERED.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        unsafe {
+            let _ = windows::Win32::NetworkManagement::Dns::DnsServiceDeRegister(req, None);
+        }
+    }
+    STATUS.store(u32::MAX, Ordering::Relaxed);
 }
 
 /// `Some(true)` registered, `Some(false)` failed, `None` still pending.

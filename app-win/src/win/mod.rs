@@ -3,6 +3,7 @@
 
 mod bar;
 mod blocker;
+pub mod browse;
 mod capture;
 mod cuda;
 mod cursor;
@@ -19,7 +20,7 @@ pub mod viewer;
 use glass_core::clock;
 use glass_core::identity::fingerprint_short;
 use glass_core::input::InputAction;
-use glass_core::net::{HostListener, HostOptions, HostSession};
+use glass_core::net::{HostEvent, HostListener, HostOptions, HostSession};
 use glass_core::packet::OutFrame;
 use glass_core::protocol::{CursorShape, StreamInfo, DEFAULT_PORT, FLAG_IDR};
 use glass_core::recording::{
@@ -367,6 +368,41 @@ fn disable_quick_edit() {
 }
 
 pub fn host(args: &[String]) -> Res<()> {
+    host_with(
+        args,
+        HostUi {
+            event: Box::new(crate::print_event),
+            line: Box::new(|l| println!("{l}")),
+            report: Box::new(|_| {}),
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    )
+}
+
+/// Where a host's messages go: the console (`glass host`) or the app's window.
+pub struct HostUi {
+    /// Pairing PINs, refusals and the like.
+    pub event: Box<dyn FnMut(HostEvent) + Send>,
+    /// Status lines.
+    pub line: Box<dyn FnMut(&str) + Send>,
+    /// A finished session's report.
+    pub report: Box<dyn FnMut(&str) + Send>,
+    /// Set (then wake the listener with a connection to its port) to stop.
+    pub stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Shares this PC until `ui.stop` is set (the window's "Share this PC").
+pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
+    let HostUi {
+        event,
+        line,
+        report: mut on_report,
+        stop,
+    } = ui;
+    let line = std::sync::Mutex::new(line);
+    macro_rules! say {
+        ($($t:tt)*) => { (line.lock().unwrap_or_else(|e| e.into_inner()))(&format!($($t)*)) };
+    }
     let a = parse(args)?;
     d3d::init_process();
     disable_quick_edit();
@@ -390,7 +426,7 @@ pub fn host(args: &[String]) -> Res<()> {
     let opts = HostOptions {
         fixed_pin: None,
         ask,
-        events: Box::new(crate::print_event),
+        events: event,
         host_os: glass_core::protocol::HOST_OS_WINDOWS,
         // 4:4:4 switchable mid-session; view modes need a virtual display (M7).
         host_caps: glass_core::protocol::HOST_CAP_444,
@@ -415,36 +451,34 @@ pub fn host(args: &[String]) -> Res<()> {
         a.mbps,
         listener.port()
     );
-    print!("{head}");
+    say!("{}", head.trim_end());
     let lan = lan_ip();
     let ip = lan.map_or("(unknown)".to_string(), |ip| ip.to_string());
     let id = fingerprint_short(&device.fingerprint());
-    println!(
+    say!(
         "This PC: \"{}\", id {id}. Only paired devices can connect; everything is encrypted.",
         device.name
     );
-    println!("On the Mac, open Glass and pick this PC (or type {ip}).");
+    say!("On the Mac, open Glass and pick this PC (or type {ip}).");
     let paired = device
         .peers()
         .iter()
         .filter(|p| p.roles & glass_core::identity::ROLE_VIEWER != 0)
         .count();
     if paired == 0 {
-        println!(
-            "No device is paired yet: connecting from the Mac shows a PIN here to type there."
-        );
+        say!("No device is paired yet: connecting from the Mac shows a PIN here to type there.");
     } else {
-        println!("{paired} paired device(s) (`glass devices` lists them, `glass forget NAME` removes one).");
+        say!("{paired} paired device(s) (`glass devices` lists them, `glass forget NAME` removes one).");
     }
     if a.ask {
-        println!("You'll be asked before each connection (--ask).");
+        say!("You'll be asked before each connection (--ask).");
     }
-    println!("(Allow glass.exe through Windows Firewall on private networks if asked.)");
+    say!("(Allow glass.exe through Windows Firewall on private networks if asked.)");
     if blocker::self_elevated() {
-        println!("Running as administrator: the Mac can control admin windows too (not UAC prompts or the lock screen).");
+        say!("Running as administrator: the Mac can control admin windows too (not UAC prompts or the lock screen).");
     } else {
-        println!("Not running as administrator: Windows blocks the Mac's input while an admin window (e.g. Task Manager) is in front.");
-        println!("(Start host.cmd and answer Yes when Windows asks, or right-click it > Run as administrator.)");
+        say!("Not running as administrator: Windows blocks the Mac's input while an admin window (e.g. Task Manager) is in front.");
+        say!("(Start host.cmd and answer Yes when Windows asks, or right-click it > Run as administrator.)");
     }
     if !a.local {
         let v4 = match lan {
@@ -452,11 +486,12 @@ pub fn host(args: &[String]) -> Res<()> {
             _ => None,
         };
         if let Err(e) = mdns::advertise(&device.name, listener.port(), v4, &id) {
-            println!("(Not listed on the network: {e}. Type the address on the Mac instead.)");
+            say!("(Not listed on the network: {e}. Type the address on the Mac instead.)");
         }
     }
 
-    loop {
+    let port = listener.port();
+    while !stop.load(Ordering::Relaxed) {
         let mut cap = capture::Capture::start(&gpu, mon)?;
         let (w, h) = cap.size();
         let info = StreamInfo {
@@ -467,7 +502,7 @@ pub fn host(args: &[String]) -> Res<()> {
             fps: mon.refresh_hz as u16,
             mode: glass_core::protocol::MODE_HOST_SCREEN, // LATER(M7): IddCx virtual display
         };
-        println!("\nWaiting for a viewer on port {} ...", listener.port());
+        say!("\nWaiting for a viewer on port {} ...", listener.port());
         let mut injector = inject::Injector {
             mapper: inject::Mapper::for_monitor(inject::Rect {
                 left: mon.left,
@@ -497,18 +532,22 @@ pub fn host(args: &[String]) -> Res<()> {
                 b.fetch_add(1, Ordering::Relaxed);
             }
         });
-        let mut session = match listener.accept(info, sink) {
+        let accepted = listener.accept(info, sink);
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let mut session = match accepted {
             Ok(Some(s)) => s,
             Ok(None) => continue, // pairing or refusal, already reported
             Err(e) => {
-                eprintln!("A connection attempt failed: {e}");
+                say!("A connection attempt failed: {e}");
                 continue;
             }
         };
         if mdns::registered() == Some(false) {
-            println!("(Listing on the network failed; type the address on the Mac.)");
+            say!("(Listing on the network failed; type the address on the Mac.)");
         }
-        println!(
+        say!(
             "Viewer connected: \"{}\" from {} (encrypted)",
             session.peer_name,
             session.peer_tcp.ip()
@@ -521,6 +560,7 @@ pub fn host(args: &[String]) -> Res<()> {
             (w, h),
             mon.refresh_hz,
             &blocking,
+            &stop,
         )?;
         let counters = session.counters();
         let ic = counters.input;
@@ -547,7 +587,8 @@ pub fn host(args: &[String]) -> Res<()> {
             }
         );
         let report = format!("{head}{report}");
-        println!("{report}");
+        say!("{report}");
+        on_report(&report);
         if let Some(path) = &a.log {
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new()
@@ -555,11 +596,15 @@ pub fn host(args: &[String]) -> Res<()> {
                 .append(true)
                 .open(path)?;
             writeln!(f, "{report}")?;
-            println!("(appended to {path})");
+            say!("(appended to {path})");
         }
     }
+    mdns::unadvertise();
+    let _ = port;
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_session(
     gpu: &d3d::Gpu,
     cap: &mut capture::Capture,
@@ -568,6 +613,7 @@ fn run_session(
     (w, h): (u32, u32),
     fps: u32,
     blocking: &AtomicU8,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> Res<(String, Vec<String>, u64)> {
     while cap.next_frame()?.is_some() {} // drop frames captured while waiting
     let make = |chroma444: bool| {
@@ -606,7 +652,7 @@ fn run_session(
     let mut blocked_since = None;
     let t0 = clock::now_us();
     let mut pending_idr = true;
-    while session.connected() && run.error.is_none() {
+    while session.connected() && run.error.is_none() && !stop.load(Ordering::Relaxed) {
         cap.wait(5);
         pending_idr |= session.take_keyframe_request();
         // The viewer switched colour (4:2:0 <-> 4:4:4); view modes need a

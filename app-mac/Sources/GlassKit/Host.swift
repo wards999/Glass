@@ -268,6 +268,7 @@ public final class GlassAdvertiser: NSObject, NetServiceDelegate {
             "v": Data(String(glass_protocol_version()).utf8),
             "fp": Data(fingerprintPrefix.utf8),
             "port": Data(String(port).utf8),
+            "os": Data("mac".utf8),
         ]
         if let ip { txt["ip"] = Data(ip.utf8) }
         s.setTXTRecord(NetService.data(fromTXTRecord: txt))

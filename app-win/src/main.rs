@@ -139,6 +139,30 @@ fn forget(what: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// `glass find`: Glass hosts on the local network (3 s of listening).
+#[cfg(windows)]
+fn find() -> Result<(), Box<dyn std::error::Error>> {
+    win::browse::start()?;
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let found = win::browse::list();
+    if found.is_empty() {
+        println!("No Glass hosts found (they may hide behind router settings; typing an address still works).");
+    }
+    for f in found {
+        println!(
+            "{:<32} {}:{}  {}  id {}  protocol {}",
+            f.name,
+            f.address,
+            f.port,
+            f.os.as_deref().unwrap_or("?"),
+            f.fp.as_deref().unwrap_or("?"),
+            f.version.as_deref().unwrap_or("?")
+        );
+    }
+    win::browse::stop();
+    Ok(())
+}
+
 /// "Glass (Windows) <version> | core <v> | protocol v<n>"
 pub fn banner() -> String {
     format!(
@@ -161,6 +185,7 @@ usage:
   glass probe HOST [--port P] [--pin PIN] [--seconds S] [--verify FILE.glsr] [--min-frames N]
   glass serve FILE.glsr [--port P] [--pin PIN]
   glass list
+  glass find                         Glass hosts on the local network
   glass record [--monitor N] [--seconds S] [--chroma 420|444] [--mbps M] out.glsr
   glass dump in.glsr out.h265
   glass pack in.h265 out.glsr WIDTH HEIGHT FPS 420|444
@@ -251,6 +276,8 @@ fn main() {
         Some("connect") => connect::connect(&args[1..]),
         #[cfg(windows)]
         Some("list") => win::list(),
+        #[cfg(windows)]
+        Some("find") => find(),
         #[cfg(windows)]
         Some("record") => win::record(&args[1..]),
         Some("--version") => {

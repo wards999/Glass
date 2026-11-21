@@ -6,6 +6,11 @@ fn main() {
     if std::env::var("CARGO_CFG_WINDOWS").is_err() {
         return;
     }
+    // Icon and manifest (M3d).
+    println!("cargo:rerun-if-changed=glass.rc");
+    println!("cargo:rerun-if-changed=glass.manifest");
+    println!("cargo:rerun-if-changed=packaging/glass.ico");
+    let _ = embed_resource::compile("glass.rc", embed_resource::NONE);
     let Ok(dir) = std::env::var("FFMPEG_DIR") else {
         return;
     };

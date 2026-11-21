@@ -83,3 +83,11 @@ Unattended access (the Glass service, M3f):
   Installing again from a newer build updates it.
   Remove it:  Settings > Remove service, or  glass-cli service uninstall
   Log: C:\ProgramData\Glass\service.log
+
+Sharper pictures from a PC (resolution matching):
+  While a viewer is connected, this PC switches its screen to the mode that
+  best fits the viewer's screen, and switches back afterwards. It can only use
+  modes the monitor or graphics driver offers: on a small monitor, NVIDIA DSR
+  (NVIDIA Control Panel > Manage 3D settings > DSR - Factors) or an HDMI dummy
+  plug adds bigger ones. To keep the resolution:  glass-cli host --keep-resolution
+  The service keeps each session's results in C:\ProgramData\Glassgent-results.txt

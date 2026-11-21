@@ -25,8 +25,10 @@ On the PC to be reached from far away (QUIETPC), from the extracted zip:
 6. Through Windows Remote Desktop: connect to QUIETPC with Remote Desktop, then
    view it with Glass: you see its own screen (locked while Remote Desktop is
    connected) and can sign in there (this ends the Remote Desktop session).
-7. Send back the viewer results, `C:\ProgramData\Glass\service.log`, and
-   anything odd. Remove it again any time from the same Settings section.
+7. **Resolution:** with NVIDIA DSR on (or a bigger monitor), QUIETPC should
+   switch to a sharper mode while viewed and back afterwards.
+8. Send back the viewer results, `C:\ProgramData\Glass\service.log`, and
+   anything odd., and `C:\ProgramData\Glass\agent-results.txt`. Remove it again any time from the same Settings section.
 
 ## M3d test 6 (the redesigned window; replaces tests 4 and 5)
 Use the zip and dmg from the same test build (protocol v7). Extract the zip

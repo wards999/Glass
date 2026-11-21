@@ -13,6 +13,7 @@ mod dda;
 mod decode;
 mod decode444;
 pub mod desktop;
+mod display;
 pub mod dpapi;
 mod encode;
 mod inject;
@@ -75,6 +76,9 @@ struct Args {
     /// The service's agent: Desktop Duplication following the lock screen
     /// and UAC prompts, input on whichever desktop is showing (M3f).
     desktops: bool,
+    /// Switch this screen to the mode that best fits the viewer while it's
+    /// connected (`--keep-resolution` turns it off).
+    match_res: bool,
     out: String,
 }
 
@@ -90,6 +94,7 @@ fn parse(args: &[String]) -> Res<Args> {
         ask: false,
         pin: None,
         desktops: false,
+        match_res: true,
         out: String::new(),
     };
     let mut it = args.iter();
@@ -105,6 +110,7 @@ fn parse(args: &[String]) -> Res<Args> {
             "--ask" => a.ask = true,
             "--pin" => a.pin = Some(val()?.to_string()),
             "--desktops" => a.desktops = true,
+            "--keep-resolution" => a.match_res = false,
             "--chroma" => {
                 a.chroma444 = match val()?.as_str() {
                     "444" => true,
@@ -432,7 +438,17 @@ pub fn agent(args: &[String]) -> Res<()> {
             });
             println!("{l}");
         }),
-        report: Box::new(move |_| update(&s3, &mut |st| st.connected = false)),
+        report: Box::new(move |r| {
+            update(&s3, &mut |st| st.connected = false);
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(service::data_dir().join("agent-results.txt"))
+            {
+                let _ = writeln!(f, "{r}");
+            }
+        }),
         stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         end: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
@@ -564,7 +580,7 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
     let port = listener.port();
     while !stop.load(Ordering::Relaxed) {
         let mut cap = capture::Capture::start(&gpu, mon, a.desktops)?;
-        let (w, h) = cap.size();
+        let (mut w, mut h) = cap.size();
         let info = StreamInfo {
             codec: CODEC_HEVC,
             chroma: if a.chroma444 { CHROMA_444 } else { CHROMA_420 },
@@ -591,7 +607,16 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
         let (b, bl) = (blocked.clone(), blocking.clone());
         let follow = a.desktops;
         let mut follower = desktop::Follower::new();
+        // A new monitor rectangle after the resolution changed for a viewer.
+        let remap: Arc<std::sync::Mutex<Option<inject::Rect>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let remap_in = remap.clone();
         let sink = Box::new(move |action| {
+            if let Ok(mut g) = remap_in.try_lock() {
+                if let Some(r) = g.take() {
+                    injector.mapper = inject::Mapper::for_monitor(r);
+                }
+            }
             // The agent: put input on whichever desktop is showing (the lock
             // screen, a UAC prompt) once the capture thread has moved there.
             if follow {
@@ -630,13 +655,62 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
             session.peer_name,
             session.peer_tcp.ip()
         );
+        // Match the viewer's resolution for the session, where this screen
+        // offers a better mode (M3f).
+        let mut fps = mon.refresh_hz;
+        let mut switched = None;
+        if a.match_res {
+            let v = session.viewer;
+            if let Some(cur) = display::current(&mon.name) {
+                let best = display::best(
+                    &display::modes(&mon.name),
+                    v.display_w as u32,
+                    v.display_h as u32,
+                    cur,
+                );
+                if let Some(m) = best {
+                    if display::switch(&mon.name, m) {
+                        switched = Some(cur);
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        let now = capture::monitors()?
+                            .into_iter()
+                            .find(|x| x.name == mon.name);
+                        if let Some(nm) = now {
+                            drop(cap);
+                            cap = capture::Capture::start(&gpu, &nm, a.desktops)?;
+                            (w, h) = cap.size();
+                            fps = nm.refresh_hz;
+                            *remap.lock().unwrap_or_else(|e| e.into_inner()) = Some(inject::Rect {
+                                left: nm.left,
+                                top: nm.top,
+                                width: nm.width as i32,
+                                height: nm.height as i32,
+                            });
+                            session.send_stream_change(StreamInfo {
+                                width: w as u16,
+                                height: h as u16,
+                                fps: fps as u16,
+                                ..info
+                            })?;
+                            say!(
+                                "Matched the viewer: this screen is {}x{} for now (was {}x{}).",
+                                w,
+                                h,
+                                cur.width,
+                                cur.height
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let (mut report, blocked_by, blocked_us) = run_session(
             &gpu,
             &mut cap,
             &mut session,
             &a,
             (w, h),
-            mon.refresh_hz,
+            fps,
             &blocking,
             &stop,
             &end,
@@ -645,6 +719,15 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
         let counters = session.counters();
         let ic = counters.input;
         drop(session); // releases anything the viewer still held
+        if let Some(orig) = switched {
+            display::restore(&mon.name);
+            let _ = writeln!(
+                report,
+                "  resolution: matched the viewer at {}x{} (this screen is {}x{}; put back)",
+                w, h, orig.width, orig.height
+            );
+            say!("Screen back to {}x{}.", orig.width, orig.height);
+        }
         let _ = writeln!(
             report,
             "  input: {} packets | {} keys, {} clicks, {} scrolls, {} moves | repaired {}",

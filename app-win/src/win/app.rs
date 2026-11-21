@@ -1748,6 +1748,8 @@ impl GlassApp {
                             .show(ui, |ui| {
                     // Scrolls when it's taller than the window.
                     let max_h = (ctx.content_rect().bottom() - at.y - 60.0).max(240.0);
+                    // A scroll bar with its own lane, not floating over the text.
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                     egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).show(ui, |ui| {
                     ui.set_width(380.0);
                     ui.label(RichText::new("Settings").font(semibold(18.0)).color(p.strong));

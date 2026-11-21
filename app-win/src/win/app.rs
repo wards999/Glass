@@ -1,22 +1,26 @@
-//! The Glass window on Windows (M3d): `Glass.exe`. Built with egui for a
-//! modern look that follows Windows' light/dark theme (or a chosen one).
+//! The Glass window on Windows (M3d): `Glass.exe`, drawn with egui.
 //!
-//! - Machines with Glass on the network as cards (Mac/PC, paired or not),
-//!   each with Connect; or connect to a typed address.
-//! - Share this PC, with the pairing PIN shown large.
-//! - Pairing PIN entry, paired devices with Forget, settings, session results
-//!   with Copy, and a tray icon (closing while sharing keeps Glass running).
-//!
-//! The command line (`glass-cli host`, `glass-cli connect`, ...) stays for
-//! tests and CI.
+//! Glass is an enabler: this window exists to get you into a remote screen
+//! fast, so it is one calm column. Devices on the network are big rows (click
+//! one to connect); sharing this PC is a switch in a card at the bottom, with
+//! the pairing code shown in large tiles when another device asks. Settings
+//! (theme, start view, colour, paired devices) sit behind the gear; light and
+//! dark follow Windows unless chosen. Closing while sharing keeps Glass in the
+//! tray. The command line (`glass-cli`) stays for tests and CI.
 //!
 //! Threads: egui's on the main thread; connecting, pairing and each viewer
 //! session on workers (the viewer opens its own window); sharing runs
 //! `host_with` on its own thread. Workers report back on a channel and wake
 //! the UI with `request_repaint`.
+//!
+//! Checks: GLASS_DEBUG_SHOT=FILE.bmp saves the window after 3 s and quits;
+//! GLASS_DEBUG_DEMO=1 (or =share, =settings) shows sample devices (and a pairing code).
 
 use super::{browse, viewer, Res};
-use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, ThemePreference};
+use eframe::egui::{
+    self, pos2, vec2, Align, Align2, Color32, CornerRadius, CursorIcon, FontFamily, FontId, Layout,
+    Margin, Rect, RichText, Sense, Stroke, StrokeKind, ThemePreference,
+};
 use glass_core::identity::{
     fingerprint_hex, fingerprint_short, Device, Peer, ROLE_HOST, ROLE_VIEWER,
 };
@@ -116,10 +120,11 @@ impl Settings {
     }
 }
 
-/// A machine card.
+/// A device row.
 #[derive(Clone)]
 struct Machine {
     name: String,
+    mac: bool,
     kind: &'static str,
     address: String,
     port: u16,
@@ -136,8 +141,7 @@ enum Dialog {
         pin: String,
         name: String,
     },
-    Report(String),
-    Paired,
+    Report(String, bool),
     Settings,
     Message(String, String),
 }
@@ -150,13 +154,20 @@ struct GlassApp {
     machines: Vec<Machine>,
     last_scan: Instant,
     address: String,
-    status: String,
-    connecting: bool,
+    show_address: bool,
+    /// The address being connected to (its row shows a spinner).
+    connecting: Option<String>,
+    notice: Option<(String, Instant)>,
     sharing: Option<Arc<AtomicBool>>,
     share_status: String,
+    /// Pairing code and the device asking.
     pin: Option<(String, String)>,
     dialog: Dialog,
     quitting: bool,
+    elevated: bool,
+    icon: Option<egui::TextureHandle>,
+    share_h: f32,
+    demo: Option<String>,
     _tray: Option<tray_icon::TrayIcon>,
     shot_at: Option<Instant>,
 }
@@ -177,8 +188,8 @@ pub fn run(share: bool) -> Res<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Glass")
-            .with_inner_size([640.0, 700.0])
-            .with_min_inner_size([500.0, 540.0])
+            .with_inner_size([460.0, 700.0])
+            .with_min_inner_size([400.0, 520.0])
             // COM is already multithreaded here (capture, DNS-SD); winit's
             // OLE drag and drop needs single-threaded. LATER(M5c): files.
             .with_drag_and_drop(false)
@@ -206,12 +217,8 @@ pub fn run(share: bool) -> Res<()> {
                 .unwrap_or_default()
                 .trim()
                 .to_string();
+            let demo = std::env::var("GLASS_DEBUG_DEMO").ok();
             let mut app = GlassApp {
-                status: format!(
-                    "This PC: \u{201C}{}\u{201D}  \u{00B7}  id {}",
-                    device.name,
-                    fingerprint_short(&device.fingerprint())
-                ),
                 device,
                 wake,
                 rx,
@@ -219,15 +226,28 @@ pub fn run(share: bool) -> Res<()> {
                 machines: Vec::new(),
                 last_scan: Instant::now() - Duration::from_secs(10),
                 address,
-                connecting: false,
+                show_address: false,
+                connecting: None,
+                notice: None,
                 sharing: None,
                 share_status: String::new(),
                 pin: None,
                 dialog: Dialog::None,
                 quitting: false,
+                elevated: super::blocker::self_elevated(),
+                icon: None,
+                share_h: 0.0,
                 _tray: tray,
                 shot_at: std::env::var_os("GLASS_DEBUG_SHOT").map(|_| Instant::now()),
+                demo,
             };
+            if app.demo.as_deref() == Some("share") {
+                app.share_status = "Waiting for a viewer \u{2026}".into();
+                app.pin = Some(("482913".into(), "MacBook Air".into()));
+            }
+            if app.demo.as_deref() == Some("settings") {
+                app.dialog = Dialog::Settings;
+            }
             if share {
                 app.toggle_share();
             }
@@ -239,37 +259,175 @@ pub fn run(share: bool) -> Res<()> {
     Ok(())
 }
 
-fn style(ctx: &egui::Context) {
-    // Windows' own UI font (Segoe UI Variable on 11, Segoe UI on 10) when present.
+// ---------------------------------------------------------------- look
+
+/// Colours for one theme.
+#[derive(Clone, Copy)]
+struct Pal {
+    bg: Color32,
+    card: Color32,
+    border: Color32,
+    hover: Color32,
+    strong: Color32,
+    text: Color32,
+    weak: Color32,
+    accent: Color32,
+    ok: Color32,
+    warn: Color32,
+    track: Color32,
+    off: Color32,
+    danger: Color32,
+}
+
+fn pal(dark: bool) -> Pal {
+    let c = Color32::from_rgb;
+    if dark {
+        Pal {
+            bg: c(17, 19, 23),
+            card: c(27, 31, 37),
+            border: c(42, 48, 57),
+            hover: c(33, 39, 48),
+            strong: c(238, 241, 245),
+            text: c(205, 210, 218),
+            weak: c(139, 149, 163),
+            accent: c(76, 141, 235),
+            ok: c(64, 200, 125),
+            warn: c(240, 175, 60),
+            track: c(37, 42, 50),
+            off: c(72, 80, 92),
+            danger: c(240, 105, 105),
+        }
+    } else {
+        Pal {
+            bg: c(243, 245, 248),
+            card: Color32::WHITE,
+            border: c(225, 229, 235),
+            hover: c(241, 246, 253),
+            strong: c(17, 21, 26),
+            text: c(40, 46, 54),
+            weak: c(100, 110, 124),
+            accent: c(37, 99, 201),
+            ok: c(24, 150, 82),
+            warn: c(200, 125, 0),
+            track: c(234, 237, 242),
+            off: c(198, 204, 212),
+            danger: c(200, 52, 52),
+        }
+    }
+}
+
+static ICONS: OnceLock<bool> = OnceLock::new();
+
+/// A Segoe Fluent / MDL2 icon, or a plain fallback if the font is missing.
+fn ic(fluent: char, fallback: &str) -> String {
+    if *ICONS.get().unwrap_or(&false) {
+        fluent.to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
+fn semibold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("semibold".into()))
+}
+
+fn icon_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("icons".into()))
+}
+
+/// Windows' own fonts: Segoe UI (Variable on 11), Semibold for titles, and
+/// Segoe Fluent Icons (MDL2 Assets on 10). egui's fonts stay as fallbacks.
+fn fonts(ctx: &egui::Context) {
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-    if let Some(bytes) = ["SegUIVar.ttf", "segoeui.ttf"]
-        .iter()
-        .find_map(|f| std::fs::read(format!(r"{windir}\Fonts\{f}")).ok())
-    {
-        let mut fonts = egui::FontDefinitions::default();
+    let read = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|f| std::fs::read(format!(r"{windir}\Fonts\{f}")).ok())
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    let mut put = |key: &str, bytes: Option<Vec<u8>>| -> Option<String> {
+        let b = bytes?;
         fonts
             .font_data
-            .insert("segoe".into(), Arc::new(egui::FontData::from_owned(bytes)));
-        if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-            f.insert(0, "segoe".into());
-        }
-        ctx.set_fonts(fonts);
+            .insert(key.into(), Arc::new(egui::FontData::from_owned(b)));
+        Some(key.to_string())
+    };
+    let regular = put("segoe", read(&["SegUIVar.ttf", "segoeui.ttf"]));
+    let bold = put("segoe-sb", read(&["seguisb.ttf"]));
+    let icons = put("icons", read(&["SegoeIcons.ttf", "segmdl2.ttf"]));
+    let mut prop = fonts.families[&FontFamily::Proportional].clone();
+    if let Some(r) = &regular {
+        prop.insert(0, r.clone());
     }
-    ctx.all_styles_mut(|s| {
-        s.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        s.spacing.button_padding = egui::vec2(14.0, 6.0);
-        s.spacing.interact_size.y = 30.0;
-        for f in s.text_styles.values_mut() {
-            f.size *= 1.1;
-        }
-        let r = CornerRadius::same(8);
-        s.visuals.widgets.noninteractive.corner_radius = r;
-        s.visuals.widgets.inactive.corner_radius = r;
-        s.visuals.widgets.hovered.corner_radius = r;
-        s.visuals.widgets.active.corner_radius = r;
-        s.visuals.widgets.open.corner_radius = r;
-        s.visuals.window_corner_radius = CornerRadius::same(14);
-    });
+    let mut sb = prop.clone();
+    if let Some(b) = bold {
+        sb.insert(0, b);
+    }
+    let mut ico = prop.clone();
+    let _ = ICONS.set(icons.is_some());
+    if let Some(i) = icons {
+        ico.insert(0, i);
+    }
+    fonts.families.insert(FontFamily::Proportional, prop);
+    fonts
+        .families
+        .insert(FontFamily::Name("semibold".into()), sb);
+    fonts.families.insert(FontFamily::Name("icons".into()), ico);
+    ctx.set_fonts(fonts);
+}
+
+fn style(ctx: &egui::Context) {
+    fonts(ctx);
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        let p = pal(theme == egui::Theme::Dark);
+        ctx.style_mut_of(theme, |s| {
+            s.spacing.item_spacing = vec2(8.0, 8.0);
+            s.spacing.button_padding = vec2(14.0, 6.0);
+            s.spacing.interact_size.y = 30.0;
+            for f in s.text_styles.values_mut() {
+                f.size = (f.size * 1.08).round();
+            }
+            let v = &mut s.visuals;
+            let r = CornerRadius::same(8);
+            v.panel_fill = p.bg;
+            v.window_fill = p.card;
+            v.window_stroke = Stroke::new(1.0, p.border);
+            v.window_corner_radius = CornerRadius::same(16);
+            v.window_shadow = egui::Shadow {
+                offset: [0, 10],
+                blur: 30,
+                spread: 0,
+                color: Color32::from_black_alpha(if theme == egui::Theme::Dark { 120 } else { 45 }),
+            };
+            v.popup_shadow = v.window_shadow;
+            v.extreme_bg_color = p.track;
+            v.faint_bg_color = p.track;
+            v.selection.bg_fill = p.accent;
+            v.selection.stroke = Stroke::new(1.5, p.accent);
+            v.hyperlink_color = p.accent;
+            v.override_text_color = Some(p.text);
+            for w in [
+                &mut v.widgets.noninteractive,
+                &mut v.widgets.inactive,
+                &mut v.widgets.hovered,
+                &mut v.widgets.active,
+                &mut v.widgets.open,
+            ] {
+                w.corner_radius = r;
+                w.fg_stroke.color = p.text;
+            }
+            v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
+            v.widgets.inactive.weak_bg_fill = p.track;
+            v.widgets.inactive.bg_fill = p.track;
+            v.widgets.inactive.bg_stroke = Stroke::NONE;
+            v.widgets.hovered.weak_bg_fill = p.hover;
+            v.widgets.hovered.bg_fill = p.hover;
+            v.widgets.hovered.bg_stroke = Stroke::new(1.0, p.border);
+            v.widgets.active.weak_bg_fill = p.border;
+            v.widgets.active.bg_fill = p.border;
+            v.widgets.open.weak_bg_fill = p.hover;
+        });
+    }
 }
 
 fn make_tray() -> Option<tray_icon::TrayIcon> {
@@ -323,18 +481,39 @@ fn save_report(file: &str, report: &str) {
     }
 }
 
+// ---------------------------------------------------------------- behaviour
+
 impl GlassApp {
     fn scan(&mut self) {
+        self.last_scan = Instant::now();
+        if self.demo.is_some() {
+            let m = |name: &str, mac, address: &str, paired, version_ok| Machine {
+                name: name.into(),
+                mac,
+                kind: if mac { "Mac" } else { "Windows PC" },
+                address: address.into(),
+                port: DEFAULT_PORT,
+                paired,
+                version_ok,
+            };
+            self.machines = vec![
+                m("MacBook Air", true, "192.168.4.46", true, true),
+                m("Studio PC", false, "192.168.4.31", false, true),
+                m("Old Laptop", false, "192.168.4.80", false, false),
+            ];
+            return;
+        }
         let mine = fingerprint_hex(&self.device.fingerprint());
         let peers = self.device.peers();
         let me = PROTOCOL_VERSION.to_string();
-        self.machines = browse::list()
+        let mut list: Vec<Machine> = browse::list()
             .into_iter()
             .filter_map(|f| {
                 let fp = f.fp.clone().unwrap_or_default().to_lowercase();
                 if !fp.is_empty() && mine.starts_with(&fp) {
                     return None; // this PC itself
                 }
+                let mac = f.os.as_deref() == Some("mac");
                 Some(Machine {
                     paired: !fp.is_empty()
                         && peers.iter().any(|p| {
@@ -342,9 +521,10 @@ impl GlassApp {
                                 && fingerprint_hex(&p.fingerprint).starts_with(&fp)
                         }),
                     version_ok: f.version.as_deref().is_none_or(|v| v == me),
+                    mac,
                     kind: match f.os.as_deref() {
                         Some("mac") => "Mac",
-                        Some("windows") => "PC",
+                        Some("windows") => "Windows PC",
                         _ => "Glass",
                     },
                     name: f.name,
@@ -353,11 +533,19 @@ impl GlassApp {
                 })
             })
             .collect();
-        self.last_scan = Instant::now();
+        // Ready ones first, then by name.
+        list.sort_by(|a, b| {
+            (!a.version_ok, !a.paired, a.name.to_lowercase()).cmp(&(
+                !b.version_ok,
+                !b.paired,
+                b.name.to_lowercase(),
+            ))
+        });
+        self.machines = list;
     }
 
     fn connect(&mut self, host: String, port: u16) {
-        if self.connecting {
+        if self.connecting.is_some() {
             return;
         }
         if let Some(dir) = glass_core::identity::default_dir() {
@@ -368,8 +556,8 @@ impl GlassApp {
             };
             let _ = std::fs::write(dir.join("last-host.txt"), a);
         }
-        self.connecting = true;
-        self.status = format!("Connecting to {host} \u{2026}");
+        self.connecting = Some(host.clone());
+        self.notice = None;
         let (wake, device, s) = (
             self.wake.clone(),
             self.device.clone(),
@@ -381,7 +569,6 @@ impl GlassApp {
     fn connect_typed(&mut self) {
         let text = self.address.trim().to_string();
         if text.is_empty() {
-            self.status = "Type the other machine's address (it shows it when sharing).".into();
             return;
         }
         let (h, p) = match text.rsplit_once(':') {
@@ -452,18 +639,23 @@ impl GlassApp {
                 show(ctx);
             }
             Msg::Failed(e) => {
-                self.connecting = false;
-                self.status = e.clone();
-                self.dialog = Dialog::Message("Couldn't connect".into(), e);
+                self.connecting = None;
+                self.dialog = Dialog::Message("Couldn\u{2019}t connect".into(), e);
                 show(ctx);
             }
             Msg::Report(r) => {
-                self.connecting = false;
-                self.status = "Session ended. Results are saved next to Glass.exe.".into();
-                self.dialog = Dialog::Report(r);
+                self.connecting = None;
+                self.notice = Some((
+                    "Session ended. Results are saved next to Glass.exe.".into(),
+                    Instant::now(),
+                ));
+                self.dialog = Dialog::Report(r, false);
                 show(ctx);
             }
-            Msg::Status(s) => self.status = s,
+            Msg::Status(s) => {
+                self.connecting = None;
+                self.notice = Some((s, Instant::now()));
+            }
             Msg::Host(e) => self.host_event(ctx, e),
             Msg::HostLine(l) => {
                 let l = l.trim();
@@ -497,48 +689,32 @@ impl GlassApp {
 
     fn host_event(&mut self, ctx: &egui::Context, e: HostEvent) {
         match e {
-            HostEvent::PairingPin {
-                device, pin, addr, ..
-            } => {
-                let (a, b) = pin.split_at(3);
-                self.pin = Some((
-                    format!("{a} {b}"),
-                    format!(
-                        "\u{201C}{device}\u{201D} ({}) wants to pair. Type this PIN there. Pair only your own devices.",
-                        addr.ip()
-                    ),
-                ));
+            HostEvent::PairingPin { device, pin, .. } => {
+                self.pin = Some((pin.to_string(), device.to_string()));
                 show(ctx);
             }
             HostEvent::Paired { device } => {
                 self.pin = None;
-                self.share_status = format!(
-                    "Paired with \u{201C}{device}\u{201D}. It can now view and control this PC."
-                );
+                self.share_status = format!("Paired with \u{201C}{device}\u{201D}");
             }
             HostEvent::WrongPin { device, left } => {
-                self.share_status = format!(
-                    "Wrong PIN from \u{201C}{device}\u{201D}: {left} more tries with this PIN."
-                )
+                self.share_status =
+                    format!("Wrong code from \u{201C}{device}\u{201D} \u{00B7} {left} tries left")
             }
             HostEvent::PairingLocked => {
                 self.pin = None;
                 self.share_status =
-                    "Too many wrong PINs: pairing is off until sharing restarts.".into();
+                    "Too many wrong codes: pairing is off until sharing restarts".into();
             }
-            HostEvent::Refused { fingerprint, addr } => {
-                self.share_status = format!(
-                    "Refused a device that isn't paired ({}, id {fingerprint}).",
-                    addr.ip()
-                )
+            HostEvent::Refused { addr, .. } => {
+                self.share_status = format!("Refused an unpaired device ({})", addr.ip())
             }
             HostEvent::Denied { device } => {
-                self.share_status = format!("Did not allow \u{201C}{device}\u{201D}.")
+                self.share_status = format!("Did not allow \u{201C}{device}\u{201D}")
             }
             HostEvent::Loop { device } => {
-                self.share_status = format!(
-                    "Refused \u{201C}{device}\u{201D}: this PC is viewing it, so it would loop."
-                )
+                self.share_status =
+                    format!("Refused \u{201C}{device}\u{201D}: this PC is viewing it (a loop)")
             }
         }
     }
@@ -557,7 +733,8 @@ fn connect_worker(
         if let Err(e) = p.finish(&pin) {
             return wake.send(Msg::Failed(match e {
                 ConnectError::WrongPin => {
-                    "That PIN wasn't right (or it expired). Connect again for a new PIN.".into()
+                    "That code wasn\u{2019}t right (or it expired). Connect again for a new one."
+                        .into()
                 }
                 e => format!("{host}: {e}"),
             }));
@@ -565,12 +742,12 @@ fn connect_worker(
     }
     let prep = match viewer::prepare(s.view, s.full_colour) {
         Ok(p) => p,
-        Err(e) => return wake.send(Msg::Failed(format!("Can't start the viewer: {e}"))),
+        Err(e) => return wake.send(Msg::Failed(format!("Can\u{2019}t start the viewer: {e}"))),
     };
     match Client::connect_with(&device, &host, port, prep.hello) {
         Ok(c) => {
             wake.send(Msg::Status(format!(
-                "Viewing \u{201C}{}\u{201D}.",
+                "Viewing \u{201C}{}\u{201D}",
                 c.peer().name
             )));
             let opts = viewer::Options {
@@ -595,98 +772,451 @@ fn connect_worker(
     }
 }
 
-/// Theme-aware colours for tags.
-struct Palette {
-    accent: Color32,
-    on_accent: Color32,
-    strong: Color32,
-    weak: Color32,
-    ok: (Color32, Color32),
-    warn: (Color32, Color32),
-    kind: (Color32, Color32),
-}
+// ---------------------------------------------------------------- widgets
 
-impl Palette {
-    fn of(v: &egui::Visuals) -> Self {
-        let dark = v.dark_mode;
-        Palette {
-            accent: if dark {
-                Color32::from_rgb(62, 127, 200)
-            } else {
-                Color32::from_rgb(23, 92, 170)
-            },
-            on_accent: Color32::WHITE,
-            strong: v.strong_text_color(),
-            weak: v.weak_text_color(),
-            ok: if dark {
-                (
-                    Color32::from_rgb(28, 70, 44),
-                    Color32::from_rgb(150, 230, 170),
-                )
-            } else {
-                (
-                    Color32::from_rgb(214, 242, 222),
-                    Color32::from_rgb(20, 100, 50),
-                )
-            },
-            warn: if dark {
-                (
-                    Color32::from_rgb(80, 64, 20),
-                    Color32::from_rgb(250, 215, 120),
-                )
-            } else {
-                (
-                    Color32::from_rgb(253, 240, 200),
-                    Color32::from_rgb(130, 90, 0),
-                )
-            },
-            kind: if dark {
-                (Color32::from_gray(64), Color32::from_gray(225))
-            } else {
-                (Color32::from_gray(226), Color32::from_gray(50))
-            },
-        }
-    }
-
-    fn primary(&self, text: &str, w: f32) -> egui::Button<'static> {
-        egui::Button::new(
-            RichText::new(text.to_string())
-                .strong()
-                .color(self.on_accent),
-        )
-        .fill(self.accent)
-        .min_size(egui::vec2(w, 34.0))
-    }
-}
-
-/// A small rounded tag ("Mac", "✓ paired").
-fn tag(ui: &mut egui::Ui, text: &str, (fill, fg): (Color32, Color32)) {
+fn card(ui: &mut egui::Ui, p: &Pal, add: impl FnOnce(&mut egui::Ui)) -> Rect {
     egui::Frame::new()
-        .fill(fill)
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(13.0).color(fg));
-        });
-}
-
-fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let v = ui.visuals().clone();
-    let fill = if v.dark_mode {
-        Color32::from_gray(38)
-    } else {
-        Color32::WHITE
-    };
-    egui::Frame::new()
-        .fill(fill)
-        .stroke(v.widgets.noninteractive.bg_stroke)
-        .corner_radius(CornerRadius::same(12))
-        .inner_margin(Margin::same(14))
+        .fill(p.card)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::same(16))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)
         })
-        .inner
+        .response
+        .rect
+}
+
+fn accent_button(text: &str, p: &Pal) -> egui::Button<'static> {
+    egui::Button::new(
+        RichText::new(text.to_string())
+            .font(semibold(14.0))
+            .color(Color32::WHITE),
+    )
+    .fill(p.accent)
+    .stroke(Stroke::NONE)
+    .corner_radius(CornerRadius::same(8))
+    .min_size(vec2(96.0, 34.0))
+}
+
+fn plain_button(text: &str, p: &Pal) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text.to_string()).color(p.text))
+        .fill(p.track)
+        .stroke(Stroke::NONE)
+        .corner_radius(CornerRadius::same(8))
+        .min_size(vec2(84.0, 34.0))
+}
+
+fn icon_button(ui: &mut egui::Ui, glyph: &str, tip: &str, p: &Pal) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
+    let h = ui.ctx().animate_bool_responsive(resp.id, resp.hovered());
+    ui.painter().rect_filled(rect, 8, p.track.gamma_multiply(h));
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        icon_font(16.0),
+        p.text,
+    );
+    resp.on_hover_text(tip)
+        .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// An on/off switch.
+fn toggle(ui: &mut egui::Ui, on: bool, p: &Pal) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(46.0, 26.0), Sense::click());
+    let t = ui.ctx().animate_bool_responsive(resp.id, on);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 13, p.off.lerp_to_gamma(p.accent, t));
+    let x = egui::lerp(rect.left() + 13.0..=rect.right() - 13.0, t);
+    painter.circle_filled(
+        pos2(x, rect.center().y + 0.5),
+        10.0,
+        Color32::from_black_alpha(30),
+    );
+    painter.circle_filled(pos2(x, rect.center().y), 10.0, Color32::WHITE);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// A pill-shaped segmented control. True if the value changed.
+fn segmented<T: PartialEq + Copy>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    opts: &[(T, &str)],
+    p: &Pal,
+) -> bool {
+    let mut changed = false;
+    // Equal segments across the full width.
+    let w = ((ui.available_width() - 6.0 - 2.0 * (opts.len() as f32 - 1.0)) / opts.len() as f32)
+        .floor();
+    egui::Frame::new()
+        .fill(p.track)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(3))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.horizontal(|ui| {
+                for (v, label) in opts {
+                    let sel = *value == *v;
+                    let b = egui::Button::new(RichText::new(*label).color(if sel {
+                        p.strong
+                    } else {
+                        p.weak
+                    }))
+                    .fill(if sel { p.card } else { Color32::TRANSPARENT })
+                    .stroke(if sel {
+                        Stroke::new(1.0, p.border)
+                    } else {
+                        Stroke::NONE
+                    })
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(vec2(w, 28.0));
+                    if ui.add(b).clicked() && !sel {
+                        *value = *v;
+                        changed = true;
+                    }
+                }
+            });
+        });
+    changed
+}
+
+/// A monitor (PC) or a laptop (Mac), line-drawn around `c`.
+fn device_glyph(painter: &egui::Painter, c: egui::Pos2, mac: bool, col: Color32) {
+    let s = Stroke::new(1.8, col);
+    if mac {
+        let scr = Rect::from_center_size(c + vec2(0.0, -2.5), vec2(24.0, 16.0));
+        painter.rect_stroke(scr, 2.5, s, StrokeKind::Inside);
+        painter.line_segment(
+            [c + vec2(-15.0, 8.0), c + vec2(15.0, 8.0)],
+            Stroke::new(2.4, col),
+        );
+    } else {
+        let scr = Rect::from_center_size(c + vec2(0.0, -3.5), vec2(26.0, 17.0));
+        painter.rect_stroke(scr, 2.5, s, StrokeKind::Inside);
+        painter.line_segment([c + vec2(0.0, 5.0), c + vec2(0.0, 9.0)], s);
+        painter.line_segment([c + vec2(-6.5, 9.5), c + vec2(6.5, 9.5)], s);
+    }
+}
+
+fn section(ui: &mut egui::Ui, text: &str, p: &Pal) {
+    ui.label(RichText::new(text).font(semibold(14.0)).color(p.strong));
+}
+
+fn modal(id: &str, p: &Pal) -> egui::Modal {
+    egui::Modal::new(egui::Id::unique(id))
+        .backdrop_color(Color32::from_black_alpha(110))
+        .frame(
+            egui::Frame::new()
+                .fill(p.card)
+                .stroke(Stroke::new(1.0, p.border))
+                .corner_radius(CornerRadius::same(16))
+                .inner_margin(Margin::same(22))
+                .shadow(egui::Shadow {
+                    offset: [0, 12],
+                    blur: 36,
+                    spread: 0,
+                    color: Color32::from_black_alpha(80),
+                }),
+        )
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}\u{2026}", s.chars().take(max - 1).collect::<String>())
+    }
+}
+
+// ---------------------------------------------------------------- the window
+
+impl GlassApp {
+    fn header(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Pal) {
+        ui.horizontal(|ui| {
+            if let Some(t) = &self.icon {
+                ui.add(
+                    egui::Image::from_texture(egui::load::SizedTexture::from_handle(t))
+                        .fit_to_exact_size(vec2(42.0, 42.0)),
+                );
+            }
+            ui.add_space(2.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(RichText::new("Glass").font(semibold(22.0)).color(p.strong));
+                ui.label(
+                    RichText::new(format!("This PC \u{00B7} {}", self.device.name))
+                        .size(13.0)
+                        .color(p.weak),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if icon_button(ui, &ic('\u{E713}', "\u{2699}"), "Settings", p).clicked() {
+                    self.dialog = Dialog::Settings;
+                }
+                let dark = ui.visuals().dark_mode;
+                let (glyph, tip) = if dark {
+                    (ic('\u{E706}', "\u{2600}"), "Switch to light")
+                } else {
+                    (ic('\u{E708}', "\u{263E}"), "Switch to dark")
+                };
+                if icon_button(ui, &glyph, tip, p).clicked() {
+                    self.settings.theme = if dark {
+                        ThemePreference::Light
+                    } else {
+                        ThemePreference::Dark
+                    };
+                    ctx.set_theme(self.settings.theme);
+                    self.settings.save();
+                }
+            });
+        });
+    }
+
+    /// One device: click anywhere to connect. True if clicked.
+    fn machine_row(&self, ui: &mut egui::Ui, m: &Machine, p: &Pal) -> bool {
+        let busy_here = self.connecting.as_deref() == Some(m.address.as_str());
+        let enabled = m.version_ok && self.connecting.is_none();
+        let (rect, resp) = ui.allocate_exact_size(
+            vec2(ui.available_width(), 70.0),
+            if enabled {
+                Sense::click()
+            } else {
+                Sense::hover()
+            },
+        );
+        let h = ui
+            .ctx()
+            .animate_bool_responsive(resp.id.with("hover"), resp.hovered() && enabled);
+        let painter = ui.painter();
+        painter.rect_filled(rect, 14, p.card.lerp_to_gamma(p.hover, h));
+        painter.rect_stroke(
+            rect,
+            14,
+            Stroke::new(1.0, p.border.lerp_to_gamma(p.accent.gamma_multiply(0.7), h)),
+            StrokeKind::Inside,
+        );
+        let fade = if m.version_ok { 1.0 } else { 0.5 };
+        let tile =
+            Rect::from_center_size(pos2(rect.left() + 38.0, rect.center().y), vec2(44.0, 44.0));
+        painter.rect_filled(tile, 11, p.accent.gamma_multiply(0.13 * fade));
+        device_glyph(painter, tile.center(), m.mac, p.accent.gamma_multiply(fade));
+        let x = tile.right() + 14.0;
+        painter.text(
+            pos2(x, rect.center().y - 10.0),
+            Align2::LEFT_CENTER,
+            truncate(&m.name, 26),
+            semibold(16.0),
+            p.strong.gamma_multiply(fade),
+        );
+        painter.text(
+            pos2(x, rect.center().y + 11.0),
+            Align2::LEFT_CENTER,
+            format!("{} \u{00B7} {}", m.kind, m.address),
+            FontId::proportional(13.0),
+            p.weak,
+        );
+        let right = pos2(rect.right() - 16.0, rect.center().y);
+        if busy_here {
+            let r = Rect::from_center_size(right - vec2(10.0, 0.0), vec2(20.0, 20.0));
+            ui.put(r, egui::Spinner::new().size(20.0).color(p.accent));
+        } else {
+            // Status, crossfading to a Connect pill on hover.
+            let (dot, label) = if !m.version_ok {
+                (p.weak, "Update Glass")
+            } else if m.paired {
+                (p.ok, "Ready")
+            } else {
+                (p.warn, "Pair")
+            };
+            let a = 1.0 - h;
+            if a > 0.01 {
+                let r = painter.text(
+                    right,
+                    Align2::RIGHT_CENTER,
+                    label,
+                    FontId::proportional(13.0),
+                    p.weak.gamma_multiply(a),
+                );
+                painter.circle_filled(pos2(r.left() - 9.0, right.y), 4.0, dot.gamma_multiply(a));
+            }
+            if h > 0.01 {
+                let g = painter.layout_no_wrap(
+                    format!("Connect  {}", ic('\u{E72A}', "\u{2192}")),
+                    semibold(13.0),
+                    Color32::WHITE,
+                );
+                let pill = Rect::from_min_max(
+                    pos2(right.x - g.size().x - 28.0, right.y - 15.0),
+                    pos2(right.x, right.y + 15.0),
+                );
+                painter.rect_filled(pill, 15, p.accent.gamma_multiply(h));
+                painter.text(
+                    pill.center(),
+                    Align2::CENTER_CENTER,
+                    "Connect",
+                    semibold(13.0),
+                    Color32::WHITE.gamma_multiply(h),
+                );
+            }
+        }
+        let resp = if enabled {
+            resp.on_hover_cursor(CursorIcon::PointingHand)
+        } else if !m.version_ok {
+            resp.on_hover_text(
+                "This device runs a different version of Glass. Install the same build on both.",
+            )
+        } else {
+            resp
+        };
+        resp.clicked()
+    }
+
+    fn empty_state(&self, ui: &mut egui::Ui, p: &Pal) {
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 210.0), Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 14, p.card);
+        painter.rect_stroke(rect, 14, Stroke::new(1.0, p.border), StrokeKind::Inside);
+        let c = pos2(rect.center().x, rect.top() + 78.0);
+        let t = ui.input(|i| i.time) as f32;
+        for i in 0..3 {
+            let phase = (t * 0.45 + i as f32 / 3.0).fract();
+            painter.circle_stroke(
+                c,
+                24.0 + phase * 44.0,
+                Stroke::new(1.5, p.accent.gamma_multiply((1.0 - phase) * 0.55)),
+            );
+        }
+        painter.circle_filled(c, 24.0, p.accent.gamma_multiply(0.14));
+        device_glyph(painter, c, false, p.accent);
+        painter.text(
+            pos2(c.x, rect.top() + 150.0),
+            Align2::CENTER_CENTER,
+            "Looking for devices \u{2026}",
+            semibold(15.0),
+            p.strong,
+        );
+        painter.text(
+            pos2(c.x, rect.top() + 174.0),
+            Align2::CENTER_CENTER,
+            "Turn on sharing on your Mac or PC and it appears here.",
+            FontId::proportional(13.0),
+            p.weak,
+        );
+        ui.ctx().request_repaint_after(Duration::from_millis(33));
+    }
+
+    fn share_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Pal) {
+        let on = self.sharing.is_some() || self.demo.as_deref() == Some("share");
+        ui.horizontal(|ui| {
+            let (tile, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
+            let col = if on { p.ok } else { p.weak };
+            ui.painter().rect_filled(tile, 11, col.gamma_multiply(0.14));
+            device_glyph(ui.painter(), tile.center(), false, col);
+            ui.add_space(4.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new("Share this PC")
+                        .font(semibold(16.0))
+                        .color(p.strong),
+                );
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let (dot, _) = ui.allocate_exact_size(vec2(8.0, 14.0), Sense::hover());
+                    ui.painter()
+                        .circle_filled(dot.center(), 4.0, if on { p.ok } else { p.off });
+                    let text = if on || !self.share_status.is_empty() {
+                        truncate(&self.share_status, 44)
+                    } else {
+                        "Off \u{00B7} other devices can\u{2019}t connect".to_string()
+                    };
+                    ui.label(RichText::new(text).size(13.0).color(p.weak));
+                });
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if toggle(ui, on, p).clicked() && self.demo.is_none() {
+                    self.toggle_share();
+                }
+            });
+        });
+        if let Some((digits, who)) = &self.pin {
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Pairing code for \u{201C}{}\u{201D}",
+                        truncate(who, 28)
+                    ))
+                    .font(semibold(14.0))
+                    .color(p.strong),
+                );
+                ui.label(
+                    RichText::new("Type it on that device. Pair only your own devices.")
+                        .size(12.5)
+                        .color(p.weak),
+                );
+            });
+            ui.add_space(6.0);
+            let (tw, th, gap, mid) = (38.0, 50.0, 7.0, 14.0);
+            let n = digits.chars().count() as f32;
+            let total = n * tw + (n - 1.0) * gap + mid - gap;
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), th), Sense::hover());
+            let mut x = row.center().x - total / 2.0;
+            for (i, ch) in digits.chars().enumerate() {
+                if i == 3 {
+                    x += mid - gap;
+                }
+                let r = Rect::from_min_size(pos2(x, row.top()), vec2(tw, th));
+                ui.painter().rect_filled(r, 9, p.track);
+                ui.painter().text(
+                    r.center(),
+                    Align2::CENTER_CENTER,
+                    ch,
+                    semibold(26.0),
+                    p.strong,
+                );
+                x += tw + gap;
+            }
+            ui.add_space(2.0);
+        }
+        if on && !self.elevated {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    RichText::new(ic('\u{E7BA}', "\u{26A0}"))
+                        .font(icon_font(12.0))
+                        .color(p.warn),
+                );
+                ui.label(
+                    RichText::new(
+                        "Admin windows (Task Manager, installers) ignore remote control.",
+                    )
+                    .size(12.5)
+                    .color(p.weak),
+                );
+                let link = ui.add(
+                    egui::Label::new(
+                        RichText::new("Restart as administrator")
+                            .size(12.5)
+                            .color(p.accent),
+                    )
+                    .sense(Sense::click()),
+                );
+                if link.on_hover_cursor(CursorIcon::PointingHand).clicked()
+                    && restart_elevated(true)
+                {
+                    self.quit(ctx);
+                }
+            });
+        }
+    }
 }
 
 impl eframe::App for GlassApp {
@@ -708,158 +1238,113 @@ impl eframe::App for GlassApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let pal = Palette::of(ui.visuals());
-        let bg = if ui.visuals().dark_mode {
-            Color32::from_gray(24)
-        } else {
-            Color32::from_gray(243)
-        };
+        let p = pal(ui.visuals().dark_mode);
+        if self.icon.is_none() {
+            self.icon = Some(ctx.load_texture(
+                "glass-icon",
+                egui::ColorImage::from_rgba_unmultiplied([64, 64], &icon_rgba(64)),
+                egui::TextureOptions::LINEAR,
+            ));
+        }
 
-        egui::Frame::new().fill(bg).inner_margin(Margin::same(20)).show(ui, |ui| {
-            ui.set_min_size(ui.available_size());
-            // Header: title, theme, settings.
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Glass").size(28.0).strong().color(pal.strong));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Settings").clicked() {
-                        self.dialog = Dialog::Settings;
-                    }
-                    let before = self.settings.theme;
-                    egui::ComboBox::from_id_salt("theme")
-                        .selected_text(match self.settings.theme {
-                            ThemePreference::System => "Theme: System",
-                            ThemePreference::Light => "Theme: Light",
-                            ThemePreference::Dark => "Theme: Dark",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.settings.theme, ThemePreference::System, "System");
-                            ui.selectable_value(&mut self.settings.theme, ThemePreference::Light, "Light");
-                            ui.selectable_value(&mut self.settings.theme, ThemePreference::Dark, "Dark");
-                        });
-                    if self.settings.theme != before {
-                        ctx.set_theme(self.settings.theme);
-                        self.settings.save();
-                    }
-                });
-            });
-            ui.label(RichText::new(&self.status).color(pal.weak));
-            ui.add_space(4.0);
+        egui::Frame::new()
+            .fill(p.bg)
+            .inner_margin(Margin {
+                left: 22,
+                right: 22,
+                top: 18,
+                bottom: 18,
+            })
+            .show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                self.header(ui, &ctx, &p);
+                ui.add_space(16.0);
 
-            // Sharing.
-            card(ui, |ui| {
+                // Devices.
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("Share this PC").size(18.0).strong().color(pal.strong));
-                        let s = if !self.share_status.is_empty() {
-                            self.share_status.as_str()
-                        } else {
-                            "Let another Mac or PC view and control this PC."
-                        };
-                        ui.label(RichText::new(s).color(pal.weak));
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let clicked = if self.sharing.is_some() {
-                            ui.add(egui::Button::new(RichText::new("Stop sharing").strong()).min_size(egui::vec2(140.0, 34.0)))
-                                .clicked()
-                        } else {
-                            ui.add(pal.primary("Start sharing", 140.0)).clicked()
-                        };
-                        if clicked {
-                            self.toggle_share();
+                    ui.label(RichText::new("DEVICES").font(semibold(12.0)).color(p.weak));
+                    if !self.machines.is_empty() {
+                        ui.label(
+                            RichText::new(self.machines.len().to_string())
+                                .size(12.0)
+                                .color(p.weak),
+                        );
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, &ic('\u{E72C}', "\u{21BB}"), "Look again", &p).clicked()
+                        {
+                            let _ = browse::start();
+                            self.scan();
                         }
                     });
                 });
-                if let Some((pin, text)) = &self.pin {
-                    ui.add_space(4.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new(format!("PIN  {pin}")).size(40.0).strong().color(pal.strong));
-                        ui.label(RichText::new(text).color(pal.weak));
+                let list_h = (ui.available_height() - self.share_h - 64.0).max(90.0);
+                let mut go = None;
+                egui::ScrollArea::vertical()
+                    .max_height(list_h)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        if self.machines.is_empty() {
+                            self.empty_state(ui, &p);
+                        }
+                        for m in &self.machines {
+                            if self.machine_row(ui, m, &p) {
+                                go = Some((m.address.clone(), m.port));
+                            }
+                        }
                     });
+                if let Some((h, port)) = go {
+                    self.connect(h, port);
                 }
-                if self.sharing.is_some() && !super::blocker::self_elevated() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            RichText::new("Admin windows (Task Manager, installers) ignore remote input unless Glass runs as administrator.")
-                                .size(13.0)
-                                .color(pal.weak),
+
+                // A typed address, tucked away.
+                ui.add_space(2.0);
+                if !self.show_address {
+                    let link = ui.add(
+                        egui::Label::new(
+                            RichText::new("+  Connect by address")
+                                .size(13.5)
+                                .color(p.accent),
+                        )
+                        .sense(Sense::click()),
+                    );
+                    if link.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                        self.show_address = true;
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.address)
+                                .hint_text("Address, e.g. 192.168.1.20")
+                                .margin(Margin::symmetric(10, 8))
+                                .desired_width(ui.available_width() - 106.0),
                         );
-                        if ui.small_button("Restart as administrator").clicked() && restart_elevated(true) {
-                            self.quit(&ctx);
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui
+                            .add_enabled(self.connecting.is_none(), accent_button("Connect", &p))
+                            .clicked()
+                            || enter
+                        {
+                            self.connect_typed();
                         }
                     });
                 }
-            });
-            ui.add_space(6.0);
-
-            // Machines.
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Machines on this network").size(18.0).strong().color(pal.strong));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Paired devices").clicked() {
-                        self.dialog = Dialog::Paired;
+                if let Some((n, at)) = &self.notice {
+                    if at.elapsed() < Duration::from_secs(10) {
+                        ui.label(RichText::new(n).size(13.0).color(p.weak));
                     }
-                    if ui.button("Refresh").clicked() {
-                        let _ = browse::start();
-                        self.scan();
-                    }
-                });
-            });
-            let list_h = (ui.available_height() - 56.0).max(120.0);
-            let mut go = None;
-            egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, true]).show(ui, |ui| {
-                if self.machines.is_empty() {
-                    card(ui, |ui| {
-                        ui.label(
-                            RichText::new("Looking for Macs and PCs with Glass \u{2026}  Start sharing on the other machine, or type its address below.")
-                                .color(pal.weak),
-                        );
-                    });
                 }
-                for m in &self.machines {
-                    card(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(&m.name).size(17.0).strong().color(pal.strong));
-                                    tag(ui, m.kind, pal.kind);
-                                    if !m.version_ok {
-                                        tag(ui, "different Glass version", pal.warn);
-                                    } else if m.paired {
-                                        tag(ui, "\u{2713} paired", pal.ok);
-                                    } else {
-                                        tag(ui, "needs PIN", pal.warn);
-                                    }
-                                });
-                                ui.label(RichText::new(&m.address).color(pal.weak));
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.add_enabled(!self.connecting && m.version_ok, pal.primary("Connect", 110.0)).clicked() {
-                                    go = Some((m.address.clone(), m.port));
-                                }
-                            });
-                        });
-                    });
-                }
-            });
-            if let Some((h, p)) = go {
-                self.connect(h, p);
-            }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Or an address:");
-                let r = ui.add(
-                    egui::TextEdit::singleline(&mut self.address)
-                        .hint_text("e.g. 192.168.1.20")
-                        .desired_width(220.0),
-                );
-                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.add_enabled(!self.connecting, egui::Button::new("Connect")).clicked() || enter {
-                    self.connect_typed();
-                }
-            });
-        });
 
-        self.dialogs(&ctx);
+                // Sharing, at the bottom.
+                let space = ui.available_height() - self.share_h - 2.0;
+                if space > 0.0 {
+                    ui.add_space(space);
+                }
+                let r = card(ui, &p, |ui| self.share_card(ui, &ctx, &p));
+                self.share_h = r.height();
+            });
+
+        self.dialogs(&ctx, &p);
 
         // GLASS_DEBUG_SHOT=FILE.bmp: save the window after 3 s and quit (checks).
         // egui's own capture: screen copies can't see an OpenGL window.
@@ -893,7 +1378,7 @@ impl eframe::App for GlassApp {
 }
 
 impl GlassApp {
-    fn dialogs(&mut self, ctx: &egui::Context) {
+    fn dialogs(&mut self, ctx: &egui::Context, p: &Pal) {
         let mut close = false;
         match &mut self.dialog {
             Dialog::None => {}
@@ -905,28 +1390,40 @@ impl GlassApp {
                 name,
             } => {
                 let mut submit = None;
-                egui::Modal::new(egui::Id::unique("pin")).show(ctx, |ui| {
-                    ui.set_width(380.0);
-                    ui.heading("Pair with Glass");
-                    ui.label(format!("\u{201C}{name}\u{201D} is showing a 6-digit PIN. Type it here."));
+                modal("pin", p).show(ctx, |ui| {
+                    ui.set_width(360.0);
+                    ui.label(RichText::new("Enter pairing code").font(semibold(20.0)).color(p.strong));
+                    ui.label(
+                        RichText::new(format!("\u{201C}{name}\u{201D} is showing a 6-digit code."))
+                            .color(p.text),
+                    );
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| {
+                        let r = ui.add(
+                            egui::TextEdit::singleline(pin)
+                                .hint_text("000 000")
+                                .font(semibold(28.0))
+                                .align(Align2::CENTER_CENTER)
+                                .char_limit(7)
+                                .margin(Margin::symmetric(12, 10))
+                                .desired_width(220.0),
+                        );
+                        r.request_focus();
+                    });
+                    ui.add_space(6.0);
                     ui.label(
                         RichText::new("Pair only your own devices: a paired host sees what you type while you view it.")
-                            .size(13.0)
-                            .weak(),
+                            .size(12.5)
+                            .color(p.weak),
                     );
-                    let r = ui.add(
-                        egui::TextEdit::singleline(pin)
-                            .hint_text("123 456")
-                            .font(egui::TextStyle::Heading)
-                            .desired_width(200.0),
-                    );
-                    r.request_focus();
+                    ui.add_space(8.0);
                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.horizontal(|ui| {
-                        if ui.button("Pair").clicked() || enter {
+                    let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(accent_button("Pair", p)).clicked() || enter {
                             submit = Some(true);
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.add(plain_button("Cancel", p)).clicked() || esc {
                             submit = Some(false);
                         }
                     });
@@ -934,8 +1431,7 @@ impl GlassApp {
                 if let Some(ok) = submit {
                     let digits: String = pin.chars().filter(char::is_ascii_digit).collect();
                     match (ok && !digits.is_empty(), pairing.take()) {
-                        (true, Some(p)) => {
-                            self.status = format!("Pairing with \u{201C}{name}\u{201D} \u{2026}");
+                        (true, Some(pr)) => {
                             let (wake, device, s, h, pt) = (
                                 self.wake.clone(),
                                 self.device.clone(),
@@ -944,136 +1440,177 @@ impl GlassApp {
                                 *port,
                             );
                             std::thread::spawn(move || {
-                                connect_worker(wake, device, h, pt, Some((p, digits)), s)
+                                connect_worker(wake, device, h, pt, Some((pr, digits)), s)
                             });
                         }
-                        _ => {
-                            self.connecting = false;
-                            self.status = "Pairing cancelled.".into();
-                        }
+                        _ => self.connecting = None,
                     }
                     close = true;
                 }
             }
-            Dialog::Report(text) => {
-                egui::Modal::new(egui::Id::unique("report")).show(ctx, |ui| {
-                    ui.set_width((ctx.content_rect().width() - 80.0).clamp(320.0, 760.0));
-                    ui.heading("Session results");
-                    ui.label(RichText::new("Copy these and paste them back to Claude.").weak());
-                    egui::ScrollArea::vertical()
-                        .max_height(380.0)
+            Dialog::Report(text, copied) => {
+                modal("report", p).show(ctx, |ui| {
+                    ui.set_width((ctx.content_rect().width() - 60.0).clamp(300.0, 720.0));
+                    ui.label(
+                        RichText::new("Session results")
+                            .font(semibold(20.0))
+                            .color(p.strong),
+                    );
+                    ui.label(
+                        RichText::new("Copy these and paste them back to Claude.").color(p.weak),
+                    );
+                    ui.add_space(6.0);
+                    egui::Frame::new()
+                        .fill(p.track)
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::same(12))
                         .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(text.as_str()).monospace().size(12.0),
-                                )
-                                .selectable(true),
-                            );
+                            egui::ScrollArea::vertical()
+                                .max_height(320.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(text.as_str()).monospace().size(12.0),
+                                        )
+                                        .selectable(true),
+                                    );
+                                });
                         });
-                    ui.horizontal(|ui| {
-                        if ui.button("Copy results").clicked() {
-                            ctx.copy_text(text.clone());
-                        }
-                        if ui.button("Close").clicked() {
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(plain_button("Close", p)).clicked() {
                             close = true;
+                        }
+                        let label = if *copied {
+                            "Copied \u{2713}"
+                        } else {
+                            "Copy results"
+                        };
+                        if ui
+                            .add(accent_button(label, p).min_size(vec2(130.0, 34.0)))
+                            .clicked()
+                        {
+                            ctx.copy_text(text.clone());
+                            *copied = true;
                         }
                     });
                 });
             }
             Dialog::Message(title, text) => {
-                egui::Modal::new(egui::Id::unique("msg")).show(ctx, |ui| {
-                    ui.set_width(400.0);
-                    ui.heading(title.as_str());
-                    ui.label(text.as_str());
-                    if ui.button("OK").clicked() {
-                        close = true;
-                    }
+                modal("msg", p).show(ctx, |ui| {
+                    ui.set_width(360.0);
+                    ui.label(
+                        RichText::new(title.as_str())
+                            .font(semibold(20.0))
+                            .color(p.strong),
+                    );
+                    ui.label(RichText::new(text.as_str()).color(p.text));
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(accent_button("OK", p)).clicked()
+                            || ui.input(|i| {
+                                i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Escape)
+                            })
+                        {
+                            close = true;
+                        }
+                    });
                 });
-            }
-            Dialog::Paired => {
-                let peers: Vec<Peer> = self.device.peers();
-                let mut forget = None;
-                egui::Modal::new(egui::Id::unique("paired")).show(ctx, |ui| {
-                    ui.set_width(480.0);
-                    ui.heading("Paired devices");
-                    if peers.is_empty() {
-                        ui.label(RichText::new("None yet.").weak());
-                    }
-                    for p in &peers {
-                        card(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new(&p.name).strong());
-                                    let mut roles = Vec::new();
-                                    if p.roles & ROLE_VIEWER != 0 {
-                                        roles.push("may view this PC");
-                                    }
-                                    if p.roles & ROLE_HOST != 0 {
-                                        roles.push("this PC may view it");
-                                    }
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "id {}  \u{00B7}  {}",
-                                            fingerprint_short(&p.fingerprint),
-                                            roles.join(", ")
-                                        ))
-                                        .size(13.0)
-                                        .weak(),
-                                    );
-                                });
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.button("Forget").clicked() {
-                                            forget = Some(p.fingerprint);
-                                        }
-                                    },
-                                );
-                            });
-                        });
-                    }
-                    if ui.button("Close").clicked() {
-                        close = true;
-                    }
-                });
-                if let Some(fp) = forget {
-                    let _ = self.device.forget(&fp);
-                    self.scan();
-                }
             }
             Dialog::Settings => {
                 let mut s = self.settings.clone();
-                egui::Modal::new(egui::Id::unique("settings")).show(ctx, |ui| {
-                    ui.set_width(440.0);
-                    ui.heading("Settings");
-                    ui.label(RichText::new("Theme").strong());
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut s.theme, ThemePreference::System, "System");
-                        ui.radio_value(&mut s.theme, ThemePreference::Light, "Light");
-                        ui.radio_value(&mut s.theme, ThemePreference::Dark, "Dark");
-                    });
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("When viewing a Mac, start in").strong());
-                    egui::ComboBox::from_id_salt("view")
-                        .width(300.0)
-                        .selected_text(viewer::mode_name(s.view))
-                        .show_ui(ui, |ui| {
-                            for m in [MODE_FIT, MODE_FIT_MORE_SPACE, MODE_FIT_LARGER, MODE_HOST_SCREEN] {
-                                ui.selectable_value(&mut s.view, m, viewer::mode_name(m));
-                            }
-                        });
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Colour").strong());
-                    ui.radio_value(&mut s.full_colour, false, "Fast (4:2:0): lowest lag");
-                    ui.radio_value(&mut s.full_colour, true, "Full colour (4:4:4): exact colours, a little more lag");
-                    ui.label(
-                        RichText::new("Both can be changed while viewing, from the bar at the top edge of the screen.")
-                            .size(13.0)
-                            .weak(),
+                let peers: Vec<Peer> = self.device.peers();
+                let mut forget = None;
+                modal("settings", p).show(ctx, |ui| {
+                    ui.set_width(400.0);
+                    ui.label(RichText::new("Settings").font(semibold(20.0)).color(p.strong));
+                    ui.add_space(6.0);
+
+                    section(ui, "Appearance", p);
+                    segmented(
+                        ui,
+                        &mut s.theme,
+                        &[
+                            (ThemePreference::System, "System"),
+                            (ThemePreference::Light, "Light"),
+                            (ThemePreference::Dark, "Dark"),
+                        ],
+                        p,
                     );
-                    if ui.button("Done").clicked() {
-                        close = true;
+                    ui.add_space(10.0);
+
+                    section(ui, "When viewing", p);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Start in").color(p.text));
+                        egui::ComboBox::from_id_salt("view")
+                            .width(250.0)
+                            .selected_text(viewer::mode_name(s.view))
+                            .show_ui(ui, |ui| {
+                                for m in [MODE_FIT, MODE_FIT_MORE_SPACE, MODE_FIT_LARGER, MODE_HOST_SCREEN] {
+                                    ui.selectable_value(&mut s.view, m, viewer::mode_name(m));
+                                }
+                            });
+                    });
+                    segmented(
+                        ui,
+                        &mut s.full_colour,
+                        &[(false, "Fast \u{00B7} 4:2:0"), (true, "Full colour \u{00B7} 4:4:4")],
+                        p,
+                    );
+                    ui.label(
+                        RichText::new("Fast has the lowest lag. Full colour is exact but adds some lag. Both can be switched while viewing, from the bar at the top edge.")
+                            .size(12.5)
+                            .color(p.weak),
+                    );
+                    ui.add_space(10.0);
+
+                    section(ui, "Paired devices", p);
+                    if peers.is_empty() {
+                        ui.label(RichText::new("None yet.").color(p.weak));
                     }
+                    for peer in &peers {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                ui.label(RichText::new(truncate(&peer.name, 32)).color(p.strong));
+                                let mut roles = Vec::new();
+                                if peer.roles & ROLE_VIEWER != 0 {
+                                    roles.push("can view this PC");
+                                }
+                                if peer.roles & ROLE_HOST != 0 {
+                                    roles.push("this PC can view it");
+                                }
+                                ui.label(RichText::new(roles.join(" \u{00B7} ")).size(12.5).color(p.weak));
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let f = ui.add(
+                                    egui::Label::new(RichText::new("Forget").color(p.danger)).sense(Sense::click()),
+                                );
+                                if f.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                    forget = Some(peer.fingerprint);
+                                }
+                            });
+                        });
+                    }
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "This PC \u{201C}{}\u{201D} \u{00B7} id {} \u{00B7} protocol v{}",
+                            self.device.name,
+                            fingerprint_short(&self.device.fingerprint()),
+                            PROTOCOL_VERSION
+                        ))
+                        .size(12.0)
+                        .color(p.weak),
+                    );
+                    ui.add_space(6.0);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(accent_button("Done", p)).clicked()
+                            || ui.input(|i| i.key_pressed(egui::Key::Escape))
+                        {
+                            close = true;
+                        }
+                    });
                 });
                 if s != self.settings {
                     if s.theme != self.settings.theme {
@@ -1081,6 +1618,10 @@ impl GlassApp {
                     }
                     self.settings = s;
                     self.settings.save();
+                }
+                if let Some(fp) = forget {
+                    let _ = self.device.forget(&fp);
+                    self.scan();
                 }
             }
         }

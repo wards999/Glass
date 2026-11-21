@@ -1,6 +1,7 @@
 import AppKit
 import CGlassCore
 import Foundation
+import Symbols
 import GlassKit
 import UniformTypeIdentifiers
 
@@ -12,7 +13,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var hostField: NSTextField!
     private var connectButton: NSButton!
     private var listStack: NSStackView!
-    private var machineButtons: [NSButton] = []
+    private var countLabel: NSTextField?
+    private var connectingHost: String?
+    private var addressRow: NSStackView!
+    private var addressLink: NSButton!
+    private var shareSwitch: NSSwitch?
+    private var themeButton: NSButton?
+    private var settingsPopover: NSPopover?
     private var found: [DiscoveredHost] = []
     private let browser = GlassBrowser()
     private let pairedMenu = NSMenu(title: "Paired Devices")
@@ -98,6 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             self?.showConnect()
         }
         hostController = h
+        shareSwitch?.state = .on
         h.open()
     }
 
@@ -150,6 +158,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     private func showConnect() {
         if connectWindow == nil { buildConnectWindow() }
+        connectingHost = nil
+        shareSwitch?.state = hostController == nil ? .off : .on
         connectButton.isEnabled = true
         connectButton.title = "Connect"
         browser.start()
@@ -161,7 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func setBusy(_ title: String) {
         connectButton.isEnabled = false
         connectButton.title = title
-        machineButtons.forEach { $0.isEnabled = false }
+        refreshFound()
     }
 
     // MARK: theme (System / Light / Dark)
@@ -174,14 +184,118 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
     }
 
-    @objc private func pickTheme(_ sender: NSPopUpButton) {
-        let t = ["system", "light", "dark"][max(0, sender.indexOfSelectedItem)]
-        UserDefaults.standard.set(t, forKey: "theme")
+    /// The header's quick switch: light <-> dark (Settings also offers System).
+    @objc private func quickTheme(_ sender: NSButton) {
+        UserDefaults.standard.set(isDark ? "light" : "dark", forKey: "theme")
         applyTheme()
+        updateThemeButton()
     }
 
-    @objc private func showPaired(_ sender: NSButton) {
-        pairedMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    private var isDark: Bool { NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua }
+
+    private func updateThemeButton() {
+        themeButton?.image = NSImage(systemSymbolName: isDark ? "sun.max" : "moon", accessibilityDescription: isDark ? "Switch to light" : "Switch to dark")
+        themeButton?.toolTip = isDark ? "Switch to light" : "Switch to dark"
+    }
+
+    // MARK: settings (a popover from the gear)
+
+    @objc private func showSettings(_ sender: NSButton) {
+        let vc = NSViewController()
+        vc.view = settingsView()
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.contentViewController = vc
+        pop.show(relativeTo: sender.bounds, of: sender, preferredEdge: .maxY)
+        settingsPopover = pop
+    }
+
+    private func settingsView() -> NSView {
+        func heading(_ t: String, _ size: CGFloat = 13) -> NSTextField {
+            let l = NSTextField(labelWithString: t)
+            l.font = .systemFont(ofSize: size, weight: .semibold)
+            return l
+        }
+        let theme = NSSegmentedControl(labels: ["System", "Light", "Dark"], trackingMode: .selectOne,
+                                       target: self, action: #selector(pickThemeSegment(_:)))
+        theme.selectedSegment = ["system", "light", "dark"].firstIndex(of: UserDefaults.standard.string(forKey: "theme") ?? "system") ?? 0
+        theme.segmentDistribution = .fillEqually
+        let colour = NSSegmentedControl(labels: ["Fast \u{00B7} 4:2:0", "Full colour \u{00B7} 4:4:4"], trackingMode: .selectOne,
+                                        target: self, action: #selector(pickColour(_:)))
+        colour.selectedSegment = UserDefaults.standard.bool(forKey: "fullColour") ? 1 : 0
+        colour.segmentDistribution = .fillEqually
+        let note = NSTextField(wrappingLabelWithString: "Fast has the lowest lag. Full colour is exact but adds some lag. Both can be switched while viewing, from the bar at the top edge.")
+        note.font = .systemFont(ofSize: 11)
+        note.textColor = .secondaryLabelColor
+        var views: [NSView] = [heading("Settings", 17), heading("Appearance"), theme,
+                               heading("Colour when viewing"), colour, note, heading("Paired devices")]
+        let peers = GlassDevice.shared?.peers ?? []
+        if peers.isEmpty {
+            let none = NSTextField(labelWithString: "None yet.")
+            none.textColor = .secondaryLabelColor
+            views.append(none)
+        }
+        for p in peers {
+            let name = NSTextField(labelWithString: p.name)
+            name.lineBreakMode = .byTruncatingTail
+            name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            var roles: [String] = []
+            if p.roles & 2 != 0 { roles.append("can view this Mac") }
+            if p.roles & 1 != 0 { roles.append("this Mac can view it") }
+            let detail = NSTextField(labelWithString: roles.joined(separator: " \u{00B7} "))
+            detail.font = .systemFont(ofSize: 11)
+            detail.textColor = .secondaryLabelColor
+            let texts = NSStackView(views: [name, detail])
+            texts.orientation = .vertical
+            texts.alignment = .leading
+            texts.spacing = 1
+            let forget = NSButton(title: "Forget", target: self, action: #selector(forgetFromSettings(_:)))
+            forget.isBordered = false
+            forget.contentTintColor = .systemRed
+            forget.identifier = NSUserInterfaceItemIdentifier(p.hex)
+            views.append(NSStackView(views: [texts, NSView(), forget]))
+        }
+        let id = GlassDevice.shared.map { " \u{00B7} id \($0.fingerprintHexPrefix)" } ?? ""
+        let about = NSTextField(labelWithString: "This Mac \u{201C}\(GlassDevice.computerName)\u{201D}\(id) \u{00B7} protocol v\(glass_protocol_version())")
+        about.font = .systemFont(ofSize: 11)
+        about.textColor = .tertiaryLabelColor
+        views.append(about)
+        let stack = NSStackView(views: views)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.setCustomSpacing(14, after: theme)
+        stack.setCustomSpacing(14, after: note)
+        stack.setCustomSpacing(14, after: views[views.count - 2])
+        stack.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+        stack.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        for v in views where !(v is NSTextField) || v === note {
+            v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -36).isActive = true
+        }
+        return stack
+    }
+
+    @objc private func pickThemeSegment(_ sender: NSSegmentedControl) {
+        UserDefaults.standard.set(["system", "light", "dark"][max(0, sender.selectedSegment)], forKey: "theme")
+        applyTheme()
+        updateThemeButton()
+    }
+
+    @objc private func pickColour(_ sender: NSSegmentedControl) {
+        UserDefaults.standard.set(sender.selectedSegment == 1, forKey: "fullColour")
+    }
+
+    @objc private func forgetFromSettings(_ sender: NSButton) {
+        guard let d = GlassDevice.shared, let hex = sender.identifier?.rawValue,
+              let p = d.peers.first(where: { $0.hex == hex }) else { return }
+        settingsPopover?.close()
+        let a = NSAlert()
+        a.messageText = "Forget \u{201C}\(p.name)\u{201D}?"
+        a.informativeText = "This Mac will no longer trust it. To connect again you'll pair with a new code."
+        a.addButton(withTitle: "Forget")
+        a.addButton(withTitle: "Cancel")
+        if a.runModal() == .alertFirstButtonReturn { d.forget(p) }
+        refreshFound()
     }
 
     // MARK: discovery
@@ -189,40 +303,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func refreshFound() {
         guard let listStack else { return }
         listStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        machineButtons = []
-        let busy = !(connectButton?.isEnabled ?? true)
+        countLabel?.stringValue = found.isEmpty ? "" : "\(found.count)"
         if found.isEmpty {
-            let l = NSTextField(wrappingLabelWithString: "Looking for Macs and PCs with Glass\u{2026}  Start sharing on the other machine, or type its address below.")
-            l.textColor = .secondaryLabelColor
-            add(card(l))
+            add(EmptyState())
             return
         }
-        for (i, h) in found.enumerated() {
-            let paired = GlassDevice.shared?.pairedHost(prefix: h.fingerprintPrefix) != nil
-            let versionOK = h.version.map { $0 == String(glass_protocol_version()) } ?? true
-            let name = NSTextField(labelWithString: h.name)
-            name.font = .systemFont(ofSize: 15, weight: .semibold)
-            name.lineBreakMode = .byTruncatingTail
-            name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            let status = !versionOK ? tag("different Glass version", .systemOrange)
-                : paired ? tag("\u{2713} paired", .systemGreen) : tag("needs PIN", .systemOrange)
-            let top = NSStackView(views: [name, tag(h.kind, .secondaryLabelColor), status])
-            top.spacing = 6
-            let addr = NSTextField(labelWithString: h.address)
-            addr.textColor = .secondaryLabelColor
-            let left = NSStackView(views: [top, addr])
-            left.orientation = .vertical
-            left.alignment = .leading
-            left.spacing = 3
-            let b = NSButton(title: "Connect", target: self, action: #selector(connectFound(_:)))
-            b.tag = i
-            b.bezelColor = .controlAccentColor
-            b.controlSize = .large
-            b.isEnabled = versionOK && !busy
-            machineButtons.append(b)
-            let row = NSStackView(views: [left, NSView(), b])
-            row.orientation = .horizontal
-            add(card(row))
+        let me = String(glass_protocol_version())
+        let hosts = found.map { h -> (DiscoveredHost, Bool, Bool) in
+            (h, GlassDevice.shared?.pairedHost(prefix: h.fingerprintPrefix) != nil, h.version.map { $0 == me } ?? true)
+        }.sorted { a, b in
+            // Ready ones first, then by name.
+            (a.2 ? 0 : 1, a.1 ? 0 : 1, a.0.name.lowercased()) < (b.2 ? 0 : 1, b.1 ? 0 : 1, b.0.name.lowercased())
+        }
+        for (h, paired, versionOK) in hosts {
+            let (status, colour): (String, NSColor) = !versionOK ? ("Update Glass", .tertiaryLabelColor)
+                : paired ? ("Ready", .systemGreen) : ("Pair", .systemOrange)
+            let kind = h.os == "mac" ? "Mac" : h.os == "windows" ? "Windows PC" : "Glass"
+            let row = DeviceRow(name: h.name, detail: "\(kind) \u{00B7} \(h.address)", mac: h.os == "mac",
+                                status: status, statusColour: colour,
+                                enabled: versionOK && connectingHost == nil,
+                                busy: connectingHost == h.address)
+            if !versionOK { row.toolTip = "This device runs a different version of Glass. Install the same build on both." }
+            row.onClick = { [weak self] in self?.connectFound(h) }
+            add(row)
         }
     }
 
@@ -231,54 +334,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         v.widthAnchor.constraint(equalTo: listStack.widthAnchor).isActive = true
     }
 
-    @objc private func connectFound(_ sender: NSButton) {
-        guard sender.tag < found.count, connectButton.isEnabled else { return }
-        let h = found[sender.tag]
+    private func connectFound(_ h: DiscoveredHost) {
+        guard connectButton.isEnabled else { return }
         hostField.stringValue = h.port == GlassClient.defaultPort ? h.address : "\(h.address):\(h.port)"
         connect()
     }
 
+    @objc private func toggleAddress() {
+        addressRow.isHidden.toggle()
+        addressLink.title = addressRow.isHidden ? "+  Connect by address" : "\u{2212}  Connect by address"
+        if !addressRow.isHidden { connectWindow?.makeFirstResponder(hostField) }
+    }
+
+    @objc private func shareSwitched(_ sender: NSSwitch) {
+        if sender.state == .on { shareThisMac() }
+    }
+
+    @objc private func lookAgain() {
+        browser.stop()
+        browser.start()
+    }
+
     private func buildConnectWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 600),
-                         styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        w.title = "Glass \(appVersion)"
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 640),
+                         styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                         backing: .buffered, defer: false)
+        w.title = "Glass"
+        w.titlebarAppearsTransparent = true
+        w.titleVisibility = .hidden
         w.isReleasedWhenClosed = false
         w.delegate = self
-        w.contentMinSize = NSSize(width: 480, height: 460)
+        w.backgroundColor = Look.bg
+        w.contentMinSize = NSSize(width: 380, height: 500)
 
-        // Header: title and theme.
+        // Header: icon, name, this Mac; theme and settings.
+        let icon = NSImageView(image: NSApp.applicationIconImage ?? NSImage())
+        icon.translatesAutoresizingMaskIntoConstraints = false
         let title = NSTextField(labelWithString: "Glass")
-        title.font = .systemFont(ofSize: 26, weight: .bold)
-        let theme = NSPopUpButton(frame: .zero, pullsDown: false)
-        theme.addItems(withTitles: ["Theme: System", "Theme: Light", "Theme: Dark"])
-        let saved = UserDefaults.standard.string(forKey: "theme") ?? "system"
-        theme.selectItem(at: ["system", "light", "dark"].firstIndex(of: saved) ?? 0)
-        theme.target = self
-        theme.action = #selector(pickTheme(_:))
-        let header = NSStackView(views: [title, NSView(), theme])
-        let id = GlassDevice.shared.map { "  \u{00B7}  id \($0.fingerprintHexPrefix)" } ?? ""
-        let me = NSTextField(labelWithString: "This Mac: \u{201C}\(GlassDevice.computerName)\u{201D}\(id)")
+        title.font = .systemFont(ofSize: 22, weight: .semibold)
+        let me = NSTextField(labelWithString: "This Mac \u{00B7} \(GlassDevice.computerName)")
+        me.font = .systemFont(ofSize: 12)
         me.textColor = .secondaryLabelColor
+        let names = NSStackView(views: [title, me])
+        names.orientation = .vertical
+        names.alignment = .leading
+        names.spacing = 0
+        themeButton = symbolButton("moon", "Switch to dark", #selector(quickTheme(_:)))
+        updateThemeButton()
+        let gear = symbolButton("gearshape", "Settings", #selector(showSettings(_:)))
+        let header = NSStackView(views: [icon, names, NSView(), themeButton, gear])
+        header.spacing = 10
+        header.alignment = .centerY
 
-        // Sharing.
-        let shareTitle = NSTextField(labelWithString: "Share this Mac")
-        shareTitle.font = .systemFont(ofSize: 16, weight: .semibold)
-        let shareNote = NSTextField(labelWithString: "Let another Mac or PC view and control this Mac.")
-        shareNote.textColor = .secondaryLabelColor
-        let shareText = NSStackView(views: [shareTitle, shareNote])
-        shareText.orientation = .vertical
-        shareText.alignment = .leading
-        shareText.spacing = 3
-        let share = NSButton(title: "Start Sharing\u{2026}", target: self, action: #selector(shareThisMac))
-        share.bezelColor = .controlAccentColor
-        share.controlSize = .large
-        let shareCard = card(NSStackView(views: [shareText, NSView(), share]))
-
-        // Machines.
-        let machines = NSTextField(labelWithString: "Machines on this network")
-        machines.font = .systemFont(ofSize: 16, weight: .semibold)
-        let paired = NSButton(title: "Paired Devices", target: self, action: #selector(showPaired(_:)))
-        let machinesHeader = NSStackView(views: [machines, NSView(), paired])
+        // Devices.
+        let devices = NSTextField(labelWithString: "DEVICES")
+        devices.font = .systemFont(ofSize: 11, weight: .semibold)
+        devices.textColor = .secondaryLabelColor
+        let count = NSTextField(labelWithString: "")
+        count.font = .systemFont(ofSize: 11)
+        count.textColor = .secondaryLabelColor
+        countLabel = count
+        let refresh = symbolButton("arrow.clockwise", "Look again", #selector(lookAgain))
+        let devicesHeader = NSStackView(views: [devices, count, NSView(), refresh])
+        devicesHeader.spacing = 6
         listStack = NSStackView()
         listStack.orientation = .vertical
         listStack.alignment = .leading
@@ -301,7 +419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
             doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
             doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
-            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 140),
+            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 150),
         ])
         browser.onChange = { [weak self] hosts in
             // Not this Mac itself.
@@ -310,30 +428,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             self?.refreshFound()
         }
 
-        // A typed address.
-        let label = NSTextField(labelWithString: "Or an address:")
+        // A typed address, tucked away.
+        addressLink = NSButton(title: "+  Connect by address", target: self, action: #selector(toggleAddress))
+        addressLink.isBordered = false
+        addressLink.contentTintColor = .controlAccentColor
+        addressLink.font = .systemFont(ofSize: 13)
         hostField = NSTextField(string: UserDefaults.standard.string(forKey: "lastHost") ?? "")
-        hostField.placeholderString = "e.g. 192.168.1.20"
+        hostField.placeholderString = "Address, e.g. 192.168.1.20"
+        hostField.controlSize = .large
         hostField.target = self
         hostField.action = #selector(connect)
         connectButton = NSButton(title: "Connect", target: self, action: #selector(connect))
         connectButton.keyEquivalent = "\r"
-        let addressRow = NSStackView(views: [label, hostField, connectButton, NSView()])
-        let open = NSButton(title: "Open Recording\u{2026}", target: self, action: #selector(openRecording))
-        open.controlSize = .small
-        let note = NSTextField(labelWithString: "Paired devices only; everything is encrypted. While viewing, move to the top edge for the bar.")
-        note.textColor = .secondaryLabelColor
-        note.font = .systemFont(ofSize: 11)
-        note.lineBreakMode = .byTruncatingTail
-        note.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let footer = NSStackView(views: [note, NSView(), open])
+        connectButton.controlSize = .large
+        addressRow = NSStackView(views: [hostField, connectButton])
+        addressRow.isHidden = true
 
-        let stack = NSStackView(views: [header, me, shareCard, machinesHeader, scroll, addressRow, footer])
+        // Sharing, at the bottom.
+        let shareTile = LayerView(fill: Look.track, stroke: nil, radius: 11)
+        let shareIcon = NSImageView(image: NSImage(systemSymbolName: "laptopcomputer", accessibilityDescription: nil) ?? NSImage())
+        shareIcon.symbolConfiguration = .init(pointSize: 20, weight: .regular)
+        shareIcon.contentTintColor = .secondaryLabelColor
+        center(shareIcon, in: shareTile, size: 44)
+        let shareTitle = NSTextField(labelWithString: "Share this Mac")
+        shareTitle.font = .systemFont(ofSize: 15, weight: .semibold)
+        let shareNote = NSTextField(labelWithString: "Off \u{00B7} other devices can\u{2019}t connect")
+        shareNote.font = .systemFont(ofSize: 12)
+        shareNote.textColor = .secondaryLabelColor
+        let shareText = NSStackView(views: [shareTitle, shareNote])
+        shareText.orientation = .vertical
+        shareText.alignment = .leading
+        shareText.spacing = 2
+        shareSwitch = NSSwitch()
+        shareSwitch.target = self
+        shareSwitch.action = #selector(shareSwitched(_:))
+        let shareRow = NSStackView(views: [shareTile, shareText, NSView(), shareSwitch])
+        shareRow.spacing = 12
+        shareRow.alignment = .centerY
+        let shareCard = Card(shareRow)
+
+        let stack = NSStackView(views: [header, devicesHeader, scroll, addressLink, addressRow, shareCard])
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 10
-        stack.setCustomSpacing(18, after: shareCard)
-        stack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 16, right: 20)
+        stack.spacing = 8
+        stack.setCustomSpacing(20, after: header)
+        stack.setCustomSpacing(12, after: addressRow)
+        stack.edgeInsets = NSEdgeInsets(top: 40, left: 22, bottom: 20, right: 22)
         stack.translatesAutoresizingMaskIntoConstraints = false
         let content = NSView()
         content.addSubview(stack)
@@ -342,15 +482,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             stack.topAnchor.constraint(equalTo: content.topAnchor),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            hostField.widthAnchor.constraint(equalToConstant: 220),
+            icon.widthAnchor.constraint(equalToConstant: 44),
+            icon.heightAnchor.constraint(equalToConstant: 44),
         ]
-        for v in [header, shareCard, machinesHeader, scroll, addressRow, footer] {
-            cs.append(v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40))
+        for v in [header, devicesHeader, scroll, addressRow, shareCard] {
+            cs.append(v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44))
         }
         NSLayoutConstraint.activate(cs)
         w.contentView = content
+        w.setContentSize(NSSize(width: 440, height: 640))
         w.center()
         connectWindow = w
+    }
+
+    private func symbolButton(_ symbol: String, _ tip: String, _ action: Selector) -> NSButton {
+        let b = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: tip) ?? NSImage(),
+                         target: self, action: action)
+        b.isBordered = false
+        b.bezelStyle = .regularSquare
+        b.symbolConfiguration = .init(pointSize: 15, weight: .regular)
+        b.contentTintColor = .secondaryLabelColor
+        b.toolTip = tip
+        b.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        b.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        return b
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -375,6 +530,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func connectTo(_ host: String, _ port: UInt16) {
+        connectingHost = host
         setBusy("Connecting…")
         DispatchQueue.global(qos: .userInitiated).async {
             // The view last used with this host (default: fit), and the colour choice.
@@ -522,37 +678,218 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 }
 
-/// Top-down layout for the scrolling machine list.
+// MARK: - Look (same palette as the Windows app)
+
+enum Look {
+    private static func rgb(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> NSColor {
+        NSColor(srgbRed: r / 255, green: g / 255, blue: b / 255, alpha: 1)
+    }
+    private static func dyn(_ light: NSColor, _ dark: NSColor) -> NSColor {
+        NSColor(name: nil) { $0.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light }
+    }
+    static let bg = dyn(rgb(243, 245, 248), rgb(17, 19, 23))
+    static let card = dyn(.white, rgb(27, 31, 37))
+    static let border = dyn(rgb(225, 229, 235), rgb(42, 48, 57))
+    static let hover = dyn(rgb(241, 246, 253), rgb(33, 39, 48))
+    static let track = dyn(rgb(234, 237, 242), rgb(37, 42, 50))
+}
+
+/// Top-down layout for the scrolling device list.
 private final class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
-/// A rounded card that follows light/dark.
-private func card(_ content: NSView) -> NSBox {
-    let b = NSBox()
-    b.boxType = .custom
-    b.titlePosition = .noTitle
-    b.cornerRadius = 12
-    b.borderWidth = 1
-    b.borderColor = .separatorColor
-    b.fillColor = .controlBackgroundColor
-    b.contentViewMargins = NSSize(width: 14, height: 12)
-    b.contentView = content
-    return b
+/// A rounded, layer-backed view whose colours follow light/dark.
+class LayerView: NSView {
+    var fill: NSColor { didSet { needsDisplay = true } }
+    var stroke: NSColor? { didSet { needsDisplay = true } }
+    var radius: CGFloat
+
+    init(fill: NSColor = Look.card, stroke: NSColor? = Look.border, radius: CGFloat = 14) {
+        self.fill = fill
+        self.stroke = stroke
+        self.radius = radius
+        super.init(frame: .zero)
+        wantsLayer = true
+        translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = fill.cgColor
+            layer?.borderColor = stroke?.cgColor
+        }
+        layer?.cornerRadius = radius
+        layer?.borderWidth = stroke == nil ? 0 : 1
+    }
 }
 
-/// A small rounded tag ("Mac", "✓ paired").
-private func tag(_ text: String, _ colour: NSColor) -> NSView {
-    let l = NSTextField(labelWithString: text)
-    l.font = .systemFont(ofSize: 11, weight: .medium)
-    l.textColor = colour
-    let b = NSBox()
-    b.boxType = .custom
-    b.titlePosition = .noTitle
-    b.cornerRadius = 8
-    b.borderWidth = 0
-    b.fillColor = colour.withAlphaComponent(0.16)
-    b.contentViewMargins = NSSize(width: 7, height: 2)
-    b.contentView = l
-    return b
+/// A card: `content` with 16 pt of padding.
+final class Card: LayerView {
+    init(_ content: NSView, inset: CGFloat = 16) {
+        super.init()
+        content.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
+            content.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
+            content.topAnchor.constraint(equalTo: topAnchor, constant: inset),
+            content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -inset),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+}
+
+private func center(_ v: NSView, in box: NSView, size: CGFloat) {
+    v.translatesAutoresizingMaskIntoConstraints = false
+    box.addSubview(v)
+    NSLayoutConstraint.activate([
+        box.widthAnchor.constraint(equalToConstant: size),
+        box.heightAnchor.constraint(equalToConstant: size),
+        v.centerXAnchor.constraint(equalTo: box.centerXAnchor),
+        v.centerYAnchor.constraint(equalTo: box.centerYAnchor),
+    ])
+}
+
+/// One device: click anywhere to connect. Hover shows a Connect pill.
+final class DeviceRow: LayerView {
+    var onClick: (() -> Void)?
+    private let enabled: Bool
+    private let statusStack: NSStackView
+    private let pill = LayerView(fill: .controlAccentColor, stroke: nil, radius: 13)
+    private var hovering = false {
+        didSet {
+            let on = hovering && enabled
+            fill = on ? Look.hover : Look.card
+            stroke = on ? NSColor.controlAccentColor.withAlphaComponent(0.6) : Look.border
+            pill.isHidden = !on
+            statusStack.isHidden = on
+        }
+    }
+
+    init(name: String, detail: String, mac: Bool, status: String, statusColour: NSColor, enabled: Bool, busy: Bool) {
+        self.enabled = enabled
+        let dot = LayerView(fill: statusColour, stroke: nil, radius: 4)
+        dot.widthAnchor.constraint(equalToConstant: 8).isActive = true
+        dot.heightAnchor.constraint(equalToConstant: 8).isActive = true
+        let statusLabel = NSTextField(labelWithString: status)
+        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabelColor
+        statusStack = NSStackView(views: [dot, statusLabel])
+        statusStack.spacing = 6
+        statusStack.alignment = .centerY
+        super.init()
+
+        let tile = LayerView(fill: NSColor.controlAccentColor.withAlphaComponent(0.13), stroke: nil, radius: 11)
+        let img = NSImageView(image: NSImage(systemSymbolName: mac ? "laptopcomputer" : "desktopcomputer",
+                                             accessibilityDescription: nil) ?? NSImage())
+        img.symbolConfiguration = .init(pointSize: 20, weight: .regular)
+        img.contentTintColor = .controlAccentColor
+        center(img, in: tile, size: 44)
+        let title = NSTextField(labelWithString: name)
+        title.font = .systemFont(ofSize: 15, weight: .semibold)
+        title.lineBreakMode = .byTruncatingTail
+        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let sub = NSTextField(labelWithString: detail)
+        sub.font = .systemFont(ofSize: 12)
+        sub.textColor = .secondaryLabelColor
+        let texts = NSStackView(views: [title, sub])
+        texts.orientation = .vertical
+        texts.alignment = .leading
+        texts.spacing = 2
+        if !enabled && !busy {
+            tile.alphaValue = 0.5
+            title.alphaValue = 0.5
+        }
+
+        let pillLabel = NSTextField(labelWithString: "Connect")
+        pillLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        pillLabel.textColor = .white
+        pillLabel.translatesAutoresizingMaskIntoConstraints = false
+        pill.addSubview(pillLabel)
+        NSLayoutConstraint.activate([
+            pillLabel.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 14),
+            pillLabel.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -14),
+            pillLabel.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+            pill.heightAnchor.constraint(equalToConstant: 26),
+        ])
+        pill.isHidden = true
+
+        var right: [NSView] = [statusStack, pill]
+        if busy {
+            let spin = NSProgressIndicator()
+            spin.style = .spinning
+            spin.controlSize = .small
+            spin.startAnimation(nil)
+            right = [spin]
+        }
+        let row = NSStackView(views: [tile, texts, NSView()] + right)
+        row.spacing = 14
+        row.alignment = .centerY
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 70),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 13),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            row.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {
+        guard enabled, bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+        onClick?()
+    }
+    override func resetCursorRects() {
+        if enabled { addCursorRect(bounds, cursor: .pointingHand) }
+    }
+}
+
+/// Shown while no device has been found.
+final class EmptyState: LayerView {
+    init() {
+        super.init()
+        let ring = LayerView(fill: NSColor.controlAccentColor.withAlphaComponent(0.13), stroke: nil, radius: 28)
+        let img = NSImageView(image: NSImage(systemSymbolName: "dot.radiowaves.left.and.right", accessibilityDescription: nil) ?? NSImage())
+        img.symbolConfiguration = .init(pointSize: 22, weight: .regular)
+        img.contentTintColor = .controlAccentColor
+        img.addSymbolEffect(.variableColor.iterative)
+        center(img, in: ring, size: 56)
+        let title = NSTextField(labelWithString: "Looking for devices\u{2026}")
+        title.font = .systemFont(ofSize: 14, weight: .semibold)
+        let note = NSTextField(labelWithString: "Turn on sharing on your Mac or PC and it appears here.")
+        note.font = .systemFont(ofSize: 12)
+        note.textColor = .secondaryLabelColor
+        let stack = NSStackView(views: [ring, title, note])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 6
+        stack.setCustomSpacing(14, after: ring)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 190),
+            stack.centerXAnchor.constraint(equalTo: centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
 }

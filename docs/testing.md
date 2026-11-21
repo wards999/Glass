@@ -10,23 +10,26 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
-## M3d test 5 (the new look, themes; replaces test 4)
+## M3d test 6 (the redesigned window; replaces tests 4 and 5)
 Use the zip and dmg from the same test build (protocol v7). Extract the zip
 on both PCs.
-1. **PC:** double-click **Glass.exe**. The new window opens (no black flash):
-   a "Share this PC" card and a card for each machine with Glass, tagged
-   Mac/PC and "paired" or "needs PIN".
-2. **Theme:** try Theme: Light / Dark / System (top right) on the PC and on
-   the Mac. Restart each app: the choice is kept.
-3. **Connect** from a machine's card. The PIN dialog appears the first time.
-   Use the bar, then disconnect: the results window opens with Copy.
-4. **Start sharing** on the PC; the PIN shows large in the card. Connect from
-   the Mac. Close the PC window while sharing: Glass stays in the tray
-   (right-click it for Open / Stop sharing / Quit).
-5. **No loops:** while the PC views the Mac, on the Mac (in the remote view)
-   connect back to the PC. It must refuse.
-6. **PC → PC** with the second PC, if handy.
-7. Send the results and anything that looked or felt wrong.
+1. **Look:** open Glass on the PC and the Mac. Devices on the network are
+   rows ("Ready" = paired, "Pair" = needs a code). With none found, a
+   "Looking for devices" card shows instead.
+2. **Theme:** the moon/sun button switches light/dark; the gear opens
+   Settings (System/Light/Dark, colour, paired devices with Forget). Restart
+   each app: the choice is kept.
+3. **Connect:** click a device row (hover shows Connect). The code dialog
+   appears the first time. Use the bar, then disconnect: results open with
+   Copy.
+4. **Share:** flip the "Share this PC" / "Share this Mac" switch. Connect from
+   the other machine; on the PC the pairing code shows in large tiles. Close
+   the PC window while sharing: Glass stays in the tray.
+5. **No loops:** while the PC views the Mac, connect from the Mac (in the
+   remote view) back to the PC. It must refuse.
+6. **PC to PC** with the second PC, if handy.
+7. Send the results, screenshots of the Mac window (light and dark), and
+   anything that looked or felt wrong.
 
 ## M3d test 4 (the Glass window, machine list, no loops)
 Use the zip and dmg from the same test build (protocol v7). Extract the zip

@@ -630,9 +630,21 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         link?.invalidate()
         link = nil
         window.delegate = nil
-        if window.isVisible { window.close() }
+        // Keep the window alive until macOS has finished with it: closing a
+        // full-screen window runs an exit animation after close() returns,
+        // and this viewer (its only owner) goes away in onFinish. That
+        // crashed when the host ended a full-screen session.
+        let w: NSWindow = window
+        LiveViewer.closing.append(w)
+        if w.isVisible { w.close() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            LiveViewer.closing.removeAll { $0 === w }
+        }
         onFinish(report(reason))
     }
+
+    /// Windows of finished viewers, kept for a few seconds (see `completed`).
+    private static var closing: [NSWindow] = []
 
     private func report(_ reason: String) -> String {
         lock.withLock {

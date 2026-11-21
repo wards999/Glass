@@ -24,7 +24,7 @@ path = "src/gui.rs"
 glass-core = { path = "../core" }
 
 [target.'cfg(windows)'.dependencies]
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "clipboard", "accesskit"] }
 # Raw FFI from the ffmpeg-next project; the safe wrapper doesn't cover D3D11 hw frames.
 ffmpeg-sys-next = { version = "9.1", default-features = false, features = ["avcodec"] }
 tray-icon = "0.26.1"

@@ -248,6 +248,9 @@ pub fn run(share: bool) -> Res<()> {
             if app.demo.as_deref() == Some("settings") {
                 app.dialog = Dialog::Settings;
             }
+            if app.demo.as_deref() == Some("report") {
+                app.dialog = Dialog::Report("Glass copy check: results text".into(), false);
+            }
             if share {
                 app.toggle_share();
             }
@@ -1380,6 +1383,8 @@ impl eframe::App for GlassApp {
 impl GlassApp {
     fn dialogs(&mut self, ctx: &egui::Context, p: &Pal) {
         let mut close = false;
+        // GLASS_DEBUG_DEMO=report presses Copy itself (clipboard check).
+        let auto_copy = self.demo.as_deref() == Some("report");
         match &mut self.dialog {
             Dialog::None => {}
             Dialog::Pin {
@@ -1465,13 +1470,14 @@ impl GlassApp {
                         .corner_radius(CornerRadius::same(10))
                         .inner_margin(Margin::same(12))
                         .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
+                            egui::ScrollArea::both()
                                 .max_height(320.0)
                                 .show(ui, |ui| {
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(text.as_str()).monospace().size(12.0),
                                         )
+                                        .extend()
                                         .selectable(true),
                                     );
                                 });
@@ -1489,6 +1495,7 @@ impl GlassApp {
                         if ui
                             .add(accent_button(label, p).min_size(vec2(130.0, 34.0)))
                             .clicked()
+                            || (auto_copy && !*copied)
                         {
                             ctx.copy_text(text.clone());
                             *copied = true;

@@ -85,3 +85,34 @@ settings; the Mac menu-bar icon; the Mac viewer's bar; the app icon.
 
 ![Glass window](img/m3d-app-window.png)
 
+
+## m3d-test6 (2026-11-21): the redesigned window
+
+The Glass window was rebuilt for both apps: egui on Windows (Segoe UI,
+Fluent icons), AppKit on the Mac (SF Symbols, system accent), with the same
+palette. It has device rows (click to connect), a sharing switch with the
+pairing code shown in large tiles, Settings behind the gear, and
+System/Light/Dark themes. Checked here with `GLASS_DEBUG_SHOT` and
+`GLASS_DEBUG_DEMO` (the device names are sample data):
+
+![Light, devices](img/m3d-window-light.png) ![Dark, sharing](img/m3d-window-dark-share.png)
+
+**Mac → PC, real hardware** (MacBook Air host, RTX 4070 PC, home Wi-Fi,
+81.8 s, the view and colour changed from the bar during the session):
+
+| | p50 | p99 | max |
+|---|---|---|---|
+| capture → screen | 15.48 ms | 32.04 ms | 124.97 ms |
+| input → screen | 30.77 ms | 134.10 ms | 137.02 ms |
+| network | 2.18 ms | 86.64 ms | 123.89 ms |
+| encode (Mac) | 5.30 ms | 14.00 ms | 34.43 ms |
+
+- 0 lost frames, 0 decode errors, 3.0 Mbps average. The Mac sends only on
+  change (27 fps average while in use).
+- capture → screen p50 (15.5 ms) is better than M3c's 17.5 ms. The p99 and
+  input → screen p99 tails come from Wi-Fi spikes (network p99 87 ms), which
+  is M4's job.
+- The present-interval max (9.3 s) is an idle screen, not a stall.
+- **Bug found:** Copy results (and Ctrl+C in the results) did nothing,
+  because eframe's clipboard feature was off. Fixed for m3d-test7: Copy was
+  checked against the Windows clipboard here.

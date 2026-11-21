@@ -420,7 +420,7 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
             format!(
                 "DXGI frame statistics ({} of {} implausible, counted as the present call)",
                 r.stats_before_submit,
-                r.present.summary().count
+                r.presented
             )
         } else {
             "DXGI frame statistics".to_string()

@@ -7,6 +7,8 @@
 //! - UI thread: the window, a low-level keyboard hook (so Win, Alt+Tab and
 //!   friends go to the host while the window is in front), mouse messages,
 //!   and the host's pointer shape as this PC's own cursor (no round trip).
+//! - A control bar drops down from the top edge (`bar.rs`): view, colour,
+//!   full screen, pin, disconnect, status.
 //! - Local chords, never sent: Ctrl+Alt+Shift+F full screen/window,
 //!   Ctrl+Alt+Shift+R next view mode (M3c), Ctrl+Alt+Shift+Q disconnect.
 //! - 4:2:0 decodes on D3D11VA (any GPU); 4:4:4 on NVDEC (`decode444.rs`),
@@ -14,6 +16,7 @@
 //!
 //! LATER(M5): on-screen stats overlay; display-linked pacing.
 
+use super::bar::{self, Bar};
 use super::decode::{Decoder, Picture};
 use super::decode444::{self, CudaDecoder, Planar};
 use super::present::{fit, Presenter};
@@ -36,10 +39,10 @@ use std::time::Duration;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateDIBSection, DeleteObject, EnumDisplaySettingsW, GetMonitorInfoW,
-    MonitorFromPoint, MonitorFromWindow, ScreenToClient, BITMAPINFO, BITMAPV5HEADER, BI_BITFIELDS,
-    DEVMODEW, DIB_RGB_COLORS, ENUM_CURRENT_SETTINGS, HGDIOBJ, MONITORINFO, MONITORINFOEXW,
-    MONITOR_DEFAULTTONEAREST,
+    ClientToScreen, CreateBitmap, CreateDIBSection, DeleteObject, EnumDisplaySettingsW,
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, ScreenToClient, BITMAPINFO,
+    BITMAPV5HEADER, BI_BITFIELDS, DEVMODEW, DIB_RGB_COLORS, ENUM_CURRENT_SETTINGS, HGDIOBJ,
+    MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -114,6 +117,66 @@ const WM_NEXT_MODE: u32 = WM_APP + 4;
 /// Posted by the keyboard hook: full colour (4:4:4) on/off.
 const WM_TOGGLE_444: u32 = WM_APP + 5;
 const TIMER_CURSOR: usize = 1;
+const TIMER_SHOT: usize = 2;
+
+thread_local! {
+    static DEBUG_SHOT: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Saves the top 300 px of `hwnd`'s area on screen as a 24-bit BMP (debug).
+unsafe fn save_shot(hwnd: HWND, path: &std::path::Path) {
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetDIBits, ReleaseDC,
+        SelectObject, BITMAPINFOHEADER, BI_RGB, SRCCOPY,
+    };
+    let mut r = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut r);
+    let (w, h) = (r.right - r.left, (r.bottom - r.top).min(300));
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let screen = GetDC(None);
+    let mem = CreateCompatibleDC(Some(screen));
+    let bmp = CreateCompatibleBitmap(screen, w, h);
+    let old = SelectObject(mem, bmp.into());
+    let _ = BitBlt(mem, 0, 0, w, h, Some(screen), r.left, r.top, SRCCOPY);
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: h,
+            biPlanes: 1,
+            biBitCount: 24,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let stride = ((w * 3 + 3) & !3) as usize;
+    let mut px = vec![0u8; stride * h as usize];
+    GetDIBits(
+        mem,
+        bmp,
+        0,
+        h as u32,
+        Some(px.as_mut_ptr() as *mut _),
+        &mut info,
+        DIB_RGB_COLORS,
+    );
+    SelectObject(mem, old);
+    let _ = DeleteObject(bmp.into());
+    let _ = DeleteDC(mem);
+    ReleaseDC(None, screen);
+    let mut f = Vec::with_capacity(54 + px.len());
+    f.extend_from_slice(b"BM");
+    f.extend_from_slice(&((54 + px.len()) as u32).to_le_bytes());
+    f.extend_from_slice(&[0; 4]);
+    f.extend_from_slice(&54u32.to_le_bytes());
+    let hdr = std::slice::from_raw_parts(&info.bmiHeader as *const _ as *const u8, 40);
+    f.extend_from_slice(hdr);
+    f.extend_from_slice(&px);
+    let _ = std::fs::write(path, f);
+}
 
 /// Shared by the UI and render threads.
 struct Shared {
@@ -190,6 +253,10 @@ struct Ui {
     buttons: u8,
     render_done: bool,
     notice: u8,
+    /// The drop-down control bar, and when the pointer was last on it.
+    bar: Option<Bar>,
+    bar_seen_us: u64,
+    last_bar_status_us: u64,
 }
 
 thread_local! {
@@ -753,16 +820,159 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
             buttons: 0,
             render_done: false,
             notice: NOTICE_NONE,
+            bar: Bar::new(hwnd).ok(),
+            bar_seen_us: 0,
+            last_bar_status_us: 0,
         })
     });
     with_ui(|ui| ui.layout());
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = SetForegroundWindow(hwnd);
+    // GLASS_SHOW_BAR=1: start with the bar shown and pinned (checks, demos).
+    if std::env::var_os("GLASS_SHOW_BAR").is_some() {
+        with_ui(|ui| {
+            if let Some(b) = &mut ui.bar {
+                b.pinned = true;
+            }
+            ui.show_bar();
+        });
+    }
+    // GLASS_DEBUG_SHOT=FILE.bmp: save the top of the window (with the bar)
+    // two seconds in, to check how it looks without a person watching.
+    if let Some(path) = std::env::var_os("GLASS_DEBUG_SHOT") {
+        SetTimer(Some(hwnd), TIMER_SHOT, 2000, None);
+        DEBUG_SHOT.with(|d| *d.borrow_mut() = Some(path.into()));
+    }
     SetTimer(Some(hwnd), TIMER_CURSOR, 15, None);
     Ok(hwnd)
 }
 
 impl Ui {
+    /// The viewer's client area in screen coordinates.
+    fn client_on_screen(&self) -> RECT {
+        let mut r = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut r);
+            let mut tl = POINT {
+                x: r.left,
+                y: r.top,
+            };
+            let _ = ClientToScreen(self.hwnd, &mut tl);
+            RECT {
+                left: tl.x,
+                top: tl.y,
+                right: tl.x + (r.right - r.left),
+                bottom: tl.y + (r.bottom - r.top),
+            }
+        }
+    }
+
+    /// Puts the current view, colour and status on the bar.
+    fn update_bar(&mut self) {
+        let Some(bar) = &self.bar else { return };
+        let c = &self.sh.client;
+        let info = c.info();
+        let st = c.stats();
+        let status = format!(
+            "{}  ·  {}x{}  ·  {}  ·  round trip {:.0} ms",
+            c.peer().name,
+            info.width,
+            info.height,
+            if info.chroma == CHROMA_444 {
+                "4:4:4"
+            } else {
+                "4:2:0"
+            },
+            st.last_rtt_us as f64 / 1e3
+        );
+        bar.set_state(
+            info.mode,
+            info.chroma == CHROMA_444,
+            self.sh.can_444.load(Ordering::Relaxed),
+            self.fullscreen,
+            &status,
+        );
+        self.last_bar_status_us = clock::now_us();
+    }
+
+    fn show_bar(&mut self) {
+        self.update_bar();
+        let r = self.client_on_screen();
+        if let Some(bar) = &mut self.bar {
+            bar.show(r);
+        }
+        self.bar_seen_us = clock::now_us();
+    }
+
+    /// Hides the bar once the pointer has left it for a moment (unless pinned).
+    fn tick_bar(&mut self) {
+        let now = clock::now_us();
+        let (visible, pinned, r) = match &self.bar {
+            Some(b) => (b.visible, b.pinned, b.rect()),
+            None => return,
+        };
+        if !visible {
+            return;
+        }
+        if now.saturating_sub(self.last_bar_status_us) > 500_000 {
+            self.update_bar();
+        }
+        let mut pt = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pt);
+        }
+        let near = pt.x >= r.left - 12
+            && pt.x < r.right + 12
+            && pt.y >= r.top - 12
+            && pt.y < r.bottom + 12;
+        if near || pinned {
+            self.bar_seen_us = now;
+        } else if now.saturating_sub(self.bar_seen_us) > 700_000 {
+            if let Some(b) = &mut self.bar {
+                b.hide();
+            }
+        }
+    }
+
+    /// A click on the bar.
+    fn bar_command(&mut self, id: usize) {
+        let sh = self.sh.clone();
+        let c = &sh.client;
+        match id {
+            i if (bar::ID_VIEW..bar::ID_VIEW + MODE_COUNT as usize).contains(&i) => {
+                let m = (i - bar::ID_VIEW) as u8;
+                sh.mode.store(m, Ordering::Relaxed);
+                println!("Asking the host for: {} ...", mode_name(m));
+                c.set_mode(m, sh.allow_444());
+            }
+            bar::ID_420 | bar::ID_444 => {
+                let want = id == bar::ID_444;
+                sh.want_444.store(want, Ordering::Relaxed);
+                println!(
+                    "Asking the host for {} ...",
+                    if want { "full colour (4:4:4)" } else { "4:2:0" }
+                );
+                c.set_mode(sh.mode.load(Ordering::Relaxed), sh.allow_444());
+            }
+            bar::ID_FULLSCREEN => {
+                self.toggle_fullscreen();
+                if self.bar.as_ref().is_some_and(|b| b.visible) {
+                    self.show_bar();
+                }
+            }
+            bar::ID_PIN => {
+                if let Some(b) = &mut self.bar {
+                    b.pinned = !b.pinned;
+                }
+            }
+            bar::ID_DISCONNECT => unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            },
+            _ => {}
+        }
+        self.update_bar();
+    }
+
     /// Recomputes the picture area after a size change.
     fn layout(&mut self) {
         let (w, h) = client_size(self.hwnd);
@@ -978,6 +1188,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let (x, y) = xy(lparam);
                 let (nx, ny) = ui.to_host(x, y);
                 c.input_move(nx, ny);
+                // Pointer at the very top edge: show the control bar.
+                if y <= 1 && ui.buttons == 0 && !ui.bar.as_ref().is_some_and(|b| b.visible) {
+                    ui.show_bar();
+                }
+                Some(LRESULT(0))
+            }
+            bar::WM_BAR_COMMAND => {
+                ui.bar_command(wparam.0);
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN | WM_LBUTTONUP => {
@@ -1021,8 +1239,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 SetCursor(cur);
                 Some(LRESULT(1))
             }
+            WM_TIMER if wparam.0 == TIMER_SHOT => {
+                let _ = KillTimer(Some(hwnd), TIMER_SHOT);
+                if let Some(p) = DEBUG_SHOT.with(|d| d.borrow_mut().take()) {
+                    save_shot(hwnd, &p);
+                }
+                Some(LRESULT(0))
+            }
             WM_TIMER if wparam.0 == TIMER_CURSOR => {
                 ui.poll_cursor();
+                ui.tick_bar();
                 let notice = c.stats().host_notice;
                 if notice != ui.notice {
                     ui.notice = notice;
@@ -1045,6 +1271,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             WM_STREAM_CHANGED => {
                 ui.layout();
+                ui.update_bar();
                 let i = c.info();
                 println!(
                     "Now showing: {} at {}x{}, {}.",

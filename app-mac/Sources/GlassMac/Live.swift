@@ -105,9 +105,12 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         if client.hostIsMac { pcStyleModifiers = true }
     }
 
+    /// Last stream parameters seen (still readable after the client closes).
+    private lazy var shownInfo = client.info
+
     private var streamDesc: String {
-        let i = client.info
-        return "\(i.width)x\(i.height) @ \(i.fps) Hz HEVC \(client.is444 ? "4:4:4" : "4:2:0")"
+        let i = shownInfo
+        return "\(i.width)x\(i.height) @ \(i.fps) Hz HEVC \(Int32(i.chroma) == GLASS_CHROMA_444 ? "4:4:4" : "4:2:0")"
     }
 
     func open() {
@@ -476,6 +479,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     /// The host switched view or colour: new picture shape and pointer scale.
     private func streamChanged() {
         let i = client.info
+        shownInfo = i
         window.contentAspectRatio = NSSize(width: Int(i.width), height: Int(i.height))
         updateDrawableSize()
         cursorGeneration &-= 1 // rescale the pointer on the next poll

@@ -27,7 +27,10 @@ Use the zip and dmg from the same test build (protocol v6).
 3. **PC views PC** (the second PC): host.cmd on one, connect.cmd on the
    other. Ctrl stays Ctrl (Ctrl+C copies), the Win key opens Start on the
    host, and the views are greyed out.
-4. Send all the reports: connect.cmd text, host.cmd text, and the Mac's
+4. **No loops:** while the PC views the Mac, open Glass on the Mac (in the
+   remote view) and try to connect back to the PC. It must refuse with "that
+   would make a loop". After disconnecting, Mac → PC works again.
+5. Send all the reports: connect.cmd text, host.cmd text, and the Mac's
    Show Results.
 
 ## M3c (sharp text, view modes, 4:4:4)

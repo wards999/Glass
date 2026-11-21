@@ -34,6 +34,8 @@
 
 #define GLASS_HOST_EVENT_DENIED 6
 
+#define GLASS_HOST_EVENT_LOOP 7
+
 /**
  * `InputActionC::kind`.
  */
@@ -119,7 +121,8 @@
 #define GLASS_WRONG_TOTAL 10
 
 /**
- * Protocol version. 6 = M3d: `Welcome` says what the host is (OS) and can
+ * Protocol version. 7 = M3d: `Hello` lists who sees the viewer, so a host
+ * can refuse a connection loop (`REJECT_LOOP`). 6 = M3d: `Welcome` says what the host is (OS) and can
  * do (view modes, 4:4:4), so any host/viewer pair works the same way.
  * 5 = M3c: the viewer describes its screen and what it
  * can decode in `Hello`, picks a view mode (`SetMode`), and the host
@@ -127,7 +130,12 @@
  * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
  * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 6
+#define GLASS_PROTOCOL_VERSION 7
+
+/**
+ * Most "seen by" ids a `Hello` carries (no-loop rule).
+ */
+#define GLASS_MAX_SEEN_BY 8
 
 /**
  * `Welcome::host_os`.
@@ -245,6 +253,11 @@
 #define GLASS_REJECT_WRONG_PIN 6
 
 /**
+ * The host is this machine, or already sees it: the connection would loop.
+ */
+#define GLASS_REJECT_LOOP 7
+
+/**
  * Pairing messages (TLS control channel, before Hello; see `pairing.rs`).
  * Viewer -> host: `name` (UTF-8, ≤ 63 bytes).
  */
@@ -268,7 +281,7 @@
 /**
  * Largest encoded control message (including the 2-byte length).
  */
-#define GLASS_CONTROL_MAX 32
+#define GLASS_CONTROL_MAX 96
 
 /**
  * Largest control frame of any type (2-byte length + up to 65535).
@@ -359,6 +372,10 @@ enum GLASS_ConnectError
    * This device's identity couldn't be loaded, created or saved.
    */
   GLASS_ConnectError_Identity = 10,
+  /**
+   * The host is this machine, or already sees it: it would loop.
+   */
+  GLASS_ConnectError_Loop = 11,
 };
 #if __STDC_VERSION__ >= 202311L
 typedef enum GLASS_ConnectError GLASS_ConnectError;

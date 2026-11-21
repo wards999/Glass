@@ -10,7 +10,7 @@ import VideoToolbox
 
 /// Something the host's user should see.
 public struct GlassHostEvent {
-    public enum Kind { case pairingPin, paired, wrongPin, pairingLocked, refused, denied, other }
+    public enum Kind { case pairingPin, paired, wrongPin, pairingLocked, refused, denied, loop, other }
     public let kind: Kind
     public let device: String
     public let pin: String
@@ -31,6 +31,7 @@ public struct GlassHostEvent {
         case GLASS_HOST_EVENT_PAIRING_LOCKED: kind = .pairingLocked
         case GLASS_HOST_EVENT_REFUSED: kind = .refused
         case GLASS_HOST_EVENT_DENIED: kind = .denied
+        case GLASS_HOST_EVENT_LOOP: kind = .loop
         default: kind = .other
         }
         device = str(e.device)
@@ -58,6 +59,8 @@ public struct GlassHostEvent {
             return "Refused a device that isn't paired with this Mac (\(address), id \(device))."
         case .denied:
             return "Did not allow \u{201C}\(device)\u{201D} to connect."
+        case .loop:
+            return "Refused \u{201C}\(device)\u{201D}: this Mac is already viewing it (directly or through another machine), so it would be a loop."
         case .other:
             return ""
         }

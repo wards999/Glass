@@ -626,4 +626,49 @@ mod tests {
         // The real session is unaffected.
         assert_eq!(take(&c, 5).len(), 5);
     }
+
+    #[test]
+    fn connection_loops_are_refused() {
+        use crate::identity::{ROLE_HOST, ROLE_VIEWER};
+        // "Mac" and "PC" both host, and are paired both ways.
+        let (rec, _) = recording(3);
+        let (mac, mac_dev, _) = host(rec.clone());
+        let (pc, pc_dev, pc_events) = host(rec);
+        let both = ROLE_HOST | ROLE_VIEWER;
+        mac_dev.add_peer(pc_dev.fingerprint(), "PC", both).unwrap();
+        pc_dev.add_peer(mac_dev.fingerprint(), "Mac", both).unwrap();
+
+        // The PC views the Mac: the Mac is now seen by the PC.
+        let pc_views_mac = Client::connect(&pc_dev, "127.0.0.1", mac.port()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while mac_dev.seen_by().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            mac_dev.seen_by(),
+            vec![crate::identity::seen_id(&pc_dev.fingerprint())]
+        );
+
+        // From inside, the Mac tries to view the PC: refused, it would loop.
+        match Client::connect(&mac_dev, "127.0.0.1", pc.port()) {
+            Err(ConnectError::Loop) => {}
+            other => panic!("expected a loop refusal, got {:?}", other.map(|_| ())),
+        }
+        wait_for(&pc_events, |e| matches!(e, HostEvent::Loop { .. }));
+
+        // A machine can't view itself either.
+        pc_dev.add_peer(pc_dev.fingerprint(), "PC", both).unwrap();
+        assert!(matches!(
+            Client::connect(&pc_dev, "127.0.0.1", pc.port()),
+            Err(ConnectError::Loop)
+        ));
+
+        // Once the PC stops viewing, the Mac may view the PC.
+        drop(pc_views_mac);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !mac_dev.seen_by().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(Client::connect(&mac_dev, "127.0.0.1", pc.port()).is_ok());
+    }
 }

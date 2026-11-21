@@ -46,3 +46,17 @@ settings; the Mac menu-bar icon; the Mac viewer's bar; the app icon.
   capture (screenshots, Zoom, Glass). It is still in front on the Mac, so
   typing reaches it. That's by design; Glass can't and shouldn't override it.
 
+## m3d-test3: no connection loops (protocol v7)
+- Each viewer's `Hello` lists who currently sees its machine, transitively:
+  its viewers and theirs, up to 8.
+  - A host process records this in `seen-by.txt` and refreshes it every 3 s.
+  - Records older than 10 s are ignored, so a crashed host can't block
+    anything.
+- A host refuses (reject 7 "loop") when the viewer is itself, or when the
+  host is on that list. That covers A↔B and longer chains like A→B→C→A.
+- **Test:** `connection_loops_are_refused` checks:
+  - PC views Mac, then Mac → PC: refused, and the PC host reports it.
+  - PC → itself: refused.
+  - After the PC disconnects, Mac → PC works.
+- Also fixed: the Mac viewer's report showed "0x0" after the session closed.
+

@@ -683,6 +683,7 @@ pub const HOST_EVENT_WRONG_PIN: u8 = 3;
 pub const HOST_EVENT_PAIRING_LOCKED: u8 = 4;
 pub const HOST_EVENT_REFUSED: u8 = 5;
 pub const HOST_EVENT_DENIED: u8 = 6;
+pub const HOST_EVENT_LOOP: u8 = 7;
 
 /// Something the host's user should see (`net::HostEvent`). Strings are
 /// NUL-terminated UTF-8.
@@ -791,6 +792,7 @@ fn event_c(e: HostEvent) -> HostEventC {
             addr.ip().to_string(),
         ),
         HostEvent::Denied { device } => (HOST_EVENT_DENIED, device, "".into(), "".into()),
+        HostEvent::Loop { device } => (HOST_EVENT_LOOP, device, "".into(), "".into()),
     };
     c.kind = kind;
     unsafe {

@@ -147,6 +147,39 @@ pub struct Device {
     dir: Option<PathBuf>,
     /// The list itself when in memory; a cache of `peers.txt` otherwise.
     peers: Mutex<Vec<Peer>>,
+    /// "Seen by" (in memory; `seen-by.txt` shares it between processes).
+    seen: Mutex<(u64, Vec<SeenId>)>,
+}
+
+/// A device in a "seen by" list: the first 8 bytes of its fingerprint.
+pub type SeenId = [u8; 8];
+
+/// The `SeenId` of a fingerprint.
+pub fn seen_id(fp: &Fingerprint) -> SeenId {
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&fp[..8]);
+    id
+}
+
+fn seen_from_hex(s: &str) -> Option<SeenId> {
+    if s.len() != 16 {
+        return None;
+    }
+    let mut id = [0u8; 8];
+    for (i, b) in id.iter_mut().enumerate() {
+        *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(id)
+}
+
+/// A "seen by" record older than this is stale (its host process died).
+const SEEN_FRESH_SECS: u64 = 10;
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -288,6 +321,7 @@ impl Device {
             identity,
             dir: Some(dir.to_path_buf()),
             peers: Mutex::new(Vec::new()),
+            seen: Mutex::new((0, Vec::new())),
         });
         d.peers();
         Ok(d)
@@ -300,7 +334,48 @@ impl Device {
             identity: Identity::generate()?,
             dir: None,
             peers: Mutex::new(Vec::new()),
+            seen: Mutex::new((0, Vec::new())),
         }))
+    }
+
+    /// The machines that currently see this one: its viewers and, through
+    /// them, theirs (no-loop rule, M3d). Shared by this machine's Glass
+    /// processes: a host process records it while a session runs and
+    /// refreshes it every few seconds; stale records are ignored.
+    pub fn seen_by(&self) -> Vec<SeenId> {
+        let (at, ids) = match &self.dir {
+            Some(dir) => {
+                let text = std::fs::read_to_string(dir.join("seen-by.txt")).unwrap_or_default();
+                let mut lines = text.lines();
+                let at = lines
+                    .next()
+                    .and_then(|l| l.trim().parse().ok())
+                    .unwrap_or(0);
+                let ids = lines.filter_map(|l| seen_from_hex(l.trim())).collect();
+                (at, ids)
+            }
+            None => lock(&self.seen).clone(),
+        };
+        if unix_secs().saturating_sub(at) > SEEN_FRESH_SECS {
+            Vec::new()
+        } else {
+            ids
+        }
+    }
+
+    /// Records (or, with an empty list, clears) who sees this machine.
+    /// Call again every few seconds while it holds.
+    pub fn set_seen_by(&self, ids: &[SeenId]) {
+        let at = if ids.is_empty() { 0 } else { unix_secs() };
+        *lock(&self.seen) = (at, ids.to_vec());
+        if let Some(dir) = &self.dir {
+            let mut text = format!("{at}\n");
+            for id in ids {
+                text.extend(id.iter().map(|b| format!("{b:02x}")));
+                text.push('\n');
+            }
+            let _ = write_private(&dir.join("seen-by.txt"), text.as_bytes());
+        }
     }
 
     pub fn fingerprint(&self) -> Fingerprint {

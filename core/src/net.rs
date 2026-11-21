@@ -23,7 +23,8 @@
 
 use crate::clock::{self, ClockSync};
 use crate::identity::{
-    clean_name, fingerprint_short, Device, Fingerprint, Peer, ROLE_HOST, ROLE_VIEWER,
+    clean_name, fingerprint_short, seen_id, Device, Fingerprint, Peer, SeenId, ROLE_HOST,
+    ROLE_VIEWER,
 };
 use crate::input::{
     InputAction, InputApplier, InputCounters, InputPacket, InputSender, MAX_INPUT_DATAGRAM,
@@ -32,9 +33,9 @@ use crate::packet::{OutFrame, Packetiser, Reassembler, ReassemblyStats};
 use crate::pairing::{self, PinState};
 use crate::protocol::{
     decode_punch, encode_pair, encode_punch, Control, ControlError, CursorShape, Message,
-    StreamInfo, CONTROL_MAX, FRAME_MAX, PAIR_CONFIRM, PAIR_PAKE, PAIR_READY, PAIR_START,
-    PROTOCOL_VERSION, PUNCH_SIZE, REJECT_DENIED, REJECT_NOT_PAIRED, REJECT_PAIRING_LOCKED,
-    REJECT_VERSION, REJECT_WRONG_PIN,
+    StreamInfo, CONTROL_MAX, FRAME_MAX, MAX_SEEN_BY, PAIR_CONFIRM, PAIR_PAKE, PAIR_READY,
+    PAIR_START, PROTOCOL_VERSION, PUNCH_SIZE, REJECT_DENIED, REJECT_LOOP, REJECT_NOT_PAIRED,
+    REJECT_PAIRING_LOCKED, REJECT_VERSION, REJECT_WRONG_PIN,
 };
 use crate::seal::{Opener, Sealer, Secret, WIRE_MAX};
 use crate::tls::{self, Channel, TlsReader, TlsWriter};
@@ -250,6 +251,9 @@ pub enum HostEvent {
     },
     /// The user said no to a paired device ("ask before each connection").
     Denied { device: String },
+    /// Refused: the connection would loop (`device` is this machine, or
+    /// already sees it).
+    Loop { device: String },
 }
 
 /// "Ask before each connection": true = allow this paired viewer.
@@ -422,6 +426,7 @@ impl HostListener {
         tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
         let mut ch = tls::handshake(tcp, tls::server_conn(&self.tls)?)?;
         let mut reader = ControlReader::new();
+        let seen: Vec<SeenId>;
         let (version, viewer) = match reader.read_one(&mut ch.reader)? {
             Incoming::Pair(PAIR_START, name) => {
                 self.pair(&mut ch, &mut reader, &name, peer_tcp)?;
@@ -434,16 +439,22 @@ impl HostListener {
                 refresh_hz,
                 caps,
                 mode,
-            }) => (
-                version,
-                ViewerHello {
-                    display_w,
-                    display_h,
-                    refresh_hz,
-                    caps,
-                    mode,
-                },
-            ),
+                seen_count,
+                seen_by,
+            }) => {
+                let n = (seen_count as usize).min(MAX_SEEN_BY);
+                seen = seen_by[..n].to_vec();
+                (
+                    version,
+                    ViewerHello {
+                        display_w,
+                        display_h,
+                        refresh_hz,
+                        caps,
+                        mode,
+                    },
+                )
+            }
             // A viewer that doesn't know us looked and left.
             Incoming::Control(Control::Bye) => return Ok(None),
             _ => return Err(invalid("expected Hello")),
@@ -470,6 +481,19 @@ impl HostListener {
             });
             return Ok(None);
         };
+        // No loops: not this machine, and not a viewer this machine is
+        // already (directly or through others) watching.
+        let me = seen_id(&self.device.fingerprint());
+        if ch.peer == self.device.fingerprint() || seen.contains(&me) {
+            let _ = send_control(
+                &ch.writer,
+                Control::Reject {
+                    reason: REJECT_LOOP,
+                },
+            );
+            self.event(HostEvent::Loop { device: peer.name });
+            return Ok(None);
+        }
         if let Some(ask) = &mut self.opts.ask {
             if !ask(&peer) {
                 let _ = send_control(
@@ -510,6 +534,7 @@ impl HostListener {
         let mut threads = Vec::new();
 
         // Control: answer pings, take keyframe requests, notice disconnects.
+        let ch_peer = ch.peer;
         let Channel {
             reader: mut tls_in,
             writer: out,
@@ -518,8 +543,18 @@ impl HostListener {
         tls_in.set_read_timeout(Some(Duration::from_millis(100)))?;
         let sh = shared.clone();
         let w = out.clone();
+        // This machine is now seen by the viewer and by whoever sees it.
+        let mut seen_now = vec![seen_id(&ch_peer)];
+        for id in seen.iter() {
+            if !seen_now.contains(id) && seen_now.len() < MAX_SEEN_BY {
+                seen_now.push(*id);
+            }
+        }
+        let device = self.device.clone();
+        device.set_seen_by(&seen_now);
         threads.push(std::thread::spawn(move || {
             let mut reader = reader;
+            let mut refreshed = clock::now_us();
             while !sh.stop.load(Ordering::Relaxed) {
                 let mut pong = None;
                 let r = reader.read(&mut tls_in, |m| {
@@ -554,7 +589,12 @@ impl HostListener {
                         break;
                     }
                 }
+                if clock::now_us().saturating_sub(refreshed) > 3_000_000 {
+                    device.set_seen_by(&seen_now);
+                    refreshed = clock::now_us();
+                }
             }
+            device.set_seen_by(&[]);
             let _ = send_control(&w, Control::Bye);
             sh.connected.store(false, Ordering::Relaxed);
         }));
@@ -918,6 +958,8 @@ pub enum ConnectError {
     PairingLocked = 9,
     /// This device's identity couldn't be loaded, created or saved.
     Identity = 10,
+    /// The host is this machine, or already sees it: it would loop.
+    Loop = 11,
 }
 
 impl std::fmt::Display for ConnectError {
@@ -937,6 +979,9 @@ impl std::fmt::Display for ConnectError {
                 "too many wrong PINs: restart Glass on the host to pair again"
             }
             ConnectError::Identity => "could not load or save this device's identity",
+            ConnectError::Loop => {
+                "that would make a loop: the host is this machine, or it's already viewing this machine (directly or through another one)"
+            }
         })
     }
 }
@@ -1101,6 +1146,7 @@ fn reject_error(reason: u8) -> ConnectError {
         REJECT_NOT_PAIRED => ConnectError::NotPaired,
         REJECT_PAIRING_LOCKED => ConnectError::PairingLocked,
         REJECT_WRONG_PIN => ConnectError::WrongPin,
+        REJECT_LOOP => ConnectError::Loop,
         _ => ConnectError::Refused, // REJECT_DENIED, REJECT_BUSY
     }
 }
@@ -1227,6 +1273,8 @@ impl Client {
     ) -> Result<Self, ConnectError> {
         let (mut ch, addr) = open_channel(device, host, port)?;
         let hs = |_| ConnectError::Handshake;
+        // Who sees this machine (for the host's no-loop check).
+        let seen: Vec<SeenId> = device.seen_by().into_iter().take(MAX_SEEN_BY).collect();
         let Some(peer) = device.peer_with(&ch.peer, ROLE_HOST) else {
             let _ = send_control(&ch.writer, Control::Bye);
             return Err(ConnectError::NotPaired);
@@ -1240,6 +1288,14 @@ impl Client {
                 refresh_hz: hello.refresh_hz,
                 caps: hello.caps,
                 mode: hello.mode,
+                seen_count: seen.len() as u8,
+                seen_by: {
+                    let mut s = [[0u8; 8]; MAX_SEEN_BY];
+                    for (d, id) in s.iter_mut().zip(seen.iter()) {
+                        *d = *id;
+                    }
+                    s
+                },
             },
         )
         .map_err(hs)?;

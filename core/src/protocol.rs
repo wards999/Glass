@@ -1,14 +1,18 @@
 //! Wire formats. `docs/protocol.md` is the source of truth; keep them in sync and
 //! bump [`PROTOCOL_VERSION`] on any change.
 
-/// Protocol version. 6 = M3d: `Welcome` says what the host is (OS) and can
+/// Protocol version. 7 = M3d: `Hello` lists who sees the viewer, so a host
+/// can refuse a connection loop (`REJECT_LOOP`). 6 = M3d: `Welcome` says what the host is (OS) and can
 /// do (view modes, 4:4:4), so any host/viewer pair works the same way.
 /// 5 = M3c: the viewer describes its screen and what it
 /// can decode in `Hello`, picks a view mode (`SetMode`), and the host
 /// announces new stream parameters mid-session (`StreamChange`).
 /// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
 /// datagrams. v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 6;
+pub const PROTOCOL_VERSION: u8 = 7;
+
+/// Most "seen by" ids a `Hello` carries (no-loop rule).
+pub const MAX_SEEN_BY: usize = 8;
 
 /// `Welcome::host_os`.
 pub const HOST_OS_UNKNOWN: u8 = 0;
@@ -208,6 +212,8 @@ pub const REJECT_DENIED: u8 = 4;
 pub const REJECT_PAIRING_LOCKED: u8 = 5;
 /// Wrong (or expired) PIN.
 pub const REJECT_WRONG_PIN: u8 = 6;
+/// The host is this machine, or already sees it: the connection would loop.
+pub const REJECT_LOOP: u8 = 7;
 
 /// Pairing messages (TLS control channel, before Hello; see `pairing.rs`).
 /// Viewer -> host: `name` (UTF-8, ≤ 63 bytes).
@@ -252,6 +258,10 @@ pub enum Control {
         refresh_hz: u16,
         caps: u8,
         mode: u8,
+        /// Machines that see the viewer (first 8 bytes of their
+        /// fingerprints), `seen_count` of them.
+        seen_count: u8,
+        seen_by: [[u8; 8]; MAX_SEEN_BY],
     },
     /// Host -> client reply to Hello.
     Welcome {
@@ -304,7 +314,7 @@ pub enum Control {
 }
 
 /// Largest encoded control message (including the 2-byte length).
-pub const CONTROL_MAX: usize = 32;
+pub const CONTROL_MAX: usize = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlError {
@@ -346,12 +356,18 @@ impl Control {
                 refresh_hz,
                 caps,
                 mode,
+                seen_count,
+                seen_by,
             } => {
                 put(&[version]);
                 put(&display_w.to_be_bytes());
                 put(&display_h.to_be_bytes());
                 put(&refresh_hz.to_be_bytes());
-                put(&[caps, mode]);
+                let n = (seen_count as usize).min(MAX_SEEN_BY);
+                put(&[caps, mode, n as u8]);
+                for id in &seen_by[..n] {
+                    put(id);
+                }
             }
             Control::SetMode { mode, allow_444 } => put(&[mode, allow_444 as u8]),
             Control::StreamChange { info } => {
@@ -410,8 +426,28 @@ impl Control {
         let u16_at = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
         let u32_at = |i: usize| u32::from_be_bytes(b[i..i + 4].try_into().unwrap());
         let u64_at = |i: usize| u64::from_be_bytes(b[i..i + 8].try_into().unwrap());
+        // Hello: 10 bytes, then 8 per "seen by" id.
+        if kind == 1 {
+            let n = *b.get(9).ok_or(ControlError::Malformed)? as usize;
+            if n > MAX_SEEN_BY || b.len() != 10 + 8 * n {
+                return Err(ControlError::Malformed);
+            }
+            let mut seen_by = [[0u8; 8]; MAX_SEEN_BY];
+            for (i, id) in seen_by.iter_mut().enumerate().take(n) {
+                id.copy_from_slice(&b[10 + 8 * i..18 + 8 * i]);
+            }
+            return Ok(Control::Hello {
+                version: b[0],
+                display_w: u16_at(1),
+                display_h: u16_at(3),
+                refresh_hz: u16_at(5),
+                caps: b[7],
+                mode: b[8],
+                seen_count: n as u8,
+                seen_by,
+            });
+        }
         let want = match kind {
-            1 => 9,
             2 => 18,
             3 => 1,
             4 => 12,
@@ -426,14 +462,6 @@ impl Control {
             return Err(ControlError::Malformed);
         }
         let msg = match kind {
-            1 => Control::Hello {
-                version: b[0],
-                display_w: u16_at(1),
-                display_h: u16_at(3),
-                refresh_hz: u16_at(5),
-                caps: b[7],
-                mode: b[8],
-            },
             2 => Control::Welcome {
                 version: b[0],
                 info: StreamInfo {
@@ -602,6 +630,13 @@ mod tests {
                 refresh_hz: 120,
                 caps: CAP_HEVC_444,
                 mode: MODE_FIT_MORE_SPACE,
+                seen_count: 2,
+                seen_by: {
+                    let mut s = [[0u8; 8]; MAX_SEEN_BY];
+                    s[0] = [1, 2, 3, 4, 5, 6, 7, 8];
+                    s[1] = [9; 8];
+                    s
+                },
             },
             Control::SetMode {
                 mode: MODE_FIT,

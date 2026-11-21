@@ -79,6 +79,9 @@ pub fn print_event(e: HostEvent) {
             addr.ip()
         ),
         HostEvent::Denied { device } => println!("Did not allow \"{device}\" to connect."),
+        HostEvent::Loop { device } => println!(
+            "Refused \"{device}\": this PC is already viewing it (directly or through another machine), so it would be a loop."
+        ),
     }
 }
 

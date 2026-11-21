@@ -44,6 +44,8 @@ public struct ConnectFailure: Error, CustomStringConvertible {
             return "That PIN wasn't right, or it expired. Use the PIN the PC is showing now."
         case 9: // GLASS_ConnectError_PairingLocked
             return "Too many wrong PINs, so the PC has switched pairing off. Restart host.cmd on the PC, then pair again."
+        case 11: // GLASS_ConnectError_Loop
+            return "That would make a loop: \(host) is this Mac, or it's already viewing this Mac (directly or through another machine). Disconnect that first."
         case 10: // GLASS_ConnectError_Identity
             return "Couldn't read or create this Mac's Glass identity in ~/Library/Application Support/Glass."
         default:

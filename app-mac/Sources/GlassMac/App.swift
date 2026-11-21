@@ -379,10 +379,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         names.orientation = .vertical
         names.alignment = .leading
         names.spacing = 0
-        themeButton = symbolButton("moon", "Switch to dark", #selector(quickTheme(_:)))
+        let themeToggle = symbolButton("moon", "Switch to dark", #selector(quickTheme(_:)))
+        themeButton = themeToggle
         updateThemeButton()
         let gear = symbolButton("gearshape", "Settings", #selector(showSettings(_:)))
-        let header = NSStackView(views: [icon, names, NSView(), themeButton, gear])
+        let header = NSStackView(views: [icon, names, NSView(), themeToggle, gear])
         header.spacing = 10
         header.alignment = .centerY
 
@@ -459,10 +460,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         shareText.orientation = .vertical
         shareText.alignment = .leading
         shareText.spacing = 2
-        shareSwitch = NSSwitch()
-        shareSwitch.target = self
-        shareSwitch.action = #selector(shareSwitched(_:))
-        let shareRow = NSStackView(views: [shareTile, shareText, NSView(), shareSwitch])
+        let toggle = NSSwitch()
+        toggle.target = self
+        toggle.action = #selector(shareSwitched(_:))
+        shareSwitch = toggle
+        let shareRow = NSStackView(views: [shareTile, shareText, NSView(), toggle])
         shareRow.spacing = 12
         shareRow.alignment = .centerY
         let shareCard = Card(shareRow)

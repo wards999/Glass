@@ -2,11 +2,11 @@ Glass for Windows (test build __VERSION__)
 =========================================
 
 Hosting (host.cmd) needs an NVIDIA GPU (NVENC); viewing (connect.cmd) works on
-any GPU that can decode HEVC. Unzip anywhere; keep the DLLs next to glass.exe.
+any GPU that can decode HEVC. Unzip anywhere; keep the DLLs next to Glass.exe and glass-cli.exe.
 Windows SmartScreen may warn because the build isn't signed: click
 "More info" > "Run anyway".
 
-The Glass window (new in this build): double-click glass.exe.
+The Glass window: double-click Glass.exe.
   - Machines with Glass on your network are listed (Macs and PCs, paired or
     not). Double-click one, or type an address and press Connect.
   - The first time, the other machine shows a 6-digit PIN: type it in the box.
@@ -15,12 +15,12 @@ The Glass window (new in this build): double-click glass.exe.
     tray (bottom right); right-click the tray icon to stop or quit.
   - Paired devices... lists and forgets pairings.
   - Restart as administrator: lets the viewer control admin windows too.
-  - Results of each session are saved next to glass.exe and shown at the end.
+  - Results of each session are saved next to Glass.exe and shown at the end.
   host.cmd and connect.cmd below still work the same way.
 
 Live stream to the Mac:
   1. Double-click host.cmd. It prints this PC's name and address, e.g.
-     192.168.1.20. If Windows Firewall asks, allow glass.exe on Private
+     192.168.1.20. If Windows Firewall asks, allow Glass on Private
      networks. (If your network is marked Public, allow Public too, or switch
      it to Private in Settings > Network & internet.)
   2. On the Mac, open Glass.app, pick this PC from the list (or type the
@@ -55,20 +55,20 @@ View and control the Mac from this PC (connect.cmd):
 M1 test (recordings): record-clips.cmd.
 
 Paired devices:
-  glass devices               this PC's id and the devices paired with it
-  glass forget NAME           unpair a device (it must pair again to connect)
+  glass-cli devices               this PC's id and the devices paired with it
+  glass-cli forget NAME           unpair a device (it must pair again to connect)
   host.cmd --ask              ask here before each connection
   Identity and pairings live in %APPDATA%\Glass (the key is encrypted with
   your Windows account).
 
-Commands:
-  glass host [--monitor N] [--chroma 420|444] [--mbps M] [--port P] [--log FILE] [--ask]
-  glass connect [HOST[:PORT]] [--pin PIN] [--windowed] [--keys pc|labelled] [--log FILE]
-  glass probe HOST [--port P] [--pin PIN] [--seconds S]  headless viewer (network check)
-  glass serve FILE.glsr [--port P] [--pin PIN]            stream a recording as if live
-  glass list
-  glass record [--monitor N] [--seconds S] [--chroma 420|444] [--mbps M] out.glsr
-  glass dump in.glsr out.h265
+Commands (glass-cli.exe, from a Command Prompt in this folder):
+  glass-cli host [--monitor N] [--chroma 420|444] [--mbps M] [--port P] [--log FILE] [--ask]
+  glass-cli connect [HOST[:PORT]] [--pin PIN] [--windowed] [--keys pc|labelled] [--log FILE]
+  glass-cli probe HOST [--port P] [--pin PIN] [--seconds S]  headless viewer (network check)
+  glass-cli serve FILE.glsr [--port P] [--pin PIN]            stream a recording as if live
+  glass-cli list
+  glass-cli record [--monitor N] [--seconds S] [--chroma 420|444] [--mbps M] out.glsr
+  glass-cli dump in.glsr out.h265
 
 Ports: TCP and UDP 47800 (change with --port; on the Mac, type address:port).
 

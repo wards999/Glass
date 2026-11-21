@@ -29,7 +29,7 @@ public struct ConnectFailure: Error, CustomStringConvertible {
         case 1: // GLASS_ConnectError_Resolve
             return "\"\(host)\" isn't an IPv4 address or a name that resolves to one."
         case 2: // GLASS_ConnectError_Connect
-            return "Couldn't reach Glass on \(host). Is host.cmd running on the PC, and is glass.exe allowed through Windows Firewall (Windows Security > Firewall > Allow an app)? Both machines must be on the same network."
+            return "Couldn't reach Glass on \(host). Is host.cmd running on the PC, and is Glass allowed through Windows Firewall (Windows Security > Firewall > Allow an app)? Both machines must be on the same network."
         case 3: // GLASS_ConnectError_Handshake
             return "Reached \(host), but the secure handshake failed. Make sure the PC and the Mac run the same Glass test build (zip and dmg from one release)."
         case 4: // GLASS_ConnectError_Version

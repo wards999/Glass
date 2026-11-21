@@ -1,4 +1,4 @@
-//! Copies the FFmpeg DLLs next to the built exe so `glass.exe` runs in place.
+//! Copies the FFmpeg DLLs next to the built exe so the programs run in place.
 
 fn main() {
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");

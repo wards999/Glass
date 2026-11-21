@@ -474,7 +474,7 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
     if a.ask {
         say!("You'll be asked before each connection (--ask).");
     }
-    say!("(Allow glass.exe through Windows Firewall on private networks if asked.)");
+    say!("(Allow Glass through Windows Firewall on private networks if asked.)");
     if blocker::self_elevated() {
         say!("Running as administrator: the Mac can control admin windows too (not UAC prompts or the lock screen).");
     } else {

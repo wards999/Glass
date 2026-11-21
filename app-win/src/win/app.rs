@@ -1,5 +1,5 @@
 //! The Glass window on Windows (M3d): what you get by double-clicking
-//! glass.exe. A list of Glass machines on the network (and paired ones),
+//! Glass.exe. A list of Glass machines on the network (and paired ones),
 //! Connect, Share this PC, pairing PINs in dialogs, paired devices with
 //! Forget, session results with Copy, and a tray icon. The command line
 //! (`glass host`, `glass connect`, ...) stays for tests and CI.
@@ -1096,7 +1096,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             set_text(
                 hwnd,
                 ID_STATUS,
-                "Session ended. Results saved next to glass.exe.",
+                "Session ended. Results saved next to Glass.exe.",
             );
             show_report(hwnd, &report);
             return LRESULT(0);

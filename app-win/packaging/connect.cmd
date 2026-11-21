@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
-if not exist glass.exe (
-  echo glass.exe isn't next to this file. Windows runs a .cmd straight from a zip
+if not exist glass-cli.exe (
+  echo glass-cli.exe isn't next to this file. Windows runs a .cmd straight from a zip
   echo without the rest of it: right-click the zip, Extract All, then run it from
   echo the extracted folder.
   pause
@@ -16,6 +16,6 @@ echo Ctrl acts as the Mac's Cmd (Ctrl+C copies) and Win as Ctrl; Alt is Option.
 echo Each session's numbers are saved to results-viewer.txt.
 echo.
 if exist results-viewer.txt del results-viewer.txt
-glass.exe connect --log results-viewer.txt %*
+glass-cli.exe connect --log results-viewer.txt %*
 echo.
 pause

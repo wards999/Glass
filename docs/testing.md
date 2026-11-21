@@ -4,7 +4,7 @@ Every push to `main` builds both apps in CI (artifacts `glass-win` and
 `glass-mac` on the run page). At the end of each milestone a tag `mN-testK`
 publishes a **prerelease** on the repo's Releases page with:
 
-- `Glass-win-<tag>.zip`: `glass.exe`, FFmpeg DLLs, `host.cmd`, `record-clips.cmd`, README
+- `Glass-win-<tag>.zip`: `Glass.exe` (the app), `glass-cli.exe` (command line), FFmpeg DLLs, `host.cmd`, `connect.cmd`, `record-clips.cmd`, README
 - `Glass-mac-<tag>.dmg`: `Glass.app` (ad-hoc signed, not notarized), README
 
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
@@ -13,7 +13,7 @@ System Settings > Privacy & Security > Open Anyway.
 ## M3d test 4 (the Glass window, machine list, no loops)
 Use the zip and dmg from the same test build (protocol v7). Extract the zip
 on both PCs.
-1. **PC:** double-click **glass.exe**. The Glass window opens (no console),
+1. **PC:** double-click **Glass.exe**. The Glass window opens (no console),
    with the icon. The Mac (sharing) and the other PC (if sharing) appear in
    the list.
 2. **Connect** by double-clicking the Mac in the list. The PIN dialog

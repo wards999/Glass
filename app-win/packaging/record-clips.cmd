@@ -5,12 +5,12 @@ echo Use the desktop normally while it records (scroll text, drag a window, mini
 echo.
 pause
 (
-  glass.exe --version
-  glass.exe list
+  glass-cli.exe --version
+  glass-cli.exe list
   echo.
-  glass.exe record --seconds 10 --chroma 420 desktop-420.glsr
+  glass-cli.exe record --seconds 10 --chroma 420 desktop-420.glsr
   echo.
-  glass.exe record --seconds 10 --chroma 444 desktop-444.glsr
+  glass-cli.exe record --seconds 10 --chroma 444 desktop-444.glsr
 ) > results-win.txt 2>&1
 type results-win.txt
 echo.

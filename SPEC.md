@@ -86,7 +86,7 @@ Desktop work: reading and writing text, code, web, documents.
 - **Audio:** in sync with the picture (±20 ms), audio latency ≤ 40 ms, no
   dropouts on a good Wi-Fi link.
 - **Very responsive:** input → screen **p50 ≤ 35 ms, p99 ≤ 60 ms** on Wi-Fi at
-  60 Hz; game controller and mouse-look work (§5c).
+  60 Hz; mouse-look works (§5c). Game controllers come later (M11).
 - Text clarity matters less here than smoothness: the bitrate adapts first.
 
 ### How we prove it
@@ -100,7 +100,7 @@ A **two-way** remote desktop tool between a Windows PC and a Mac on the same LAN
 
 - feels as **smooth** as StarDesk (even frame pacing, no micro-stutter),
 - keeps **text sharp** enough to read (desktop work, not just games),
-- is good enough to **play games on the PC from the Mac**: no micro-stutter, audio in sync, a game controller and mouse-look work (§5c),
+- is good enough to **play games on the PC from the Mac**: no micro-stutter, audio in sync, mouse-look works (§5c); game controllers later (M11),
 - shows **clean frames straight away on big screen changes** (minimise/restore, app switching),
 - works first and best on **home Wi-Fi** (the primary setup; wired is a bonus),
 - stays at **very low latency**: about 20–30 ms glass-to-glass on good 5/6 GHz Wi-Fi at 60 Hz (8–15 ms on wired gigabit at 120 Hz; see §8),
@@ -248,7 +248,7 @@ test of smoothness.
   a small adaptive buffer (target ≤ 20 ms). A/V sync: audio and video both
   carry host capture timestamps; keep them within ±20 ms and correct drift by
   resampling, never by dropping video frames.
-- **Game controller:** the Mac reads controllers with the GameController
+- **Game controller (M11, future; ADR 0013):** the Mac reads controllers with the GameController
   framework (Xbox, PlayStation, MFi) and sends button/axis state over the input
   channel (state-based like keys, at the controller's rate, ≥ 250 Hz). The
   Windows host presents them as a virtual **Xbox 360 controller** through the
@@ -522,7 +522,7 @@ Glass will not be signed with an Apple Developer ID or notarized. Design around 
 - **Private APIs are allowed** (no App Store): `CGVirtualDisplay` for §4b.
 - **Windows:** the exe is unsigned too; SmartScreen needs "More info → Run
   anyway" per build, and Windows Firewall asks per folder. `host.cmd` and the
-  README explain both. The ViGEmBus driver (M5b) is signed by its vendor.
+  README explain both. The ViGEmBus driver (M11) is signed by its vendor.
 
 ## 8. Latency budget (targets)
 
@@ -565,11 +565,12 @@ machine, so nothing unpaired may connect.)
 9. **M4 – Robustness (Wi-Fi, §6b):** NACK retransmission plus adaptive interleaved FEC, reference-frame invalidation / intra refresh instead of IDRs, paced sending on its own thread, QoS marking (qWAVE on Windows, service types on macOS), MTU probe, interface selection, radio keep-awake, receiver reports, Wi-Fi link stats and spike classification, loss simulator with a Gilbert–Elliott burst model fitted to real traces. Both directions.
 10. **M5 – Smoothness:** adaptive jitter buffer, display-linked presentation on both viewers, capture rate matched to the viewer's refresh, delay-based congestion control and adaptive bitrate with the Auto resolution ladder (§5e, §6b), clock drift tracking, frame-interval metrics against the §5c pacing target on Wi-Fi. StarDesk baseline measured before it (§5d). Compare against StarDesk and Moonlight.
 11. **M5c – Clipboard and files (both directions):** clipboard sync of text, rich text (RTF/HTML) and images, with a size cap. A **file copied** on one machine is sent in the background and lands on the other machine's clipboard as a real local file, so a normal paste works in Finder, Explorer, mail or chat; files above a limit (default 200 MB, adjustable) wait for the paste and show progress. **Drag and drop** onto the viewer window sends files to the host's Downloads, and the host can send files back. Everything goes over the paired TLS connection on its own channel, paced by M5's rate control so a transfer never stalls the picture on Wi-Fi. An on/off switch on both machines; files carry their name, size and a hash, and partial transfers are discarded. LATER: native "promised file" copy and paste (Windows virtual-file clipboard, macOS file promises) so huge files copy only when pasted.
-12. **M5b – Gaming (use case B):** audio (Opus, A/V sync), game controller (GameController → ViGEmBus), relative mouse mode, game-mode overlay, even cadence (vsync-locked sampling, cadence-error metric, frame-cap hint; §5c). Measured with a real Steam game (§5c). The opt-in low-latency Wi-Fi toggle (§5d) goes here if M5 still shows AWDL spikes.
+12. **M5b – Gaming: audio and feel (use case B):** audio (Opus, A/V sync), relative mouse mode, game-mode overlay, even cadence (vsync-locked sampling, cadence-error metric, frame-cap hint; §5c). Measured with a real Steam game (§5c), played with mouse and keyboard. Game controllers are split out to M11. The opt-in low-latency Wi-Fi toggle (§5d) goes here if M5 still shows AWDL spikes.
 13. **M7 – Clarity (rest):** native resolution for PC → Mac (Windows virtual display, IddCx, at the viewer's size **and refresh**, so games lock to the Mac's rate), scene-change burst, still-region refinement on the Windows host.
-14. **M8 – Extras:** direct NVENC SDK path, audio and controller for the Mac-host direction.
+14. **M8 – Extras:** direct NVENC SDK path, audio for the Mac-host direction.
 15. **M9 – iPad viewer (future):** view and control a Mac or PC host from an iPad. Reuses `core` (Rust, built for iOS) and the Mac viewer's Swift pieces (VideoToolbox decode, Metal, the control bar); touch mapped to pointer gestures (tap = click, two-finger scroll, long press = right click, drag), on-screen and hardware keyboards, Magic Keyboard/trackpad and Pencil as pointer. Pairing and encryption as everywhere. Viewer only: iPadOS can't be remote-controlled.
 16. **M10 – Android viewer (future, maybe):** the same for Android phones and tablets: `core` via JNI, MediaCodec decode, touch and keyboard input. Viewer only.
+17. **M11 – Game controllers (future; split out of M5b, ADR 0013):** controllers on the viewer (GameController framework on the Mac, Xbox/PlayStation/MFi; XInput/GameInput on a Windows viewer) sent as button and axis state over the input channel (≥ 250 Hz); a Windows host presents a virtual Xbox 360 pad through ViGEmBus (optional one-time admin install, detected and explained; Glass works without it), a Mac host a virtual HID gamepad if macOS allows it. Rumble goes back to the viewer's controller. Both directions, any pair.
 
 Each milestone ends with a short written result in `docs/results/Mx.md` (what works, measured numbers, known issues).
 

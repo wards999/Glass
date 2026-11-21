@@ -167,6 +167,7 @@ struct GlassApp {
     elevated: bool,
     icon: Option<egui::TextureHandle>,
     share_h: f32,
+    gear_rect: Option<Rect>,
     demo: Option<String>,
     _tray: Option<tray_icon::TrayIcon>,
     shot_at: Option<Instant>,
@@ -237,6 +238,7 @@ pub fn run(share: bool) -> Res<()> {
                 elevated: super::blocker::self_elevated(),
                 icon: None,
                 share_h: 0.0,
+                gear_rect: None,
                 _tray: tray,
                 shot_at: std::env::var_os("GLASS_DEBUG_SHOT").map(|_| Instant::now()),
                 demo,
@@ -956,8 +958,15 @@ impl GlassApp {
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
-                if icon_button(ui, &ic('\u{E713}', "\u{2699}"), "Settings", p).clicked() {
-                    self.dialog = Dialog::Settings;
+                let gear = icon_button(ui, &ic('\u{E713}', "\u{2699}"), "Settings", p);
+                self.gear_rect = Some(gear.rect);
+                if gear.clicked() {
+                    // The gear toggles the settings panel (as on the Mac).
+                    self.dialog = if matches!(self.dialog, Dialog::Settings) {
+                        Dialog::None
+                    } else {
+                        Dialog::Settings
+                    };
                 }
                 let dark = ui.visuals().dark_mode;
                 let (glyph, tip) = if dark {
@@ -1533,10 +1542,33 @@ impl GlassApp {
                 let mut s = self.settings.clone();
                 let peers: Vec<Peer> = self.device.peers();
                 let mut forget = None;
-                modal("settings", p).show(ctx, |ui| {
-                    ui.set_width(400.0);
-                    ui.label(RichText::new("Settings").font(semibold(20.0)).color(p.strong));
-                    ui.add_space(6.0);
+                // A panel under the gear (like the Mac's popover), not a
+                // modal: a click outside it or Esc closes it.
+                let anchor = self.gear_rect;
+                let at = anchor.map_or(pos2(ctx.content_rect().right() - 16.0, 64.0), |r| {
+                    pos2(r.right(), r.bottom() + 6.0)
+                });
+                let shown = egui::Area::new(egui::Id::unique("settings-panel"))
+                    .order(egui::Order::Foreground)
+                    .pivot(Align2::RIGHT_TOP)
+                    .fixed_pos(at)
+                    .constrain(true)
+                    .show(ctx, |ui| {
+                        egui::Frame::new()
+                            .fill(p.card)
+                            .stroke(Stroke::new(1.0, p.border))
+                            .corner_radius(CornerRadius::same(14))
+                            .inner_margin(Margin::same(18))
+                            .shadow(egui::Shadow {
+                                offset: [0, 10],
+                                blur: 30,
+                                spread: 0,
+                                color: Color32::from_black_alpha(70),
+                            })
+                            .show(ui, |ui| {
+                    ui.set_width(380.0);
+                    ui.label(RichText::new("Settings").font(semibold(18.0)).color(p.strong));
+                    ui.add_space(4.0);
 
                     section(ui, "Appearance", p);
                     segmented(
@@ -1551,18 +1583,14 @@ impl GlassApp {
                     );
                     ui.add_space(10.0);
 
-                    section(ui, "When viewing", p);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Start in").color(p.text));
-                        egui::ComboBox::from_id_salt("view")
-                            .width(250.0)
-                            .selected_text(viewer::mode_name(s.view))
-                            .show_ui(ui, |ui| {
-                                for m in [MODE_FIT, MODE_FIT_MORE_SPACE, MODE_FIT_LARGER, MODE_HOST_SCREEN] {
-                                    ui.selectable_value(&mut s.view, m, viewer::mode_name(m));
-                                }
-                            });
-                    });
+                    section(ui, "When viewing, start in", p);
+                    // Radio rows, not a drop-down: a pop-up inside the panel
+                    // would count as a click outside it.
+                    for m in [MODE_FIT, MODE_FIT_MORE_SPACE, MODE_FIT_LARGER, MODE_HOST_SCREEN] {
+                        ui.radio_value(&mut s.view, m, RichText::new(viewer::mode_name(m)).color(p.text));
+                    }
+                    ui.add_space(4.0);
+                    section(ui, "Colour", p);
                     segmented(
                         ui,
                         &mut s.full_colour,
@@ -1615,15 +1643,19 @@ impl GlassApp {
                         .size(12.0)
                         .color(p.weak),
                     );
-                    ui.add_space(6.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.add(accent_button("Done", p)).clicked()
-                            || ui.input(|i| i.key_pressed(egui::Key::Escape))
-                        {
-                            close = true;
-                        }
-                    });
+                            });
+                    })
+                    .response
+                    .rect;
+                let outside = ctx.input(|i| {
+                    i.pointer.any_pressed()
+                        && i.pointer.interact_pos().is_some_and(|q| {
+                            !shown.contains(q) && !anchor.is_some_and(|a| a.contains(q))
+                        })
                 });
+                if outside || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    close = true;
+                }
                 if s != self.settings {
                     if s.theme != self.settings.theme {
                         ctx.set_theme(s.theme);

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Glass icon, draft 2 (M3d): a frosted glass pane in front of another
+       machine's screen, with a pointer: looking at (and using) a screen elsewhere. -->
+  <defs>
+    <clipPath id="pane"><rect x="110" y="300" width="620" height="600" rx="120"/></clipPath>
+  </defs>
+  <!-- The other screen (behind) -->
+  <rect x="330" y="120" width="590" height="420" rx="56" fill="#1B2433"/>
+  <rect x="362" y="152" width="526" height="356" rx="28" fill="#3E6FA8"/>
+  <rect x="392" y="182" width="230" height="150" rx="14" fill="#9CC8F2"/>
+  <rect x="642" y="182" width="216" height="70" rx="14" fill="#D6EBFF"/>
+  <rect x="580" y="540" width="90" height="60" fill="#1B2433"/>
+  <rect x="500" y="596" width="250" height="34" rx="17" fill="#1B2433"/>
+  <!-- The glass pane (front), slightly see-through -->
+  <rect x="110" y="300" width="620" height="600" rx="120" fill="#2F6FB8" opacity="0.88"/>
+  <g clip-path="url(#pane)">
+    <path d="M110 300 H730 V520 L110 860 Z" fill="#4C8FD6" opacity="0.75"/>
+    <path d="M300 300 H450 L110 640 V490 Z" fill="#B9DBFA" opacity="0.8"/>
+    <path d="M520 300 H566 L110 756 V710 Z" fill="#E3F1FF" opacity="0.7"/>
+  </g>
+  <rect x="128" y="318" width="584" height="564" rx="104" fill="none" stroke="#EAF5FF" stroke-width="14" opacity="0.85"/>
+  <!-- Pointer -->
+  <path d="M420 520 L420 760 L478 704 L520 796 L560 778 L518 688 L600 688 Z"
+        fill="#FFFFFF" stroke="#1B2433" stroke-width="16" stroke-linejoin="round"/>
+</svg>

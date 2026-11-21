@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Glass icon, final (chosen 2026-11-21): looking through a glass pane at another
+       machine's screen. One shape, so it stays clear at small sizes. -->
+  <defs>
+    <clipPath id="pane"><rect x="112" y="112" width="800" height="800" rx="180"/></clipPath>
+  </defs>
+  <rect x="112" y="112" width="800" height="800" rx="180" fill="#173A66"/>
+  <g clip-path="url(#pane)">
+    <!-- The other screen, seen through the glass -->
+    <rect x="232" y="262" width="560" height="380" rx="40" fill="#0E1726"/>
+    <rect x="262" y="292" width="500" height="320" rx="16" fill="#3E7FC8"/>
+    <rect x="290" y="320" width="200" height="130" rx="10" fill="#A9D2F7"/>
+    <rect x="510" y="320" width="224" height="60" rx="10" fill="#DDEEFF"/>
+    <rect x="510" y="396" width="224" height="188" rx="10" fill="#6FA6E0"/>
+    <rect x="472" y="642" width="80" height="62" fill="#0E1726"/>
+    <rect x="392" y="700" width="240" height="32" rx="16" fill="#0E1726"/>
+    <!-- Reflections on the glass, across everything -->
+    <path d="M300 112 H470 L112 470 V300 Z" fill="#FFFFFF" opacity="0.22"/>
+    <path d="M560 112 H612 L112 612 V560 Z" fill="#FFFFFF" opacity="0.16"/>
+    <path d="M912 560 V700 L700 912 H560 Z" fill="#FFFFFF" opacity="0.10"/>
+  </g>
+  <rect x="134" y="134" width="756" height="756" rx="160" fill="none" stroke="#DDEEFF" stroke-width="16" opacity="0.75"/>
+</svg>

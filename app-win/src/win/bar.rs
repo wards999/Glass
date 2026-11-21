@@ -50,6 +50,10 @@ struct Item {
     group: u8,
     on: bool,
     enabled: bool,
+    /// Left out of the bar (what the host can't do at all).
+    shown: bool,
+    /// Shown in the status place while hovered.
+    hint: Option<String>,
     danger: bool,
     x: f32,
     w: f32,
@@ -117,14 +121,19 @@ impl State {
         let k = self.k;
         let mut x = 10.0 * k;
         let mut last_group = 255u8;
+        let mut first = true;
         let widths: Vec<f32> = self
             .items
             .iter()
             .map(|i| self.text_width(&i.label, &self.font))
             .collect();
         for (i, item) in self.items.iter_mut().enumerate() {
+            if !item.shown {
+                item.w = 0.0;
+                continue;
+            }
             let pad = if item.group != 0 { 12.0 } else { 14.0 } * k;
-            if i > 0 {
+            if !std::mem::take(&mut first) {
                 x += if item.group != 0 && item.group == last_group {
                     2.0 * k
                 } else {
@@ -137,9 +146,19 @@ impl State {
             last_group = item.group;
         }
         self.status_x = x + 14.0 * k;
+        // Room for the status line or the longest hint, so the bar doesn't
+        // change size on hover.
+        let hints = self
+            .items
+            .iter()
+            .filter(|i| i.shown)
+            .filter_map(|i| i.hint.as_deref())
+            .map(|h| self.text_width(h, &self.status_font))
+            .fold(0.0f32, f32::max);
         let status_w = self
             .text_width(&self.status, &self.status_font)
-            .min(380.0 * k);
+            .max(hints)
+            .min(440.0 * k);
         (
             (self.status_x + status_w + 14.0 * k).ceil() as i32,
             (44.0 * k).round() as i32,
@@ -153,7 +172,7 @@ impl State {
         }
         self.items
             .iter()
-            .position(|i| i.enabled && x >= i.x && x <= i.x + i.w)
+            .position(|i| i.shown && i.enabled && x >= i.x && x <= i.x + i.w)
     }
 
     unsafe fn paint(&mut self, hwnd: HWND) {
@@ -200,7 +219,7 @@ impl State {
         let (top, h) = (7.0 * k, 30.0 * k);
         // The segmented tracks behind each switch.
         for g in [1u8, 2] {
-            let mut it = self.items.iter().filter(|i| i.group == g);
+            let mut it = self.items.iter().filter(|i| i.group == g && i.shown);
             if let Some(first) = it.next() {
                 let last = it.next_back().unwrap_or(first);
                 fill(
@@ -214,6 +233,9 @@ impl State {
             }
         }
         for (i, item) in self.items.iter().enumerate() {
+            if !item.shown {
+                continue;
+            }
             let hover = self.hover == Some(i) && item.enabled;
             let (bg, fg) = if item.group != 0 {
                 if item.on {
@@ -264,7 +286,11 @@ impl State {
             }
         }
         if let Some(br) = brush(look::WEAK) {
-            let t = wide_no_nul(&self.status);
+            let hint = self
+                .hover
+                .and_then(|h| self.items.get(h))
+                .and_then(|i| i.hint.as_deref());
+            let t = wide_no_nul(hint.unwrap_or(&self.status));
             let r = D2D_RECT_F {
                 left: self.status_x,
                 top,
@@ -464,6 +490,8 @@ impl Bar {
                 group,
                 on: false,
                 enabled: true,
+                shown: true,
+                hint: None,
                 danger,
                 x: 0.0,
                 w: 0.0,
@@ -551,9 +579,16 @@ impl Bar {
                 id if (ID_VIEW..ID_VIEW + 4).contains(&id) => {
                     let m = (id - ID_VIEW) as u8;
                     i.on = m == mode;
-                    i.enabled = m == 0 || views_ok;
+                    // Views the host can't do at all are left out (a PC host
+                    // shares only its own screen until it gets a virtual
+                    // display, M7); hovering what's left says why.
+                    i.shown = m == 0 || views_ok;
                     if m == 0 {
                         i.label = host_screen.into();
+                        i.hint = (!views_ok).then(|| {
+                            "This host shares only its own screen for now; more views come in a later update."
+                                .into()
+                        });
                     }
                 }
                 ID_420 => i.on = !full_colour,

@@ -18,10 +18,14 @@ final class ControlBar: NSVisualEffectView {
     private let keys = NSButton()
     private let pin = NSButton()
     private let status = NSTextField(labelWithString: "")
-    /// Segment index -> view mode: Fit, More space, Larger, host's screen.
-    private static let modes: [UInt8] = [1, 2, 3, 0]
+    /// Segment index -> view mode: Fit, More space, Larger, host's screen
+    /// (only the host's screen when the host can't do the others).
+    private let modes: [UInt8]
 
     init(hostIsMac: Bool, viewsOK: Bool, fullColourOK: Bool) {
+        // Views the host can't do at all are left out (a PC host shares only
+        // its own screen until it gets a virtual display, M7).
+        modes = viewsOK ? [1, 2, 3, 0] : [0]
         super.init(frame: .zero)
         material = .hudWindow
         blendingMode = .withinWindow
@@ -31,10 +35,12 @@ final class ControlBar: NSVisualEffectView {
         layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
 
         views.segmentStyle = .rounded
-        views.segmentCount = 4
-        for (i, label) in ["Fit", "More space", "Larger", hostIsMac ? "Mac's screen" : "PC's screen"].enumerated() {
-            views.setLabel(label, forSegment: i)
-            views.setEnabled(viewsOK || i == 3, forSegment: i)
+        let hostScreen = hostIsMac ? "Mac's screen" : "PC's screen"
+        let labels = viewsOK ? ["Fit", "More space", "Larger", hostScreen] : [hostScreen]
+        views.segmentCount = labels.count
+        for (i, label) in labels.enumerated() { views.setLabel(label, forSegment: i) }
+        if !viewsOK {
+            views.toolTip = "This host shares only its own screen for now; more views come in a later update."
         }
         views.trackingMode = .selectOne
         views.target = self
@@ -87,7 +93,7 @@ final class ControlBar: NSVisualEffectView {
     override var acceptsFirstResponder: Bool { false }
 
     func update(mode: UInt8, fullColour: Bool, fullScreen: Bool, statsShown: Bool, pcKeys: Bool, status text: String) {
-        if let i = Self.modes.firstIndex(of: mode) { views.selectedSegment = i }
+        if let i = modes.firstIndex(of: mode) { views.selectedSegment = i }
         colour.selectedSegment = fullColour ? 1 : 0
         full.title = fullScreen ? "Window" : "Full screen"
         stats.state = statsShown ? .on : .off
@@ -98,7 +104,7 @@ final class ControlBar: NSVisualEffectView {
 
     @objc private func viewChanged() {
         let i = views.selectedSegment
-        if i >= 0, i < Self.modes.count { onCommand(.view(Self.modes[i])) }
+        if i >= 0, i < modes.count { onCommand(.view(modes[i])) }
     }
     @objc private func colourChanged() { onCommand(.colour(colour.selectedSegment == 1)) }
     @objc private func fullTapped() { onCommand(.fullScreen) }

@@ -381,6 +381,7 @@ pub fn host(args: &[String]) -> Res<()> {
             line: Box::new(|l| println!("{l}")),
             report: Box::new(|_| {}),
             stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            end: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     )
 }
@@ -395,6 +396,8 @@ pub struct HostUi {
     pub report: Box<dyn FnMut(&str) + Send>,
     /// Set (then wake the listener with a connection to its port) to stop.
     pub stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Set to end the current session only (sharing goes on).
+    pub end: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Shares this PC until `ui.stop` is set (the window's "Share this PC").
@@ -404,6 +407,7 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
         line,
         report: mut on_report,
         stop,
+        end,
     } = ui;
     let line = std::sync::Mutex::new(line);
     macro_rules! say {
@@ -567,7 +571,9 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
             mon.refresh_hz,
             &blocking,
             &stop,
+            &end,
         )?;
+        end.store(false, Ordering::Relaxed);
         let counters = session.counters();
         let ic = counters.input;
         drop(session); // releases anything the viewer still held
@@ -620,6 +626,7 @@ fn run_session(
     fps: u32,
     blocking: &AtomicU8,
     stop: &std::sync::atomic::AtomicBool,
+    end: &std::sync::atomic::AtomicBool,
 ) -> Res<(String, Vec<String>, u64)> {
     while cap.next_frame()?.is_some() {} // drop frames captured while waiting
     let make = |chroma444: bool| {
@@ -658,7 +665,11 @@ fn run_session(
     let mut blocked_since = None;
     let t0 = clock::now_us();
     let mut pending_idr = true;
-    while session.connected() && run.error.is_none() && !stop.load(Ordering::Relaxed) {
+    while session.connected()
+        && run.error.is_none()
+        && !stop.load(Ordering::Relaxed)
+        && !end.load(Ordering::Relaxed)
+    {
         cap.wait(5);
         pending_idr |= session.take_keyframe_request();
         // The viewer switched colour (4:2:0 <-> 4:4:4); view modes need a

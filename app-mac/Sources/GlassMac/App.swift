@@ -426,7 +426,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if found.isEmpty {
             // During a session it's still (no searching animation) and says so.
             let session: String? = beingViewed ? hostStatus : viewer != nil ? "Viewing another device." : nil
-            add(EmptyState(session: session))
+            let empty = EmptyState(session: session)
+            empty.onEnd = { [weak self] in self?.endSession() }
+            add(empty)
             return
         }
         let me = String(glass_protocol_version())
@@ -460,6 +462,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func add(_ v: NSView) {
         listStack.addArrangedSubview(v)
         v.widthAnchor.constraint(equalTo: listStack.widthAnchor).isActive = true
+    }
+
+    /// Ends the session this Mac is in: the one being viewed here, or the
+    /// one viewing this Mac (sharing stays on).
+    private func endSession() {
+        if let v = viewer {
+            v.stop("ended from the Glass window")
+        } else if beingViewed {
+            hostController?.endSession()
+        }
     }
 
     private func connectFound(_ h: DiscoveredHost) {
@@ -1039,9 +1051,15 @@ final class DeviceRow: LayerView {
 /// (three rings growing from 24 to 68 pt and fading, a 2.2 s cycle) around
 /// a monitor in a soft accent circle.
 final class EmptyState: LayerView {
+    var onEnd: () -> Void = {}
+    private var endButton: NSButton!
+
+    @objc private func endTapped() { onEnd() }
+
     /// `session`: in a session (says who), so no searching animation.
     init(session: String? = nil) {
         super.init()
+        endButton = NSButton(title: "End session", target: nil, action: nil)
         let radar = RadarView(animated: session == nil)
         let title = NSTextField(labelWithString: session == nil ? "Looking for devices\u{2026}" : "In a session")
         title.font = .systemFont(ofSize: 15, weight: .semibold)
@@ -1049,7 +1067,12 @@ final class EmptyState: LayerView {
         note.font = .systemFont(ofSize: 12)
         note.textColor = .secondaryLabelColor
         note.lineBreakMode = .byTruncatingTail
-        let stack = NSStackView(views: [radar, title, note])
+        endButton.bezelColor = .systemRed
+        endButton.controlSize = .large
+        endButton.isHidden = session == nil
+        endButton.target = self
+        endButton.action = #selector(endTapped)
+        let stack = NSStackView(views: [radar, title, note, endButton])
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 8
@@ -1057,7 +1080,7 @@ final class EmptyState: LayerView {
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 210),
+            heightAnchor.constraint(equalToConstant: session == nil ? 210 : 250),
             stack.centerXAnchor.constraint(equalTo: centerXAnchor),
             stack.topAnchor.constraint(equalTo: topAnchor, constant: 8),
         ])

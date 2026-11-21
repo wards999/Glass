@@ -43,6 +43,11 @@ final class HostController: NSObject {
         startSharing()
     }
 
+    /// Ends the current session; sharing goes on.
+    func endSession() {
+        runner?.endSession()
+    }
+
     func stop() {
         stopped = true
         permissionTimer?.invalidate()

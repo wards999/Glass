@@ -163,6 +163,8 @@ struct GlassApp {
     viewer_on: bool,
     notice: Option<(String, Instant)>,
     sharing: Option<Arc<AtomicBool>>,
+    /// Ends the current shared session (sharing goes on).
+    end_session: Arc<AtomicBool>,
     share_status: String,
     /// Pairing code and the device asking.
     pin: Option<(String, String)>,
@@ -237,6 +239,7 @@ pub fn run(share: bool) -> Res<()> {
                 viewer_on: false,
                 notice: None,
                 sharing: None,
+                end_session: Arc::new(AtomicBool::new(false)),
                 share_status: String::new(),
                 pin: None,
                 dialog: Dialog::None,
@@ -626,6 +629,7 @@ impl GlassApp {
                 w3.send(Msg::Report(r.to_string()))
             }),
             stop: stop.clone(),
+            end: self.end_session.clone(),
         };
         std::thread::spawn(move || {
             let why = match super::host_with(&[], ui) {
@@ -1171,6 +1175,16 @@ impl GlassApp {
         }
     }
 
+    /// Ends the session this window is in: the one being viewed here, or the
+    /// one viewing this PC (sharing stays on).
+    fn end_session(&mut self) {
+        if self.viewing.is_some() {
+            disconnect_viewer();
+        } else if self.viewer_on {
+            self.end_session.store(true, Ordering::Relaxed);
+        }
+    }
+
     fn share_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Pal) {
         let on = self.sharing.is_some() || self.demo.as_deref() == Some("share");
         ui.horizontal(|ui| {
@@ -1343,12 +1357,29 @@ impl eframe::App for GlassApp {
                 });
                 let list_h = (ui.available_height() - self.share_h - 64.0).max(90.0);
                 let mut go = None;
+                let mut end = false;
                 egui::ScrollArea::vertical()
                     .max_height(list_h)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         if self.machines.is_empty() {
                             self.empty_state(ui, &p);
+                            if self.viewing.is_some() || self.viewer_on {
+                                ui.vertical_centered(|ui| {
+                                    let b = egui::Button::new(
+                                        RichText::new("End session")
+                                            .font(semibold(14.0))
+                                            .color(Color32::WHITE),
+                                    )
+                                    .fill(p.danger)
+                                    .stroke(Stroke::NONE)
+                                    .corner_radius(CornerRadius::same(8))
+                                    .min_size(vec2(130.0, 34.0));
+                                    if ui.add(b).clicked() {
+                                        end = true;
+                                    }
+                                });
+                            }
                         }
                         for m in &self.machines {
                             if self.machine_row(ui, m, &p) {
@@ -1356,6 +1387,9 @@ impl eframe::App for GlassApp {
                             }
                         }
                     });
+                if end {
+                    self.end_session();
+                }
                 if let Some((h, port)) = go {
                     if self.viewing.as_deref() == Some(h.as_str()) {
                         disconnect_viewer();

@@ -89,6 +89,20 @@ public final class HostRunner {
         t.start()
     }
 
+    /// Ends the current session only; sharing goes on.
+    public func endSession() {
+        stopFlag.withLock { endRequested = true }
+    }
+
+    fileprivate func takeEndRequest() -> Bool {
+        stopFlag.withLock {
+            defer { endRequested = false }
+            return endRequested
+        }
+    }
+
+    private var endRequested = false
+
     /// Ends any session and stops listening.
     public func stop() {
         stopFlag.withLock { stopped = true }
@@ -272,6 +286,7 @@ private final class HostSessionRun {
         var reason = "viewer left"
         while true {
             if runner.isStopped { reason = "sharing stopped"; break }
+            if runner.takeEndRequest() { reason = "ended on this Mac"; break }
             if !q.sync(execute: { s.connected }) { break }
             if let f = failLock.withLock({ failure }) { reason = f; break }
             if let deadline, GlassClock.nowUs() >= deadline { reason = "--seconds elapsed"; break }

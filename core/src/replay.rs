@@ -270,6 +270,7 @@ mod tests {
             fixed_pin: Some(PIN.into()),
             ask,
             events: Box::new(move |e| ev.lock().unwrap().push(e)),
+            ..Default::default()
         };
         (
             Replay::start(file, 0, dev.clone(), opts).unwrap(),

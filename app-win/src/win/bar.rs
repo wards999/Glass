@@ -230,14 +230,19 @@ impl Bar {
     }
 
     /// Shows which view and colour mode are on, what full screen does, and
-    /// a status line; greys out 4:4:4 if this PC can't decode it.
+    /// a status line. Greys out what the host or this PC can't do: the
+    /// "fit" views without `views_ok`, 4:4:4 without `can_444`.
+    /// `host_screen` labels the host's-own-screen view ("Mac's screen").
+    #[allow(clippy::too_many_arguments)]
     pub fn set_state(
         &self,
         mode: u8,
         full_colour: bool,
         can_444: bool,
+        views_ok: bool,
         fullscreen: bool,
         status: &str,
+        host_screen: &str,
     ) {
         for m in 0..4u8 {
             self.check(ID_VIEW + m as usize, m == mode);
@@ -248,6 +253,15 @@ impl Bar {
         unsafe {
             if let Ok(c) = GetDlgItem(Some(self.hwnd), ID_444 as i32) {
                 let _ = EnableWindow(c, can_444);
+            }
+            for m in 1..4usize {
+                if let Ok(c) = GetDlgItem(Some(self.hwnd), (ID_VIEW + m) as i32) {
+                    let _ = EnableWindow(c, views_ok);
+                }
+            }
+            if let Ok(c) = GetDlgItem(Some(self.hwnd), ID_VIEW as i32) {
+                let t = wide(host_screen);
+                let _ = SetWindowTextW(c, PCWSTR(t.as_ptr()));
             }
             if let Ok(c) = GetDlgItem(Some(self.hwnd), ID_FULLSCREEN as i32) {
                 let t = wide(if fullscreen { "Window" } else { "Full screen" });

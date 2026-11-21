@@ -264,7 +264,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func connectTo(_ host: String, _ port: UInt16) {
         setBusy("Connecting…")
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = Result { try GlassClient(host: host, port: port) }
+            // The view last used with this host (default: fit), and the colour choice.
+            let saved = UserDefaults.standard.object(forKey: "viewMode-\(host)") as? Int
+            let mode = UInt8(saved ?? Int(GLASS_MODE_FIT))
+            let full = UserDefaults.standard.bool(forKey: "fullColour")
+            let result = Result { try GlassClient(host: host, port: port, mode: mode, fullColour: full) }
             DispatchQueue.main.async {
                 switch result {
                 case .success(let client):

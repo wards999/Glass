@@ -262,6 +262,10 @@ pub struct HostOptions {
     /// Asked before each connection of a paired viewer; `None` = always allow.
     pub ask: Option<AskFn>,
     pub events: Box<dyn FnMut(HostEvent) + Send>,
+    /// What this host is (`protocol::HOST_OS_*`), told to viewers.
+    pub host_os: u8,
+    /// What it can do (`protocol::HOST_CAP_*`), told to viewers.
+    pub host_caps: u8,
 }
 
 impl Default for HostOptions {
@@ -269,6 +273,8 @@ impl Default for HostOptions {
         Self {
             fixed_pin: None,
             ask: None,
+            host_os: crate::protocol::HOST_OS_UNKNOWN,
+            host_caps: 0,
             events: Box::new(|_| {}),
         }
     }
@@ -484,6 +490,8 @@ impl HostListener {
                 info,
                 udp_port: self.udp.local_addr()?.port(),
                 session_id,
+                host_os: self.opts.host_os,
+                host_caps: self.opts.host_caps,
             },
         )?;
         let (to_viewer, from_viewer) = media_secrets(&ch.writer, session_id)?;
@@ -1073,6 +1081,8 @@ struct ClientShared {
 pub struct Client {
     shared: Arc<ClientShared>,
     ctl: TlsWriter,
+    host_os: u8,
+    host_caps: u8,
     host: SocketAddrV4,
     peer: Peer,
     threads: Vec<JoinHandle<()>>,
@@ -1237,13 +1247,18 @@ impl Client {
             .set_read_timeout(Some(APPROVAL_TIMEOUT))
             .map_err(hs)?;
         let mut reader = ControlReader::new();
-        let (info, udp_port, session_id) = match reader.read_one(&mut ch.reader).map_err(hs)? {
+        let (info, udp_port, session_id, host_os, host_caps) = match reader
+            .read_one(&mut ch.reader)
+            .map_err(hs)?
+        {
             Incoming::Control(Control::Welcome {
                 version,
                 info,
                 udp_port,
                 session_id,
-            }) if version == PROTOCOL_VERSION => (info, udp_port, session_id),
+                host_os,
+                host_caps,
+            }) if version == PROTOCOL_VERSION => (info, udp_port, session_id, host_os, host_caps),
             Incoming::Control(Control::Welcome { .. }) => return Err(ConnectError::Version),
             Incoming::Control(Control::Reject { reason }) => return Err(reject_error(reason)),
             _ => return Err(ConnectError::Handshake),
@@ -1308,6 +1323,8 @@ impl Client {
         Ok(Self {
             shared,
             ctl,
+            host_os,
+            host_caps,
             host: addr,
             peer,
             threads,
@@ -1317,6 +1334,16 @@ impl Client {
     /// Current stream parameters (they change after a `StreamChange`).
     pub fn info(&self) -> StreamInfo {
         *lock(&self.shared.info)
+    }
+
+    /// What the host is (`protocol::HOST_OS_*`).
+    pub fn host_os(&self) -> u8 {
+        self.host_os
+    }
+
+    /// What the host can do (`protocol::HOST_CAP_*`).
+    pub fn host_caps(&self) -> u8 {
+        self.host_caps
     }
 
     /// Counts `StreamChange`s so far (poll to notice one).

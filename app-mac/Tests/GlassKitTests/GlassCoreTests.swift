@@ -8,7 +8,7 @@ final class GlassCoreTests: XCTestCase {
     func testCoreLinksAndReportsVersions() {
         XCTAssertFalse(GlassCore.version.isEmpty)
         XCTAssertEqual(GlassCore.version.split(separator: ".").count, 3)
-        XCTAssertEqual(GlassCore.protocolVersion, 5)
+        XCTAssertEqual(GlassCore.protocolVersion, 6)
     }
 }
 
@@ -296,7 +296,10 @@ final class HostTests: XCTestCase {
         XCTAssertEqual(s.peerAddress, "127.0.0.1")
         // The Mac viewer says it decodes 4:4:4 and wants the host's own screen.
         XCTAssertEqual(s.viewer.caps & UInt8(GLASS_CAP_HEVC_444), UInt8(GLASS_CAP_HEVC_444))
-        XCTAssertEqual(s.viewer.mode, UInt8(GLASS_MODE_HOST_SCREEN))
+        XCTAssertEqual(s.viewer.mode, UInt8(GLASS_MODE_FIT)) // the default view
+        XCTAssertNotEqual(s.viewer.caps & UInt8(GLASS_CAP_PREFER_420), 0) // 4:2:0 to start
+        XCTAssertTrue(client.hostIsMac)
+        XCTAssertNotEqual(Int32(client.hostCaps) & GLASS_HOST_CAP_444, 0)
         XCTAssertNil(s.takeModeRequest())
 
         // Frames reach the viewer intact once its UDP punch has arrived.

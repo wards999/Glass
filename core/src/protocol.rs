@@ -1,12 +1,25 @@
 //! Wire formats. `docs/protocol.md` is the source of truth; keep them in sync and
 //! bump [`PROTOCOL_VERSION`] on any change.
 
-/// Protocol version. 5 = M3c: the viewer describes its screen and what it
+/// Protocol version. 6 = M3d: `Welcome` says what the host is (OS) and can
+/// do (view modes, 4:4:4), so any host/viewer pair works the same way.
+/// 5 = M3c: the viewer describes its screen and what it
 /// can decode in `Hello`, picks a view mode (`SetMode`), and the host
 /// announces new stream parameters mid-session (`StreamChange`).
 /// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
 /// datagrams. v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 5;
+pub const PROTOCOL_VERSION: u8 = 6;
+
+/// `Welcome::host_os`.
+pub const HOST_OS_UNKNOWN: u8 = 0;
+pub const HOST_OS_WINDOWS: u8 = 1;
+pub const HOST_OS_MAC: u8 = 2;
+
+/// `Welcome::host_caps` bits.
+/// The host can show the "fit" view modes (a virtual display).
+pub const HOST_CAP_VIEW_MODES: u8 = 1;
+/// The host can encode 4:4:4 and switch to it mid-session (`SetMode`).
+pub const HOST_CAP_444: u8 = 2;
 
 /// Default TCP control port; the host's UDP media socket uses the same number.
 pub const DEFAULT_PORT: u16 = 47800;
@@ -246,6 +259,10 @@ pub enum Control {
         info: StreamInfo,
         udp_port: u16,
         session_id: u32,
+        /// `HOST_OS_*`.
+        host_os: u8,
+        /// `HOST_CAP_*` bits.
+        host_caps: u8,
     },
     Reject {
         reason: u8,
@@ -348,6 +365,8 @@ impl Control {
                 info,
                 udp_port,
                 session_id,
+                host_os,
+                host_caps,
             } => {
                 put(&[version, info.codec, info.chroma, info.mode]);
                 put(&info.width.to_be_bytes());
@@ -355,6 +374,7 @@ impl Control {
                 put(&info.fps.to_be_bytes());
                 put(&udp_port.to_be_bytes());
                 put(&session_id.to_be_bytes());
+                put(&[host_os, host_caps]);
             }
             Control::Reject { reason } => put(&[reason]),
             Control::CursorVisible { visible } => put(&[visible as u8]),
@@ -392,7 +412,7 @@ impl Control {
         let u64_at = |i: usize| u64::from_be_bytes(b[i..i + 8].try_into().unwrap());
         let want = match kind {
             1 => 9,
-            2 => 16,
+            2 => 18,
             3 => 1,
             4 => 12,
             5 => 20,
@@ -426,6 +446,8 @@ impl Control {
                 },
                 udp_port: u16_at(10),
                 session_id: u32_at(12),
+                host_os: b[16],
+                host_caps: b[17],
             },
             3 => Control::Reject { reason: b[0] },
             4 => Control::Ping {
@@ -607,6 +629,8 @@ mod tests {
                 },
                 udp_port: 47800,
                 session_id: 0xA1B2_C3D4,
+                host_os: HOST_OS_MAC,
+                host_caps: HOST_CAP_VIEW_MODES | HOST_CAP_444,
             },
             Control::Reject {
                 reason: REJECT_BUSY,

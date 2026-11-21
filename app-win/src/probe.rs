@@ -58,6 +58,7 @@ pub fn serve(args: &[String]) -> Res<()> {
         fixed_pin: pin,
         ask: None,
         events: Box::new(crate::print_event),
+        ..Default::default()
     };
     let replay = Replay::start(
         std::fs::read(&file)?,

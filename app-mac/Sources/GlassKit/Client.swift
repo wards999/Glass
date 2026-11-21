@@ -1,3 +1,4 @@
+import AppKit
 import CGlassCore
 import Foundation
 
@@ -65,7 +66,13 @@ public final class GlassClient {
     // Guards `ptr` for calls from other threads against `close()`.
     private let lock = NSLock()
     private var ptr: OpaquePointer?
-    public let info: GLASS_StreamInfo
+    /// Current stream parameters (they change when the host switches view
+    /// or colour; see `infoChanges`).
+    public var info: GLASS_StreamInfo { with(GLASS_StreamInfo()) { glass_client_info($0) } }
+    /// What the host is (`GLASS_HOST_OS_*`) and can do (`GLASS_HOST_CAP_*`).
+    public let hostOS: UInt8
+    public let hostCaps: UInt8
+    public var hostIsMac: Bool { Int32(hostOS) == GLASS_HOST_OS_MAC }
     public let host: String
     public let port: UInt16
     /// The paired host's name ("QUIETPC22").
@@ -75,14 +82,28 @@ public final class GlassClient {
 
     /// Connects to a paired host (TLS with pinned certificates; encrypted
     /// media). Throws `ConnectFailure` with `needsPairing` if not paired.
-    public init(host: String, port: UInt16 = GlassClient.defaultPort, device: GlassDevice? = GlassDevice.shared) throws {
+    /// `mode`: view mode to ask for (`GLASS_MODE_*`); `fullColour`: 4:4:4
+    /// from the start (else 4:2:0, switchable later).
+    public init(host: String, port: UInt16 = GlassClient.defaultPort, device: GlassDevice? = GlassDevice.shared,
+                mode: UInt8 = UInt8(GLASS_MODE_FIT), fullColour: Bool = false) throws {
         guard let device else { throw ConnectFailure(code: 10, host: host) }
         var err: Int32 = 0
-        guard let p = glass_client_connect(device.ptr, host, port, &err) else {
+        // Tell the host about this Mac's screen, so it can fit it.
+        var hello = GLASS_ViewerHello()
+        if let s = NSScreen.main {
+            let px = s.convertRectToBacking(s.frame).size
+            hello.display_w = UInt16(clamping: Int(px.width))
+            hello.display_h = UInt16(clamping: Int(px.height))
+            hello.refresh_hz = UInt16(clamping: s.maximumFramesPerSecond)
+        }
+        hello.caps = UInt8(GLASS_CAP_HEVC_444) | (fullColour ? 0 : UInt8(GLASS_CAP_PREFER_420))
+        hello.mode = mode
+        guard let p = glass_client_connect(device.ptr, host, port, hello, &err) else {
             throw ConnectFailure(code: err, host: host)
         }
         ptr = p
-        info = glass_client_info(p)
+        hostOS = glass_client_host_os(p)
+        hostCaps = glass_client_host_caps(p)
         var name = [CChar](repeating: 0, count: 128)
         glass_client_host_name(p, &name, name.count)
         hostName = String(cString: name)
@@ -118,6 +139,14 @@ public final class GlassClient {
         default:
             return .disconnected
         }
+    }
+
+    /// Counts the host's stream changes; re-read `info` when it moves.
+    public var infoChanges: UInt32 { with(0) { glass_client_info_changes($0) } }
+
+    /// Asks the host for view mode `mode`; `allow444` false asks for 4:2:0.
+    public func setMode(_ mode: UInt8, allow444: Bool) {
+        with(()) { glass_client_set_mode($0, mode, allow444) }
     }
 
     public func requestKeyframe() {

@@ -107,10 +107,13 @@ public final class GlassHost {
         var err: Int32 = 0
         let ctx = Unmanaged.passUnretained(events).toOpaque()
         let p: OpaquePointer?
+        // A Mac host: view modes if the virtual display works here, and 4:4:4.
+        let os = UInt8(GLASS_HOST_OS_MAC)
+        let caps = (VirtualDisplay.available ? UInt8(GLASS_HOST_CAP_VIEW_MODES) : 0) | UInt8(GLASS_HOST_CAP_444)
         if let fixedPin {
-            p = glass_host_listen(device.ptr, port, fixedPin, eventTrampoline, ctx, &err)
+            p = glass_host_listen(device.ptr, port, fixedPin, os, caps, eventTrampoline, ctx, &err)
         } else {
-            p = glass_host_listen(device.ptr, port, nil, eventTrampoline, ctx, &err)
+            p = glass_host_listen(device.ptr, port, nil, os, caps, eventTrampoline, ctx, &err)
         }
         guard let p else { throw HostStartFailure(code: err) }
         ptr = p

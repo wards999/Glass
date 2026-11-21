@@ -25,3 +25,24 @@ settings; the Mac menu-bar icon; the Mac viewer's bar; the app icon.
 - The Mac host keeps only the newest frame. To check: dragging must not get
   laggier over time.
 - 4:2:0 by default; 4:4:4 from the bar or Ctrl+Alt+Shift+C.
+
+## m3d-test2 (built 2026-11-21)
+- **Protocol v6:** `Welcome` carries the host's OS and capabilities.
+  - The viewer picks keys by itself: Ctrl↔⌘ only across Mac/PC, as
+    labelled between two PCs or two Macs. `--keys` overrides.
+  - The bars grey out what the host can't do.
+- **The PC host switches 4:2:0 ↔ 4:4:4 mid-session** (new NVENC encoder,
+  StreamChange, IDR) and follows the viewer's preference from `Hello`.
+- **The Mac viewer:**
+  - It has the same drop-down bar: views, colour, full screen, stats, PC
+    keys, pin, disconnect, status.
+  - It handles StreamChange: a new decoder, picture shape and pointer scale.
+  - It sends its screen size, so a Mac host can fit it (Mac→Mac).
+  - It remembers the view per host and the colour choice.
+- **CI:** a Mac→Mac run on the runner; the packaged app hosts a test pattern
+  and its own viewer connects.
+- **Exodus:** its password window doesn't appear in the stream. The app
+  marks that window "no screen capture", and macOS leaves it out of every
+  capture (screenshots, Zoom, Glass). It is still in front on the Mac, so
+  typing reaches it. That's by design; Glass can't and shouldn't override it.
+

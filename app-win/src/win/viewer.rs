@@ -26,8 +26,8 @@ use glass_core::input::{BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE,
 use glass_core::keymap::{pc_key_for_mac, win_scan_to_hid, PcModifierRule};
 use glass_core::net::{Client, ViewerHello, Wait};
 use glass_core::protocol::{
-    CAP_HEVC_444, CAP_PREFER_420, MODE_COUNT, MODE_FIT, MODE_FIT_LARGER, MODE_FIT_MORE_SPACE,
-    NOTICE_NONE,
+    CAP_HEVC_444, CAP_PREFER_420, HOST_CAP_444, HOST_CAP_VIEW_MODES, HOST_OS_MAC, HOST_OS_WINDOWS,
+    MODE_COUNT, MODE_FIT, MODE_FIT_LARGER, MODE_FIT_MORE_SPACE, NOTICE_NONE,
 };
 use glass_core::recording::CHROMA_444;
 use glass_core::stats::{StatRing, Summary};
@@ -54,7 +54,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 pub struct Options {
     pub windowed: bool,
     pub seconds: Option<f64>,
-    pub rule: PcModifierRule,
+    /// Key rule; `None` = from the host: Ctrl acts as ⌘ on a Mac host, keys
+    /// stay as labelled on a PC host.
+    pub rule: Option<PcModifierRule>,
     /// Ask for 4:4:4 when possible (else 4:2:0, which uses less bandwidth).
     pub full_colour: bool,
 }
@@ -343,6 +345,7 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         monitor: (mon, work, display),
     } = prep;
     let started = clock::now_us();
+    let client_os = client.host_os();
     let sh = Arc::new(Shared {
         client,
         can_444: AtomicBool::new(hello.caps & CAP_HEVC_444 != 0),
@@ -351,7 +354,11 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         stop: AtomicBool::new(false),
         reason: Mutex::new(None),
         size: AtomicU64::new(0),
-        rule: opts.rule,
+        rule: opts.rule.unwrap_or(if client_os == HOST_OS_MAC {
+            PcModifierRule::PcStyle
+        } else {
+            PcModifierRule::MacStyle
+        }),
     });
 
     let hwnd = unsafe { create_window(&sh, mon, work, !opts.windowed)? };
@@ -885,12 +892,19 @@ impl Ui {
             },
             st.last_rtt_us as f64 / 1e3
         );
+        let caps = c.host_caps();
         bar.set_state(
             info.mode,
             info.chroma == CHROMA_444,
-            self.sh.can_444.load(Ordering::Relaxed),
+            self.sh.can_444.load(Ordering::Relaxed) && caps & HOST_CAP_444 != 0,
+            caps & HOST_CAP_VIEW_MODES != 0,
             self.fullscreen,
             &status,
+            match c.host_os() {
+                HOST_OS_MAC => "Mac's screen",
+                HOST_OS_WINDOWS => "PC's screen",
+                _ => "Host's screen",
+            },
         );
         self.last_bar_status_us = clock::now_us();
     }
@@ -1284,6 +1298,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         "4:2:0"
                     }
                 );
+                Some(LRESULT(0))
+            }
+            WM_NEXT_MODE if c.host_caps() & HOST_CAP_VIEW_MODES == 0 => {
+                println!("This host can only show its own screen (other views need a virtual display there).");
                 Some(LRESULT(0))
             }
             WM_NEXT_MODE => {

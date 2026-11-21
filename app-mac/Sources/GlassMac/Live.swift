@@ -59,6 +59,11 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     var onFinish: (String) -> Void = { _ in }
     /// ⌘ -> Win, ⌃ -> Ctrl instead of the default ⌘ -> Ctrl, ⌃ -> Win.
     var pcStyleModifiers = UserDefaults.standard.bool(forKey: "pcStyleModifiers")
+    private var bar: ControlBar?
+    private var barSeen: UInt64 = 0
+    private var lastBarUpdate: UInt64 = 0
+    private var seenChanges: UInt32 = 0 // main thread
+    private var wantFullColour = UserDefaults.standard.bool(forKey: "fullColour")
 
     private var window: NSWindow!
     private var view: MetalView!
@@ -96,6 +101,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     init(client: GlassClient) throws {
         self.client = client
         renderer = try Renderer()
+        // Mac host: ⌘ stays ⌘ (the HID GUI key), so use the PC-style mapping.
+        if client.hostIsMac { pcStyleModifiers = true }
     }
 
     private var streamDesc: String {
@@ -146,6 +153,18 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             overlay.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             overlay.topAnchor.constraint(equalTo: view.topAnchor, constant: 12),
         ])
+
+        let bar = ControlBar(hostIsMac: client.hostIsMac, viewsOK: Int32(client.hostCaps) & GLASS_HOST_CAP_VIEW_MODES != 0,
+                             fullColourOK: Int32(client.hostCaps) & GLASS_HOST_CAP_444 != 0)
+        bar.onCommand = { [weak self] c in self?.barCommand(c) }
+        bar.isHidden = true
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(bar)
+        NSLayoutConstraint.activate([
+            bar.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            bar.topAnchor.constraint(equalTo: view.topAnchor, constant: 0),
+        ])
+        self.bar = bar
 
         window.contentView = view
         window.center()
@@ -235,6 +254,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         switch e.type {
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
             client.move(x: x, y: y)
+            // Pointer at the top edge: drop the control bar down.
+            if e.type == .mouseMoved, view.bounds.height - p.y <= 3, let bar, bar.isHidden { showBar() }
         case .leftMouseDown, .leftMouseUp:
             // ⌃-click is a right-click on a Mac; on the PC it's Win+click, so don't translate.
             client.button(.left, down: e.type == .leftMouseDown, x: x, y: y)
@@ -343,12 +364,19 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     // MARK: decode thread
 
     private func decodeLoop() {
-        let dec = HEVCDecoder(chroma444: client.is444)
+        var dec = HEVCDecoder(chroma444: client.is444)
+        var decChanges = client.infoChanges
         var reason: String?
         while reason == nil {
             if let r = lock.withLock({ stopReason }) {
                 reason = r
                 break
+            }
+            // The host changed the stream (size, colour): a decoder to match.
+            let changes = client.infoChanges
+            if changes != decChanges {
+                decChanges = changes
+                dec = HEVCDecoder(chroma444: client.is444)
             }
             let r = client.waitFrame(timeoutMs: 100) { meta, bytes in
                 let t0 = GlassClock.nowUs()
@@ -389,6 +417,71 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         DispatchQueue.main.async { self.completed(reason ?? "closed") }
     }
 
+    // MARK: control bar (main thread)
+
+    private func showBar() {
+        guard let bar else { return }
+        updateBar()
+        bar.isHidden = false
+        barSeen = GlassClock.nowUs()
+    }
+
+    private func tickBar() {
+        guard let bar, !bar.isHidden else { return }
+        let now = GlassClock.nowUs()
+        if let w = window {
+            let p = bar.convert(w.mouseLocationOutsideOfEventStream, from: nil)
+            if bar.bounds.insetBy(dx: -12, dy: -12).contains(p) || bar.pinned { barSeen = now }
+        }
+        if now &- barSeen > 700_000 {
+            bar.isHidden = true
+        } else if now &- lastBarUpdate > 500_000 {
+            updateBar()
+        }
+    }
+
+    private func updateBar() {
+        let i = client.info
+        let st = client.stats
+        let status = "\(client.hostName)  ·  \(i.width)x\(i.height)  ·  \(client.is444 ? "4:4:4" : "4:2:0")  ·  round trip \(Int((Double(st.last_rtt_us) / 1000).rounded())) ms"
+        lastBarUpdate = GlassClock.nowUs()
+        bar?.update(mode: i.mode, fullColour: client.is444, fullScreen: window.styleMask.contains(.fullScreen),
+                    statsShown: !statsHidden, pcKeys: pcStyleModifiers, status: status)
+    }
+
+    private func barCommand(_ c: ControlBar.Command) {
+        switch c {
+        case .view(let m):
+            client.setMode(m, allow444: wantFullColour)
+            UserDefaults.standard.set(Int(m), forKey: "viewMode-\(client.host)")
+        case .colour(let full):
+            wantFullColour = full
+            UserDefaults.standard.set(full, forKey: "fullColour")
+            client.setMode(client.info.mode, allow444: full)
+        case .fullScreen:
+            window.toggleFullScreen(nil)
+        case .stats:
+            toggleOverlay()
+        case .pcKeys:
+            if !client.hostIsMac {
+                pcStyleModifiers.toggle()
+                UserDefaults.standard.set(pcStyleModifiers, forKey: "pcStyleModifiers")
+            }
+        case .disconnect:
+            window.performClose(nil)
+        }
+        updateBar()
+    }
+
+    /// The host switched view or colour: new picture shape and pointer scale.
+    private func streamChanged() {
+        let i = client.info
+        window.contentAspectRatio = NSSize(width: Int(i.width), height: Int(i.height))
+        updateDrawableSize()
+        cursorGeneration &-= 1 // rescale the pointer on the next poll
+        updateBar()
+    }
+
     // MARK: main thread
 
     @objc private func tick(_ link: CADisplayLink) {
@@ -398,6 +491,12 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         }
         if let item { present(item.0, item.1) }
         pollCursor()
+        tickBar()
+        let changes = client.infoChanges
+        if changes != seenChanges {
+            seenChanges = changes
+            streamChanged()
+        }
         let now = GlassClock.nowUs()
         if now - lastOverlay >= 250_000 {
             lastOverlay = now

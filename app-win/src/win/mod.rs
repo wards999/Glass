@@ -391,6 +391,9 @@ pub fn host(args: &[String]) -> Res<()> {
         fixed_pin: None,
         ask,
         events: Box::new(crate::print_event),
+        host_os: glass_core::protocol::HOST_OS_WINDOWS,
+        // 4:4:4 switchable mid-session; view modes need a virtual display (M7).
+        host_caps: glass_core::protocol::HOST_CAP_444,
     };
     let mut listener = if a.local {
         HostListener::bind_on(std::net::Ipv4Addr::LOCALHOST, a.port, device.clone(), opts)?
@@ -567,17 +570,36 @@ fn run_session(
     blocking: &AtomicU8,
 ) -> Res<(String, Vec<String>, u64)> {
     while cap.next_frame()?.is_some() {} // drop frames captured while waiting
-    let mut enc = encode::Encoder::new(
-        &gpu.device,
-        &encode::Config {
-            width: w,
-            height: h,
-            fps: fps.max(1),
-            bitrate: a.mbps as i64 * 1_000_000,
-            chroma444: a.chroma444,
-            keep_last: true,
-        },
-    )?;
+    let make = |chroma444: bool| {
+        encode::Encoder::new(
+            &gpu.device,
+            &encode::Config {
+                width: w,
+                height: h,
+                fps: fps.max(1),
+                bitrate: a.mbps as i64 * 1_000_000,
+                chroma444,
+                keep_last: true,
+            },
+        )
+    };
+    let info = |chroma444: bool| StreamInfo {
+        codec: CODEC_HEVC,
+        chroma: if chroma444 { CHROMA_444 } else { CHROMA_420 },
+        width: w as u16,
+        height: h as u16,
+        fps: fps as u16,
+        mode: glass_core::protocol::MODE_HOST_SCREEN,
+    };
+    // Colour: what the viewer asked for if it can decode 4:4:4 (M3d);
+    // otherwise 4:2:0. `--chroma` only sets what Welcome announced.
+    let v = session.viewer;
+    let can_444 = v.caps & glass_core::protocol::CAP_HEVC_444 != 0;
+    let mut chroma444 = can_444 && v.caps & glass_core::protocol::CAP_PREFER_420 == 0;
+    if chroma444 != a.chroma444 {
+        session.send_stream_change(info(chroma444))?;
+    }
+    let mut enc = make(chroma444)?;
     let mut run = HostRun::new();
     let mut pointer = cursor::CursorWatch::new();
     let mut watch = blocker::BlockerWatch::new();
@@ -587,6 +609,26 @@ fn run_session(
     while session.connected() && run.error.is_none() {
         cap.wait(5);
         pending_idr |= session.take_keyframe_request();
+        // The viewer switched colour (4:2:0 <-> 4:4:4); view modes need a
+        // virtual display, which a PC host doesn't have yet (M7).
+        if let Some((_mode, allow)) = session.take_mode_request() {
+            let want = allow && can_444;
+            if want != chroma444 {
+                match make(want) {
+                    Ok(e) => {
+                        enc = e;
+                        chroma444 = want;
+                        session.send_stream_change(info(chroma444))?;
+                        pending_idr = true;
+                        println!(
+                            "Viewer switched to {}.",
+                            if want { "full colour (4:4:4)" } else { "4:2:0" }
+                        );
+                    }
+                    Err(e) => println!("Couldn't switch colour: {e}"),
+                }
+            }
+        }
         let now = clock::now_us();
         if let Some(b) = watch.poll(now, 250_000) {
             blocking.store(b.code(), Ordering::Relaxed);

@@ -119,13 +119,35 @@
 #define GLASS_WRONG_TOTAL 10
 
 /**
- * Protocol version. 5 = M3c: the viewer describes its screen and what it
+ * Protocol version. 6 = M3d: `Welcome` says what the host is (OS) and can
+ * do (view modes, 4:4:4), so any host/viewer pair works the same way.
+ * 5 = M3c: the viewer describes its screen and what it
  * can decode in `Hello`, picks a view mode (`SetMode`), and the host
  * announces new stream parameters mid-session (`StreamChange`).
  * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
  * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 5
+#define GLASS_PROTOCOL_VERSION 6
+
+/**
+ * `Welcome::host_os`.
+ */
+#define GLASS_HOST_OS_UNKNOWN 0
+
+#define GLASS_HOST_OS_WINDOWS 1
+
+#define GLASS_HOST_OS_MAC 2
+
+/**
+ * `Welcome::host_caps` bits.
+ * The host can show the "fit" view modes (a virtual display).
+ */
+#define GLASS_HOST_CAP_VIEW_MODES 1
+
+/**
+ * The host can encode 4:4:4 and switch to it mid-session (`SetMode`).
+ */
+#define GLASS_HOST_CAP_444 2
 
 /**
  * Default TCP control port; the host's UDP media socket uses the same number.
@@ -454,6 +476,23 @@ typedef struct {
 } GLASS_Summary;
 
 /**
+ * What a viewer said about itself in `Hello` (0 = unknown).
+ */
+typedef struct {
+  uint16_t display_w;
+  uint16_t display_h;
+  uint16_t refresh_hz;
+  /**
+   * `protocol::CAP_*` bits.
+   */
+  uint8_t caps;
+  /**
+   * `protocol::MODE_*` the viewer wants.
+   */
+  uint8_t mode;
+} GLASS_ViewerHello;
+
+/**
  * Stream description sent by the host in [`Control::Welcome`].
  */
 typedef struct {
@@ -635,23 +674,6 @@ typedef struct {
 } GLASS_InputActionC;
 
 typedef void (*GLASS_InputFn)(void *ctx, const GLASS_InputActionC *action);
-
-/**
- * What a viewer said about itself in `Hello` (0 = unknown).
- */
-typedef struct {
-  uint16_t display_w;
-  uint16_t display_h;
-  uint16_t refresh_hz;
-  /**
-   * `protocol::CAP_*` bits.
-   */
-  uint8_t caps;
-  /**
-   * `protocol::MODE_*` the viewer wants.
-   */
-  uint8_t mode;
-} GLASS_ViewerHello;
 
 /**
  * What the host knows about a frame when it sends it.
@@ -898,7 +920,42 @@ void glass_pairing_cancel(GLASS_Pairing *p);
 GLASS_Client *glass_client_connect(const GLASS_DeviceHandle *d,
                                    const char *host,
                                    uint16_t port,
+                                   GLASS_ViewerHello hello,
                                    int32_t *err);
+
+/**
+ * What the host is (`HOST_OS_*`).
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+uint8_t glass_client_host_os(const GLASS_Client *c);
+
+/**
+ * What the host can do (`HOST_CAP_*`).
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+uint8_t glass_client_host_caps(const GLASS_Client *c);
+
+/**
+ * Counts the host's `StreamChange`s; when it moves, re-read
+ * `glass_client_info` (new size, chroma or mode from the next IDR).
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+uint32_t glass_client_info_changes(const GLASS_Client *c);
+
+/**
+ * Asks the host for view mode `mode` (`MODE_*`); `allow_444` false asks
+ * for 4:2:0.
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+void glass_client_set_mode(const GLASS_Client *c, uint8_t mode, bool allow_444);
 
 /**
  * The connected host's paired name (NUL-terminated into `buf`).
@@ -1045,6 +1102,8 @@ void glass_client_close(GLASS_Client *c);
 GLASS_HostHandle *glass_host_listen(const GLASS_DeviceHandle *d,
                                     uint16_t port,
                                     const char *fixed_pin,
+                                    uint8_t host_os,
+                                    uint8_t host_caps,
                                     GLASS_HostEventFn events,
                                     void *ctx,
                                     int32_t *err);

@@ -10,6 +10,26 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M3d test 2 (control bar both ways, any pair)
+Use the zip and dmg from the same test build (protocol v6).
+1. **PC views the Mac** (connect.cmd):
+   - Open the bar from the top edge.
+   - Views and both colour modes should work.
+   - Keys: Ctrl acts as ⌘.
+   - Drag windows for a minute or two in each colour mode; the lag must stay
+     steady.
+2. **Mac views the PC** (Glass on the Mac ▸ Connect; host.cmd on the PC):
+   - Move the pointer to the top edge to open the bar.
+   - The fit views are greyed out (a PC can only show its own screen).
+   - Fast ↔ Full colour should switch, and the PC window says "Viewer
+     switched to …".
+   - Check that ⌘C/⌘V still work as before.
+3. **PC views PC** (the second PC): host.cmd on one, connect.cmd on the
+   other. Ctrl stays Ctrl (Ctrl+C copies), the Win key opens Start on the
+   host, and the views are greyed out.
+4. Send all the reports: connect.cmd text, host.cmd text, and the Mac's
+   Show Results.
+
 ## M3c (sharp text, view modes, 4:4:4)
 Use the zip and dmg from the same test build (protocol v5).
 1. **Mac:** install the new Glass.app, open it, and click **Share This Mac…**.

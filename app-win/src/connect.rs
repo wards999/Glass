@@ -8,9 +8,8 @@
 //! screen and three "fit to this PC" sizes; the last one is remembered per
 //! host address (`view-modes.txt`) and asked for when connecting.
 //!
-//! Keys: by default the PC's Ctrl acts as the Mac's ⌘ (so Ctrl+C copies)
-//! and Win as ⌃; `--keys labelled` sends them as labelled (for a PC host).
-//! LATER(M7): the host tells the viewer its OS, so this picks itself.
+//! Keys: with a Mac host the PC's Ctrl acts as ⌘ (so Ctrl+C copies)
+//! and Win as ⌃; with a PC host they stay as labelled. `--keys pc|labelled` overrides.
 
 use crate::win::viewer::{self, Options};
 use glass_core::identity::{default_dir, fingerprint_short};
@@ -45,7 +44,7 @@ pub fn connect(args: &[String]) -> Res<()> {
     let mut opts = Options {
         windowed: false,
         seconds: None,
-        rule: PcModifierRule::PcStyle,
+        rule: None, // from the host (Mac: Ctrl acts as ⌘; PC: as labelled)
         // 4:2:0 by default: in m3c-test4 4:4:4 cost ~25 ms on the Mac.
         full_colour: false,
     };
@@ -74,11 +73,11 @@ pub fn connect(args: &[String]) -> Res<()> {
                 })
             }
             "--keys" => {
-                opts.rule = match val()?.as_str() {
+                opts.rule = Some(match val()?.as_str() {
                     "pc" => PcModifierRule::PcStyle,
                     "labelled" | "labeled" => PcModifierRule::MacStyle,
                     k => return Err(format!("--keys {k}: use pc or labelled").into()),
-                }
+                })
             }
             s if addr.is_none() && !s.starts_with("--") => addr = Some(s.to_string()),
             s => return Err(format!("unknown argument {s}").into()),

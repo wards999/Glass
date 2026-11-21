@@ -179,6 +179,17 @@ jobs:
           GLASS_HOME=$RUNNER_TEMP/pcviewer target/release/glass probe 127.0.0.1 --port 47812 --pin 246810 --seconds 4 --min-frames 60
           wait %1
           hdiutil detach /tmp/glass
+      - name: Mac -> Mac (packaged app hosts a test pattern, its own viewer connects)
+        # Only one Mac exists for real tests (SPEC M3d); this covers the pair.
+        continue-on-error: true
+        run: |
+          hdiutil attach dist/*.dmg -mountpoint /tmp/glass -nobrowse
+          bin=/tmp/glass/Glass.app/Contents/MacOS/GlassMac
+          GLASS_HOME=$RUNNER_TEMP/machost2 perl -e "alarm 90; exec @ARGV" "$bin" host --test-pattern --pin 246810 --port 47813 --seconds 8 &
+          sleep 3
+          GLASS_HOME=$RUNNER_TEMP/macviewer perl -e "alarm 60; exec @ARGV" "$bin" connect 127.0.0.1:47813 --pin 246810 --seconds 4
+          wait %1
+          hdiutil detach /tmp/glass
       - uses: actions/upload-artifact@v4
         with:
           name: glass-mac

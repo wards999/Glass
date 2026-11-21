@@ -431,16 +431,12 @@ pub unsafe extern "C" fn glass_client_connect(
     d: *const DeviceHandle,
     host: *const c_char,
     port: u16,
+    hello: ViewerHello,
     err: *mut i32,
 ) -> *mut Client {
     let Some(host) = str_arg(host) else {
         set_err(err, ConnectError::Resolve as i32);
         return std::ptr::null_mut();
-    };
-    // The Mac viewer decodes 4:4:4 (VideoToolbox). LATER(M7): its screen size.
-    let hello = ViewerHello {
-        caps: crate::protocol::CAP_HEVC_444,
-        ..Default::default()
     };
     match Client::connect_with(&(*d).0, host, port, hello) {
         Ok(c) => {
@@ -452,6 +448,44 @@ pub unsafe extern "C" fn glass_client_connect(
             std::ptr::null_mut()
         }
     }
+}
+
+/// What the host is (`HOST_OS_*`).
+///
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_host_os(c: *const Client) -> u8 {
+    (*c).host_os()
+}
+
+/// What the host can do (`HOST_CAP_*`).
+///
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_host_caps(c: *const Client) -> u8 {
+    (*c).host_caps()
+}
+
+/// Counts the host's `StreamChange`s; when it moves, re-read
+/// `glass_client_info` (new size, chroma or mode from the next IDR).
+///
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_info_changes(c: *const Client) -> u32 {
+    (*c).info_changes()
+}
+
+/// Asks the host for view mode `mode` (`MODE_*`); `allow_444` false asks
+/// for 4:2:0.
+///
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_set_mode(c: *const Client, mode: u8, allow_444: bool) {
+    (*c).set_mode(mode, allow_444)
 }
 
 /// The connected host's paired name (NUL-terminated into `buf`).
@@ -787,6 +821,8 @@ pub unsafe extern "C" fn glass_host_listen(
     d: *const DeviceHandle,
     port: u16,
     fixed_pin: *const c_char,
+    host_os: u8,
+    host_caps: u8,
     events: HostEventFn,
     ctx: *mut c_void,
     err: *mut i32,
@@ -795,6 +831,8 @@ pub unsafe extern "C" fn glass_host_listen(
     let opts = HostOptions {
         fixed_pin: str_arg(fixed_pin).map(str::to_string),
         ask: None, // LATER: "ask before each connection" on the Mac.
+        host_os,
+        host_caps,
         events: Box::new(move |e| {
             let f = events;
             let c = event_c(e);
@@ -1284,7 +1322,13 @@ mod tests {
         unsafe {
             let d = glass_device_open(dir_c.as_ptr(), c"FFI test".as_ptr());
             assert!(!d.is_null());
-            let c = glass_client_connect(d, c"127.0.0.1".as_ptr(), port, &mut err);
+            let c = glass_client_connect(
+                d,
+                c"127.0.0.1".as_ptr(),
+                port,
+                ViewerHello::default(),
+                &mut err,
+            );
             assert!(c.is_null());
             assert_eq!(err, ConnectError::Connect as i32);
             glass_client_close(c); // null is fine
@@ -1326,7 +1370,13 @@ mod tests {
             let d = glass_device_open(dir_c.as_ptr(), c"FFI viewer".as_ptr());
             let mut err = 0;
             // Not paired yet.
-            let c = glass_client_connect(d, c"127.0.0.1".as_ptr(), port, &mut err);
+            let c = glass_client_connect(
+                d,
+                c"127.0.0.1".as_ptr(),
+                port,
+                ViewerHello::default(),
+                &mut err,
+            );
             assert!(c.is_null());
             assert_eq!(err, ConnectError::NotPaired as i32);
             // Wrong PIN, then the right one.
@@ -1354,7 +1404,13 @@ mod tests {
                 0
             );
             // Connect works now and knows the host's name.
-            let c = glass_client_connect(d, c"127.0.0.1".as_ptr(), port, &mut err);
+            let c = glass_client_connect(
+                d,
+                c"127.0.0.1".as_ptr(),
+                port,
+                ViewerHello::default(),
+                &mut err,
+            );
             assert!(!c.is_null(), "err {err}");
             glass_client_host_name(c, name.as_mut_ptr(), name.len());
             assert_eq!(
@@ -1406,6 +1462,8 @@ mod tests {
                 hd,
                 0,
                 c"112233".as_ptr(),
+                crate::protocol::HOST_OS_MAC,
+                crate::protocol::HOST_CAP_VIEW_MODES,
                 on_event,
                 std::ptr::null_mut(),
                 &mut err,
@@ -1493,6 +1551,8 @@ mod tests {
                 mode: 1,
             };
             let c = Client::connect_with(&viewer, "127.0.0.1", port, hello).unwrap();
+            assert_eq!(c.host_os(), crate::protocol::HOST_OS_MAC);
+            assert_eq!(c.host_caps(), crate::protocol::HOST_CAP_VIEW_MODES);
             let mut frames = 0;
             while frames < 5 {
                 if let Wait::Frame(..) = c.wait_frame(Duration::from_secs(5)) {

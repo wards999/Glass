@@ -1,6 +1,6 @@
 # Glass protocol
 
-**Version 5 (M3c).** View modes and stream changes on top of v4. Paired devices only: mutual TLS 1.3 on the control
+**Version 6 (M3d).** The host says what it is and can do; view modes and stream changes (v5) on top of v4. Paired devices only: mutual TLS 1.3 on the control
 connection, every UDP datagram sealed with AES-128-GCM. LAN, IPv4. This file
 is the source of truth for packet formats and control messages;
 `core/src/protocol.rs`, `packet.rs`, `input.rs`, `seal.rs`, `tls.rs` and
@@ -83,7 +83,7 @@ Framing (inside TLS): `u16 length` (type + body) · `u8 type` · body. Max
 | Type | Name | Direction | Body |
 |---|---|---|---|
 | 1 | Hello | viewer → host | `version u8`, `display_w u16`, `display_h u16`, `refresh_hz u16` (the viewer's screen in pixels, 0 = unknown), `caps u8` (bit 0: can decode HEVC 4:4:4; bit 1: start in 4:2:0), `mode u8` (view mode wanted, below) |
-| 2 | Welcome | host → viewer | `version u8`, `codec u8`, `chroma u8`, `mode u8`, `width u16`, `height u16`, `fps u16`, `udp_port u16`, `session_id u32` |
+| 2 | Welcome | host → viewer | `version u8`, `codec u8`, `chroma u8`, `mode u8`, `width u16`, `height u16`, `fps u16`, `udp_port u16`, `session_id u32`, `host_os u8` (0 unknown, 1 Windows, 2 Mac), `host_caps u8` (bit 0: view modes, bit 1: 4:4:4 switchable) |
 | 3 | Reject | host → viewer | `reason u8`: 1 version mismatch, 2 busy, 3 not paired, 4 denied by the host's user, 5 pairing locked (too many wrong PINs), 6 wrong or expired PIN |
 | 4 | Ping | viewer → host | `seq u32`, `client_ts u64` |
 | 5 | Pong | host → viewer | `seq u32`, `client_ts u64` (echoed), `host_ts u64` (host clock when the Ping was read) |
@@ -242,6 +242,7 @@ protocol version, `fp` first 8 bytes of the fingerprint (hex), `ip`, `port`.
 Advisory only: trust comes from the pinned fingerprint, never from discovery.
 
 ## Changelog
+- v6 — M3d: `Welcome` ends with `host_os` and `host_caps`, so the viewer picks its key mapping and offers only what the host can do; `Hello` caps bit 1 asks to start in 4:2:0.
 - v5 — M3c view modes: `Hello` carries the viewer's refresh rate, decode capabilities and wanted mode; `Welcome`'s reserved byte is the mode; `SetMode` (15) and `StreamChange` (16).
 - v4 — M6 security: mutual TLS 1.3 with pinned self-signed certificates,
   PIN pairing (SPAKE2 + exporter-bound confirmation, messages 11–14), reject

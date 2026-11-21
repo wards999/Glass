@@ -159,6 +159,8 @@ struct GlassApp {
     connecting: Option<String>,
     /// The address being viewed (its row says Viewing, with Disconnect).
     viewing: Option<String>,
+    /// Someone is viewing this PC (sharing, in a session).
+    viewer_on: bool,
     notice: Option<(String, Instant)>,
     sharing: Option<Arc<AtomicBool>>,
     share_status: String,
@@ -232,6 +234,7 @@ pub fn run(share: bool) -> Res<()> {
                 show_address: false,
                 connecting: None,
                 viewing: None,
+                viewer_on: false,
                 notice: None,
                 sharing: None,
                 share_status: String::new(),
@@ -693,8 +696,14 @@ impl GlassApp {
                 {
                     self.share_status = l.to_string();
                 }
+                if l.starts_with("Viewer connected") {
+                    self.viewer_on = true;
+                } else if l.starts_with("Session ended") || l.starts_with("Waiting for a viewer") {
+                    self.viewer_on = false;
+                }
             }
             Msg::HostStopped(why) => {
+                self.viewer_on = false;
                 self.sharing = None;
                 self.pin = None;
                 self.share_status = why;
@@ -1112,32 +1121,54 @@ impl GlassApp {
         painter.rect_filled(rect, 14, p.card);
         painter.rect_stroke(rect, 14, Stroke::new(1.0, p.border), StrokeKind::Inside);
         let c = pos2(rect.center().x, rect.top() + 78.0);
-        let t = ui.input(|i| i.time) as f32;
-        for i in 0..3 {
-            let phase = (t * 0.45 + i as f32 / 3.0).fract();
-            painter.circle_stroke(
-                c,
-                24.0 + phase * 44.0,
-                Stroke::new(1.5, p.accent.gamma_multiply((1.0 - phase) * 0.55)),
-            );
+        // During a session it's still (no searching animation) and says so.
+        let in_session = self.viewing.is_some() || self.viewer_on;
+        let col = if in_session { p.ok } else { p.accent };
+        if !in_session {
+            let t = ui.input(|i| i.time) as f32;
+            for i in 0..3 {
+                let phase = (t * 0.45 + i as f32 / 3.0).fract();
+                painter.circle_stroke(
+                    c,
+                    24.0 + phase * 44.0,
+                    Stroke::new(1.5, p.accent.gamma_multiply((1.0 - phase) * 0.55)),
+                );
+            }
         }
-        painter.circle_filled(c, 24.0, p.accent.gamma_multiply(0.14));
-        device_glyph(painter, c, false, p.accent);
+        painter.circle_filled(c, 24.0, col.gamma_multiply(0.14));
+        device_glyph(painter, c, false, col);
+        let (title, sub) = if in_session {
+            (
+                "In a session".to_string(),
+                if self.viewer_on {
+                    truncate(&self.share_status, 56)
+                } else {
+                    "Viewing another device.".to_string()
+                },
+            )
+        } else {
+            (
+                "Looking for devices \u{2026}".to_string(),
+                "Turn on sharing on your Mac or PC and it appears here.".to_string(),
+            )
+        };
         painter.text(
             pos2(c.x, rect.top() + 150.0),
             Align2::CENTER_CENTER,
-            "Looking for devices \u{2026}",
+            title,
             semibold(15.0),
             p.strong,
         );
         painter.text(
             pos2(c.x, rect.top() + 174.0),
             Align2::CENTER_CENTER,
-            "Turn on sharing on your Mac or PC and it appears here.",
+            sub,
             FontId::proportional(13.0),
             p.weak,
         );
-        ui.ctx().request_repaint_after(Duration::from_millis(33));
+        if !in_session {
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        }
     }
 
     fn share_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Pal) {

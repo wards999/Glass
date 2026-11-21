@@ -17,11 +17,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var connectingHost: String?
     /// The address of the machine being viewed (its row says Viewing).
     private var viewingHost: String?
+    /// Someone is viewing this Mac (sharing, in a session), and the line
+    /// that says who.
+    private var beingViewed = false
+    private var hostStatus = ""
     private var addressRow: NSStackView!
     private var addressLink: NSButton!
     private var shareSwitch: NSSwitch?
     private var themeButton: NSButton?
-    private var settingsPopover: NSPopover?
+    private var settingsPanel: NSPanel?
+    private var settingsMonitor: Any?
+    private var gearButton: NSButton?
     private var shareNote: NSTextField?
     private var shareIcon: NSImageView?
     private var shareTile: LayerView?
@@ -110,7 +116,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         showConnect()
         guard hostController == nil else { return }
         let h = HostController()
-        h.onStatus = { [weak self] s in self?.shareNote?.stringValue = s }
+        h.onStatus = { [weak self] s in
+            guard let self else { return }
+            self.shareNote?.stringValue = s
+            self.hostStatus = s
+            let viewed = s.hasPrefix("Connected")
+            if viewed != self.beingViewed {
+                self.beingViewed = viewed
+                self.refreshFound()
+            }
+        }
         hostController = h
         shareSwitch?.state = .on
         shareIcon?.contentTintColor = .systemGreen
@@ -127,6 +142,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         h.stop()
         h.detail.removeFromSuperview()
         hostController = nil
+        beingViewed = false
+        refreshFound()
         shareSwitch?.state = .off
         shareIcon?.contentTintColor = .secondaryLabelColor
         shareTile?.fill = Look.track
@@ -222,17 +239,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         themeButton?.toolTip = isDark ? "Switch to light" : "Switch to dark"
     }
 
-    // MARK: settings (a popover from the gear)
+    // MARK: settings (a panel under the gear, as on Windows)
 
     @objc private func showSettings(_ sender: NSButton) {
-        let vc = NSViewController()
-        vc.view = settingsView()
-        let pop = NSPopover()
-        pop.behavior = .transient
-        pop.contentViewController = vc
-        pop.show(relativeTo: sender.bounds, of: sender, preferredEdge: .maxY)
-        settingsPopover = pop
+        if settingsPanel != nil {
+            closeSettings()
+            return
+        }
+        guard let w = connectWindow else { return }
+        let card = Card(settingsView(), inset: 0)
+        let container = NSView()
+        container.addSubview(card)
+        NSLayoutConstraint.activate([
+            card.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            card.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            card.topAnchor.constraint(equalTo: container.topAnchor),
+            card.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+        let size = container.fittingSize
+        let panel = NSPanel(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless],
+                            backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.contentView = container
+        // Right-aligned under the gear, kept on screen.
+        let gear = w.convertToScreen(sender.convert(sender.bounds, to: nil))
+        var origin = NSPoint(x: gear.maxX - size.width, y: gear.minY - 6 - size.height)
+        if let vf = w.screen?.visibleFrame {
+            origin.x = min(max(origin.x, vf.minX + 8), vf.maxX - size.width - 8)
+            origin.y = max(origin.y, vf.minY + 8)
+        }
+        panel.setFrameOrigin(origin)
+        w.addChildWindow(panel, ordered: .above)
+        settingsPanel = panel
+        // A click outside it or Esc closes it (the gear toggles it itself).
+        settingsMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) { [weak self] e in
+            guard let self, let p = self.settingsPanel else { return e }
+            if e.type == .keyDown {
+                if e.keyCode == 53 { // Esc
+                    self.closeSettings()
+                    return nil
+                }
+                return e
+            }
+            if e.window === p { return e }
+            if e.window === self.connectWindow, let g = self.gearButton,
+               g.bounds.contains(g.convert(e.locationInWindow, from: nil)) {
+                return e
+            }
+            self.closeSettings()
+            return e
+        }
     }
+
+    private func closeSettings() {
+        if let m = settingsMonitor { NSEvent.removeMonitor(m) }
+        settingsMonitor = nil
+        if let p = settingsPanel {
+            p.parent?.removeChildWindow(p)
+            p.orderOut(nil)
+        }
+        settingsPanel = nil
+    }
+
+    /// The views, as on Windows (generic: any host that can make them).
+    private static let startViews: [(UInt8, String)] = [
+        (1, "View 1 of 4: Fit (fills this screen, sharp text)"),
+        (2, "View 2 of 4: More space (smaller text)"),
+        (3, "View 3 of 4: Larger (bigger text)"),
+        (0, "View 4 of 4: Host\u{2019}s own screen (may show black bars)"),
+    ]
 
     private func settingsView() -> NSView {
         func heading(_ t: String, _ size: CGFloat = 13) -> NSTextField {
@@ -244,6 +321,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                                        target: self, action: #selector(pickThemeSegment(_:)))
         theme.selectedSegment = ["system", "light", "dark"].firstIndex(of: UserDefaults.standard.string(forKey: "theme") ?? "system") ?? 0
         theme.segmentDistribution = .fillEqually
+        let current = (UserDefaults.standard.object(forKey: "startView") as? Int) ?? Int(GLASS_MODE_FIT)
+        let radios = NSStackView()
+        radios.orientation = .vertical
+        radios.alignment = .leading
+        radios.spacing = 6
+        for (mode, title) in Self.startViews {
+            let r = NSButton(radioButtonWithTitle: title, target: self, action: #selector(pickStartView(_:)))
+            r.tag = Int(mode)
+            r.state = Int(mode) == current ? .on : .off
+            radios.addArrangedSubview(r)
+        }
         let colour = NSSegmentedControl(labels: ["Fast \u{00B7} 4:2:0", "Full colour \u{00B7} 4:4:4"], trackingMode: .selectOne,
                                         target: self, action: #selector(pickColour(_:)))
         colour.selectedSegment = UserDefaults.standard.bool(forKey: "fullColour") ? 1 : 0
@@ -252,7 +340,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         note.font = .systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
         var views: [NSView] = [heading("Settings", 17), heading("Appearance"), theme,
-                               heading("Colour when viewing"), colour, note, heading("Paired devices")]
+                               heading("When viewing, start in"), radios,
+                               heading("Colour"), colour, note, heading("Paired devices")]
         let peers = GlassDevice.shared?.peers ?? []
         if peers.isEmpty {
             let none = NSTextField(labelWithString: "None yet.")
@@ -289,14 +378,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         stack.alignment = .leading
         stack.spacing = 8
         stack.setCustomSpacing(14, after: theme)
+        stack.setCustomSpacing(14, after: radios)
         stack.setCustomSpacing(14, after: note)
         stack.setCustomSpacing(14, after: views[views.count - 2])
         stack.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
-        stack.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.widthAnchor.constraint(equalToConstant: 380).isActive = true
         for v in views where !(v is NSTextField) || v === note {
             v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -36).isActive = true
         }
         return stack
+    }
+
+    @objc private func pickStartView(_ sender: NSButton) {
+        UserDefaults.standard.set(sender.tag, forKey: "startView")
     }
 
     @objc private func pickThemeSegment(_ sender: NSSegmentedControl) {
@@ -312,7 +407,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc private func forgetFromSettings(_ sender: NSButton) {
         guard let d = GlassDevice.shared, let hex = sender.identifier?.rawValue,
               let p = d.peers.first(where: { $0.hex == hex }) else { return }
-        settingsPopover?.close()
+        closeSettings()
         let a = NSAlert()
         a.messageText = "Forget \u{201C}\(p.name)\u{201D}?"
         a.informativeText = "This Mac will no longer trust it. To connect again you'll pair with a new code."
@@ -329,7 +424,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         listStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         countLabel?.stringValue = found.isEmpty ? "" : "\(found.count)"
         if found.isEmpty {
-            add(EmptyState())
+            // During a session it's still (no searching animation) and says so.
+            let session: String? = beingViewed ? hostStatus : viewer != nil ? "Viewing another device." : nil
+            add(EmptyState(session: session))
             return
         }
         let me = String(glass_protocol_version())
@@ -421,6 +518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         themeButton = themeToggle
         updateThemeButton()
         let gear = symbolButton("gearshape", "Settings", #selector(showSettings(_:)))
+        gearButton = gear
         let header = NSStackView(views: [icon, names, NSView(), themeToggle, gear])
         header.spacing = 10
         header.alignment = .centerY
@@ -600,7 +698,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         setBusy("Connecting…")
         DispatchQueue.global(qos: .userInitiated).async {
             // The view last used with this host (default: fit), and the colour choice.
-            let saved = UserDefaults.standard.object(forKey: "viewMode-\(host)") as? Int
+            let saved = UserDefaults.standard.object(forKey: "startView") as? Int
             let mode = UInt8(saved ?? Int(GLASS_MODE_FIT))
             let full = UserDefaults.standard.bool(forKey: "fullColour")
             let result = Result { try GlassClient(host: host, port: port, mode: mode, fullColour: full) }
@@ -941,14 +1039,16 @@ final class DeviceRow: LayerView {
 /// (three rings growing from 24 to 68 pt and fading, a 2.2 s cycle) around
 /// a monitor in a soft accent circle.
 final class EmptyState: LayerView {
-    init() {
+    /// `session`: in a session (says who), so no searching animation.
+    init(session: String? = nil) {
         super.init()
-        let radar = RadarView()
-        let title = NSTextField(labelWithString: "Looking for devices\u{2026}")
+        let radar = RadarView(animated: session == nil)
+        let title = NSTextField(labelWithString: session == nil ? "Looking for devices\u{2026}" : "In a session")
         title.font = .systemFont(ofSize: 15, weight: .semibold)
-        let note = NSTextField(labelWithString: "Turn on sharing on your Mac or PC and it appears here.")
+        let note = NSTextField(labelWithString: session ?? "Turn on sharing on your Mac or PC and it appears here.")
         note.font = .systemFont(ofSize: 12)
         note.textColor = .secondaryLabelColor
+        note.lineBreakMode = .byTruncatingTail
         let stack = NSStackView(views: [radar, title, note])
         stack.orientation = .vertical
         stack.alignment = .centerX
@@ -972,8 +1072,10 @@ final class RadarView: NSView {
     private static let period: CFTimeInterval = 1 / 0.45
     private let rings = (0..<3).map { _ in CAShapeLayer() }
     private let dot = CAShapeLayer()
+    private let animated: Bool
 
-    init() {
+    init(animated: Bool = true) {
+        self.animated = animated
         super.init(frame: NSRect(x: 0, y: 0, width: Self.side, height: Self.side))
         wantsLayer = true
         translatesAutoresizingMaskIntoConstraints = false
@@ -988,7 +1090,7 @@ final class RadarView: NSView {
         }
         let img = NSImageView(image: NSImage(systemSymbolName: "desktopcomputer", accessibilityDescription: nil) ?? NSImage())
         img.symbolConfiguration = .init(pointSize: 18, weight: .regular)
-        img.contentTintColor = .controlAccentColor
+        img.contentTintColor = animated ? .controlAccentColor : .systemGreen
         img.translatesAutoresizingMaskIntoConstraints = false
         addSubview(img)
         img.centerXAnchor.constraint(equalTo: centerXAnchor).isActive = true
@@ -1016,6 +1118,7 @@ final class RadarView: NSView {
     }
 
     private func startAnimating() {
+        guard animated else { return }
         let now = CACurrentMediaTime()
         for (i, r) in rings.enumerated() {
             r.removeAllAnimations()
@@ -1038,7 +1141,7 @@ final class RadarView: NSView {
 
     private func applyColours() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            let accent = NSColor.controlAccentColor
+            let accent: NSColor = animated ? .controlAccentColor : .systemGreen
             dot.fillColor = accent.withAlphaComponent(0.14).cgColor
             for r in rings { r.strokeColor = accent.cgColor }
         }

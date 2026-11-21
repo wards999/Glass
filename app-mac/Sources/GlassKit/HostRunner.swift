@@ -370,7 +370,9 @@ private final class Pipeline {
         let t = run.totals
         let s = run.s
         let arrival = GlassClock.nowUs()
-        t.delivery.push(UInt32(clamping: arrival &- captureUs))
+        // Frame times can be a hair ahead of our clock: never wrap.
+        func since(_ a: UInt64, _ b: UInt64) -> UInt32 { a > b ? UInt32(clamping: a - b) : 0 }
+        t.delivery.push(since(arrival, captureUs))
         let key = s.takeKeyframeRequest() || force || forceKey
         forceKey = false
         let inputSeq = s.inputSeq
@@ -395,10 +397,10 @@ private final class Pipeline {
                 let now = GlassClock.nowUs()
                 t.frameId &+= 1
                 let f = GLASS_OutFrame(frame_id: t.frameId, flags: isKey ? 1 : 0, capture_ts_us: captureUs,
-                                       encode_us: UInt32(clamping: now &- captureUs), input_seq: inputSeq)
+                                       encode_us: since(now, captureUs), input_seq: inputSeq)
                 let r = s.send(f, data)
                 let sent = GlassClock.nowUs()
-                t.encode.push(UInt32(clamping: now &- captureUs))
+                t.encode.push(since(now, captureUs))
                 t.vtEncode.push(UInt32(clamping: now &- arrival))
                 t.send.push(UInt32(clamping: sent &- now))
                 if r == 1 {

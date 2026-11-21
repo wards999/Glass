@@ -92,16 +92,14 @@ public final class HEVCEncoder {
         set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: config.bitrate))
         // Cap any one second at 1.5x the average so a burst can't flood Wi-Fi.
         set(kVTCompressionPropertyKey_DataRateLimits, [NSNumber(value: config.bitrate * 3 / 16), NSNumber(value: 1)] as CFArray)
-        set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel)
+        // 4:4:4: no profile at all. Setting Main (even then clearing it) keeps
+        // VideoToolbox at 4:2:0 (m3c-test1); unset, it picks Range Extensions.
+        if !config.chroma444 { set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel) }
         set(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2)
         set(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2)
         set(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)
         set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue!)
         set(kVTCompressionPropertyKey_MaximizePowerEfficiency, kCFBooleanFalse!)
-        if config.chroma444 {
-            // No explicit profile: VideoToolbox picks Range Extensions for 4:4:4 input if it can.
-            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: nil)
-        }
         VTCompressionSessionPrepareToEncodeFrames(session)
 
         var hw: CFBoolean?

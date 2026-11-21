@@ -265,6 +265,8 @@ struct Ui {
     handle: Option<Handle>,
     stats_box: Option<StatsBox>,
     stats_seen: u32,
+    /// The host notice the box is showing with the stats off.
+    notice_shown: u8,
     bar_seen_us: u64,
     last_bar_status_us: u64,
 }
@@ -640,6 +642,18 @@ fn overlay_text(
     lines.join("\n")
 }
 
+/// What a host notice means, for the viewer's screen.
+fn notice_text(code: u8, host: &str) -> String {
+    match code {
+        glass_core::protocol::NOTICE_INPUT_BLOCKED_ELEVATED => format!(
+            "\u{26A0} \u{201C}{host}\u{201D} is ignoring the mouse and keyboard: a program running as\nadministrator is in front. Click another window there, or restart Glass on it as administrator."
+        ),
+        _ => format!(
+            "\u{26A0} \u{201C}{host}\u{201D} is locked or showing a Windows security prompt.\nGlass can't show or control that screen yet: unlock it at the PC itself."
+        ),
+    }
+}
+
 /// Whether the on-screen stats are on, kept between sessions.
 fn load_stats_pref() -> bool {
     glass_core::identity::default_dir()
@@ -965,6 +979,7 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
             handle: Handle::new(hwnd, load_handle_frac()).ok(),
             stats_box: StatsBox::new(hwnd).ok(),
             stats_seen: 0,
+            notice_shown: NOTICE_NONE,
             bar_seen_us: 0,
             last_bar_status_us: 0,
         })
@@ -1081,10 +1096,28 @@ impl Ui {
     fn tick_stats(&mut self) {
         let show = self.sh.show_stats.load(Ordering::Relaxed);
         let c = self.client_on_screen();
+        // Why the host isn't taking input (locked, a UAC prompt, an admin
+        // window): shown even with the stats off, as on the Mac.
+        let notice = self.sh.client.stats().host_notice;
+        let host = self.sh.client.peer().name.clone();
         let Some(b) = &mut self.stats_box else { return };
         if !show {
-            b.hide();
+            if notice == NOTICE_NONE {
+                self.notice_shown = NOTICE_NONE;
+                b.hide();
+                return;
+            }
+            if notice != self.notice_shown {
+                self.notice_shown = notice;
+                b.set_text(&notice_text(notice, &host));
+            }
+            b.place(c);
             return;
+        }
+        if self.notice_shown != NOTICE_NONE {
+            // Back to the stats text on the next update.
+            self.notice_shown = NOTICE_NONE;
+            self.stats_seen = self.stats_seen.wrapping_sub(1);
         }
         let g = self.sh.stats_gen.load(Ordering::Relaxed);
         if g != self.stats_seen {

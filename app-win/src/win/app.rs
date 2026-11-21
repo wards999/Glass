@@ -1,129 +1,171 @@
-//! The Glass window on Windows (M3d): what you get by double-clicking
-//! Glass.exe. A list of Glass machines on the network (and paired ones),
-//! Connect, Share this PC, pairing PINs in dialogs, paired devices with
-//! Forget, session results with Copy, and a tray icon. The command line
-//! (`glass host`, `glass connect`, ...) stays for tests and CI.
+//! The Glass window on Windows (M3d): `Glass.exe`. Built with egui for a
+//! modern look that follows Windows' light/dark theme (or a chosen one).
 //!
-//! Threads: this window's thread runs the UI. Connecting, pairing and each
-//! viewer session run on worker threads (the viewer opens its own window);
-//! sharing runs `host_with` on its own thread. Workers report back with
-//! posted messages carrying boxed values.
+//! - Machines with Glass on the network as cards (Mac/PC, paired or not),
+//!   each with Connect; or connect to a typed address.
+//! - Share this PC, with the pairing PIN shown large.
+//! - Pairing PIN entry, paired devices with Forget, settings, session results
+//!   with Copy, and a tray icon (closing while sharing keeps Glass running).
+//!
+//! The command line (`glass-cli host`, `glass-cli connect`, ...) stays for
+//! tests and CI.
+//!
+//! Threads: egui's on the main thread; connecting, pairing and each viewer
+//! session on workers (the viewer opens its own window); sharing runs
+//! `host_with` on its own thread. Workers report back on a channel and wake
+//! the UI with `request_repaint`.
 
 use super::{browse, viewer, Res};
-use glass_core::identity::{fingerprint_hex, fingerprint_short, Device, ROLE_HOST, ROLE_VIEWER};
+use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, ThemePreference};
+use glass_core::identity::{
+    fingerprint_hex, fingerprint_short, Device, Peer, ROLE_HOST, ROLE_VIEWER,
+};
 use glass_core::net::{pair_begin, Client, ConnectError, HostEvent, Pairing};
-use glass_core::protocol::{DEFAULT_PORT, MODE_FIT};
-use std::cell::RefCell;
+use glass_core::protocol::{
+    DEFAULT_PORT, MODE_FIT, MODE_FIT_LARGER, MODE_FIT_MORE_SPACE, MODE_HOST_SCREEN,
+    PROTOCOL_VERSION,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    CreateFontW, GetStockObject, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_GUI_FONT, DEFAULT_PITCH, FF_DONTCARE, FW_BOLD, FW_NORMAL, HFONT, OUT_DEFAULT_PRECIS,
-};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::*;
-use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-use windows::Win32::UI::Shell::{
-    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NOTIFYICONDATAW,
-};
-use windows::Win32::UI::WindowsAndMessaging::*;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-// Control ids.
-const ID_LIST: usize = 10;
-const ID_ADDRESS: usize = 11;
-const ID_CONNECT: usize = 12;
-const ID_SHARE: usize = 13;
-const ID_PAIRED: usize = 14;
-const ID_REFRESH: usize = 15;
-const ID_STATUS: usize = 16;
-const ID_PIN: usize = 17;
-const ID_ADMIN: usize = 18;
-
-// Messages from workers (lparam = Box<..> raw pointer, taken by the UI).
-const WM_ASK_PIN: u32 = WM_APP + 20; // Box<(Pairing, String host, u16 port)>
-const WM_CONNECT_FAILED: u32 = WM_APP + 21; // Box<String>
-const WM_SESSION_REPORT: u32 = WM_APP + 22; // Box<String>
-const WM_HOST_EVENT: u32 = WM_APP + 23; // Box<HostEvent>
-const WM_HOST_LINE: u32 = WM_APP + 24; // Box<String>
-const WM_HOST_STOPPED: u32 = WM_APP + 25; // Box<String> (why)
-const WM_TRAY: u32 = WM_APP + 26;
-const TIMER_REFRESH: usize = 1;
-const TIMER_SHOT: usize = 2;
-
-// Tray menu ids.
-const MENU_OPEN: usize = 100;
-const MENU_SHARE: usize = 101;
-const MENU_QUIT: usize = 102;
-
-struct App {
-    hwnd: HWND,
-    device: Arc<Device>,
-    font: HFONT,
-    big: HFONT,
-    rows: Vec<Row>,
-    sharing: Option<Sharing>,
-    connecting: bool,
-    quitting: bool,
+/// From workers (and the tray) to the UI.
+enum Msg {
+    AskPin(Pairing, String, u16),
+    Failed(String),
+    Report(String),
+    Status(String),
+    Host(HostEvent),
+    HostLine(String),
+    HostStopped(String),
+    TrayOpen,
+    TrayShare,
+    TrayQuit,
 }
 
-struct Sharing {
-    stop: Arc<AtomicBool>,
-    port: u16,
-}
-
-/// A line in the machine list.
+/// Where workers send, and how they wake the UI.
 #[derive(Clone)]
-struct Row {
-    name: String,
-    kind: String,
-    address: String,
-    port: u16,
-    status: String,
+struct Wake {
+    tx: Sender<Msg>,
+    ctx: egui::Context,
 }
 
-thread_local! {
-    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
-}
-
-fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
-    APP.with(|a| a.try_borrow_mut().ok().and_then(|mut g| g.as_mut().map(f)))
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn post<T>(hwnd: HWND, msg: u32, value: T) {
-    let p = Box::into_raw(Box::new(value)) as isize;
-    unsafe {
-        if PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(p)).is_err() {
-            drop(Box::from_raw(p as *mut T));
-        }
+impl Wake {
+    fn send(&self, m: Msg) {
+        let _ = self.tx.send(m);
+        self.ctx.request_repaint();
     }
 }
 
-unsafe fn take<T>(lparam: LPARAM) -> T {
-    *Box::from_raw(lparam.0 as *mut T)
+static TRAY_WAKE: OnceLock<Mutex<Option<Wake>>> = OnceLock::new();
+
+fn tray_send(m: Msg) {
+    if let Some(w) = TRAY_WAKE.get().and_then(|w| w.lock().ok()?.clone()) {
+        w.send(m);
+    }
 }
 
-unsafe fn child(hwnd: HWND, id: usize) -> HWND {
-    GetDlgItem(Some(hwnd), id as i32).unwrap_or_default()
+/// Saved choices (`settings.txt` next to the identity).
+#[derive(Clone, PartialEq)]
+struct Settings {
+    theme: ThemePreference,
+    view: u8,
+    full_colour: bool,
 }
 
-unsafe fn set_text(hwnd: HWND, id: usize, text: &str) {
-    let t = wide(text);
-    let _ = SetWindowTextW(child(hwnd, id), PCWSTR(t.as_ptr()));
+impl Settings {
+    fn path() -> std::path::PathBuf {
+        glass_core::identity::default_dir()
+            .unwrap_or_default()
+            .join("settings.txt")
+    }
+
+    fn load() -> Self {
+        let mut s = Settings {
+            theme: ThemePreference::System,
+            view: MODE_FIT,
+            full_colour: false,
+        };
+        for line in std::fs::read_to_string(Self::path())
+            .unwrap_or_default()
+            .lines()
+        {
+            match line.split_once('=') {
+                Some(("theme", "light")) => s.theme = ThemePreference::Light,
+                Some(("theme", "dark")) => s.theme = ThemePreference::Dark,
+                Some(("view", v)) => s.view = v.parse().unwrap_or(MODE_FIT),
+                Some(("colour", v)) => s.full_colour = v == "444",
+                _ => {}
+            }
+        }
+        s
+    }
+
+    fn save(&self) {
+        let theme = match self.theme {
+            ThemePreference::Light => "light",
+            ThemePreference::Dark => "dark",
+            ThemePreference::System => "system",
+        };
+        let colour = if self.full_colour { "444" } else { "420" };
+        let _ = std::fs::write(
+            Self::path(),
+            format!("theme={theme}\nview={}\ncolour={colour}\n", self.view),
+        );
+    }
 }
 
-unsafe fn get_text(hwnd: HWND) -> String {
-    let n = GetWindowTextLengthW(hwnd).max(0) as usize;
-    let mut buf = vec![0u16; n + 1];
-    let got = GetWindowTextW(hwnd, &mut buf).max(0) as usize;
-    String::from_utf16_lossy(&buf[..got])
+/// A machine card.
+#[derive(Clone)]
+struct Machine {
+    name: String,
+    kind: &'static str,
+    address: String,
+    port: u16,
+    paired: bool,
+    version_ok: bool,
+}
+
+enum Dialog {
+    None,
+    Pin {
+        pairing: Option<Pairing>,
+        host: String,
+        port: u16,
+        pin: String,
+        name: String,
+    },
+    Report(String),
+    Paired,
+    Settings,
+    Message(String, String),
+}
+
+struct GlassApp {
+    device: Arc<Device>,
+    wake: Wake,
+    rx: Receiver<Msg>,
+    settings: Settings,
+    machines: Vec<Machine>,
+    last_scan: Instant,
+    address: String,
+    status: String,
+    connecting: bool,
+    sharing: Option<Arc<AtomicBool>>,
+    share_status: String,
+    pin: Option<(String, String)>,
+    dialog: Dialog,
+    quitting: bool,
+    _tray: Option<tray_icon::TrayIcon>,
+    shot_at: Option<Instant>,
+}
+
+fn icon_rgba(size: u32) -> Vec<u8> {
+    match size {
+        32 => include_bytes!("../../packaging/glass-32.rgba").to_vec(),
+        _ => include_bytes!("../../packaging/glass-64.rgba").to_vec(),
+    }
 }
 
 /// Opens the Glass window and runs it until Quit. `share` starts sharing
@@ -131,460 +173,193 @@ unsafe fn get_text(hwnd: HWND) -> String {
 pub fn run(share: bool) -> Res<()> {
     super::d3d::init_process();
     let device = crate::device()?;
-    unsafe {
-        let icc = INITCOMMONCONTROLSEX {
-            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
-        };
-        let _ = InitCommonControlsEx(&icc);
-        let inst: HINSTANCE = GetModuleHandleW(None)?.into();
-        // MAKEINTRESOURCE(1): resource ids travel as small pointer values.
-        #[allow(clippy::manual_dangling_ptr)]
-        let icon = LoadIconW(Some(inst), PCWSTR(1 as *const u16)).unwrap_or_default();
-        let class = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(wndproc),
-            hInstance: inst,
-            hIcon: icon,
-            hIconSm: icon,
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hbrBackground: windows::Win32::Graphics::Gdi::GetSysColorBrush(
-                windows::Win32::Graphics::Gdi::COLOR_BTNFACE,
-            ),
-            lpszClassName: w!("GlassApp"),
-            ..Default::default()
-        };
-        RegisterClassExW(&class);
-        let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("GlassApp"),
-            w!("Glass"),
-            WS_OVERLAPPEDWINDOW & !WS_MAXIMIZEBOX,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            100,
-            100,
-            None,
-            None,
-            Some(inst),
-            None,
-        )?;
-        let k = GetDpiForWindow(hwnd).max(96) as f64 / 96.0;
-        let px = |v: i32| (v as f64 * k).round() as i32;
-        let font = CreateFontW(
-            -px(15),
-            0,
-            0,
-            0,
-            FW_NORMAL.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            w!("Segoe UI"),
-        );
-        let big = CreateFontW(
-            -px(34),
-            0,
-            0,
-            0,
-            FW_BOLD.0 as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-            w!("Segoe UI"),
-        );
-        build(hwnd, inst, font, big, px)?;
-        APP.with(|a| {
-            *a.borrow_mut() = Some(App {
-                hwnd,
-                device: device.clone(),
-                font,
-                big,
-                rows: Vec::new(),
-                sharing: None,
-                connecting: false,
-                quitting: false,
-            })
-        });
-        add_tray(hwnd, icon, true);
-        let _ = browse::start();
-        SetTimer(Some(hwnd), TIMER_REFRESH, 1500, None);
-        with_app(|a| a.refresh());
-        set_text(
-            hwnd,
-            ID_STATUS,
-            &format!(
-                "This PC: \u{201C}{}\u{201D}, id {}. Pick a machine and Connect, or Share this PC so another can view it.",
-                device.name,
-                fingerprint_short(&device.fingerprint())
-            ),
-        );
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        // GLASS_DEBUG_SHOT=FILE.bmp: save the window after 3 s and quit (checks).
-        if std::env::var_os("GLASS_DEBUG_SHOT").is_some() {
-            SetTimer(Some(hwnd), TIMER_SHOT, 3000, None);
-        }
-        if share {
-            with_app(|a| a.toggle_share());
-        }
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            if !IsDialogMessageW(hwnd, &msg).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-        add_tray(hwnd, icon, false);
-        browse::stop();
-    }
-    Ok(())
-}
-
-unsafe fn build(
-    hwnd: HWND,
-    inst: HINSTANCE,
-    font: HFONT,
-    big: HFONT,
-    px: impl Fn(i32) -> i32,
-) -> Res<()> {
-    let mk = |class: PCWSTR,
-              text: &str,
-              style: WINDOW_STYLE,
-              ex: WINDOW_EX_STYLE,
-              r: (i32, i32, i32, i32),
-              id: usize|
-     -> Res<HWND> {
-        let t = wide(text);
-        let c = CreateWindowExW(
-            ex,
-            class,
-            PCWSTR(t.as_ptr()),
-            WS_CHILD | WS_VISIBLE | style,
-            px(r.0),
-            px(r.1),
-            px(r.2),
-            px(r.3),
-            Some(hwnd),
-            Some(HMENU(id as *mut _)),
-            Some(inst),
-            None,
-        )?;
-        SendMessageW(
-            c,
-            WM_SETFONT,
-            Some(WPARAM(font.0 as usize)),
-            Some(LPARAM(1)),
-        );
-        Ok(c)
-    };
-    let none = WINDOW_EX_STYLE::default();
-    mk(
-        w!("STATIC"),
-        "Machines with Glass on this network (double-click to connect):",
-        WINDOW_STYLE(0),
-        none,
-        (16, 12, 640, 22),
-        0,
-    )?;
-    let list = mk(
-        WC_LISTVIEWW,
-        "",
-        WS_TABSTOP | WS_BORDER | WINDOW_STYLE(LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS),
-        none,
-        (16, 38, 720, 230),
-        ID_LIST,
-    )?;
-    SendMessageW(
-        list,
-        LVM_SETEXTENDEDLISTVIEWSTYLE,
-        Some(WPARAM(0)),
-        Some(LPARAM(
-            (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize,
-        )),
-    );
-    for (i, (title, width)) in [
-        ("Name", 260),
-        ("Type", 70),
-        ("Address", 160),
-        ("Status", 220),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let t = wide(title);
-        let col = LVCOLUMNW {
-            mask: LVCF_TEXT | LVCF_WIDTH,
-            cx: px(*width),
-            pszText: PWSTR(t.as_ptr() as *mut u16),
-            ..Default::default()
-        };
-        SendMessageW(
-            list,
-            LVM_INSERTCOLUMNW,
-            Some(WPARAM(i)),
-            Some(LPARAM(&col as *const _ as isize)),
-        );
-    }
-    mk(
-        w!("STATIC"),
-        "Or its address:",
-        WINDOW_STYLE(0),
-        none,
-        (16, 282, 110, 24),
-        0,
-    )?;
-    let last = glass_core::identity::default_dir()
-        .and_then(|d| std::fs::read_to_string(d.join("last-host.txt")).ok())
-        .unwrap_or_default();
-    mk(
-        w!("EDIT"),
-        last.trim(),
-        WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-        none,
-        (128, 280, 300, 26),
-        ID_ADDRESS,
-    )?;
-    mk(
-        w!("BUTTON"),
-        "Connect",
-        WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
-        none,
-        (440, 279, 120, 28),
-        ID_CONNECT,
-    )?;
-    mk(
-        w!("BUTTON"),
-        "Refresh",
-        WS_TABSTOP,
-        none,
-        (616, 279, 120, 28),
-        ID_REFRESH,
-    )?;
-    mk(
-        w!("BUTTON"),
-        "Share this PC",
-        WS_TABSTOP,
-        none,
-        (16, 322, 170, 32),
-        ID_SHARE,
-    )?;
-    mk(
-        w!("BUTTON"),
-        "Paired devices\u{2026}",
-        WS_TABSTOP,
-        none,
-        (196, 322, 160, 32),
-        ID_PAIRED,
-    )?;
-    let admin = mk(
-        w!("BUTTON"),
-        "Restart as administrator",
-        WS_TABSTOP,
-        none,
-        (366, 322, 200, 32),
-        ID_ADMIN,
-    )?;
-    if super::blocker::self_elevated() {
-        let _ = ShowWindow(admin, SW_HIDE);
-    }
-    mk(
-        w!("STATIC"),
-        "",
-        WINDOW_STYLE(0),
-        none,
-        (16, 366, 720, 60),
-        ID_STATUS,
-    )?;
-    let pin = mk(
-        w!("STATIC"),
-        "",
-        WINDOW_STYLE(0x1), /* SS_CENTER */
-        none,
-        (16, 428, 720, 50),
-        ID_PIN,
-    )?;
-    SendMessageW(
-        pin,
-        WM_SETFONT,
-        Some(WPARAM(big.0 as usize)),
-        Some(LPARAM(1)),
-    );
-    // Window size for that layout.
-    let mut r = RECT {
-        left: 0,
-        top: 0,
-        right: px(752),
-        bottom: px(490),
-    };
-    let _ = AdjustWindowRectExForDpi(
-        &mut r,
-        WS_OVERLAPPEDWINDOW,
-        false,
-        WINDOW_EX_STYLE::default(),
-        GetDpiForWindow(hwnd),
-    );
-    let _ = SetWindowPos(
-        hwnd,
-        None,
-        0,
-        0,
-        r.right - r.left,
-        r.bottom - r.top,
-        SWP_NOMOVE | SWP_NOZORDER,
-    );
-    let _ = GetStockObject(DEFAULT_GUI_FONT);
-    Ok(())
-}
-
-unsafe fn add_tray(hwnd: HWND, icon: HICON, add: bool) {
-    let mut nid = NOTIFYICONDATAW {
-        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-        hWnd: hwnd,
-        uID: 1,
-        uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
-        uCallbackMessage: WM_TRAY,
-        hIcon: icon,
+    let settings = Settings::load();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Glass")
+            .with_inner_size([640.0, 700.0])
+            .with_min_inner_size([500.0, 540.0])
+            // COM is already multithreaded here (capture, DNS-SD); winit's
+            // OLE drag and drop needs single-threaded. LATER(M5c): files.
+            .with_drag_and_drop(false)
+            .with_icon(egui::IconData {
+                rgba: icon_rgba(64),
+                width: 64,
+                height: 64,
+            }),
         ..Default::default()
     };
-    let tip = wide("Glass");
-    nid.szTip[..tip.len()].copy_from_slice(&tip);
-    let _ = Shell_NotifyIconW(if add { NIM_ADD } else { NIM_DELETE }, &nid);
+    eframe::run_native(
+        "Glass",
+        options,
+        Box::new(move |cc| {
+            let ctx = cc.egui_ctx.clone();
+            style(&ctx);
+            ctx.set_theme(settings.theme);
+            let (tx, rx) = channel();
+            let wake = Wake { tx, ctx };
+            *TRAY_WAKE.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(wake.clone());
+            let tray = make_tray();
+            let _ = browse::start();
+            let address = glass_core::identity::default_dir()
+                .and_then(|d| std::fs::read_to_string(d.join("last-host.txt")).ok())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let mut app = GlassApp {
+                status: format!(
+                    "This PC: \u{201C}{}\u{201D}  \u{00B7}  id {}",
+                    device.name,
+                    fingerprint_short(&device.fingerprint())
+                ),
+                device,
+                wake,
+                rx,
+                settings,
+                machines: Vec::new(),
+                last_scan: Instant::now() - Duration::from_secs(10),
+                address,
+                connecting: false,
+                sharing: None,
+                share_status: String::new(),
+                pin: None,
+                dialog: Dialog::None,
+                quitting: false,
+                _tray: tray,
+                shot_at: std::env::var_os("GLASS_DEBUG_SHOT").map(|_| Instant::now()),
+            };
+            if share {
+                app.toggle_share();
+            }
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|e| format!("window: {e}"))?;
+    browse::stop();
+    Ok(())
 }
 
-impl App {
-    /// Rebuilds the machine list: found on the network, plus paired hosts
-    /// that aren't showing up.
-    fn refresh(&mut self) {
+fn style(ctx: &egui::Context) {
+    // Windows' own UI font (Segoe UI Variable on 11, Segoe UI on 10) when present.
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+    if let Some(bytes) = ["SegUIVar.ttf", "segoeui.ttf"]
+        .iter()
+        .find_map(|f| std::fs::read(format!(r"{windir}\Fonts\{f}")).ok())
+    {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts
+            .font_data
+            .insert("segoe".into(), Arc::new(egui::FontData::from_owned(bytes)));
+        if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            f.insert(0, "segoe".into());
+        }
+        ctx.set_fonts(fonts);
+    }
+    ctx.all_styles_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        s.spacing.button_padding = egui::vec2(14.0, 6.0);
+        s.spacing.interact_size.y = 30.0;
+        for f in s.text_styles.values_mut() {
+            f.size *= 1.1;
+        }
+        let r = CornerRadius::same(8);
+        s.visuals.widgets.noninteractive.corner_radius = r;
+        s.visuals.widgets.inactive.corner_radius = r;
+        s.visuals.widgets.hovered.corner_radius = r;
+        s.visuals.widgets.active.corner_radius = r;
+        s.visuals.widgets.open.corner_radius = r;
+        s.visuals.window_corner_radius = CornerRadius::same(14);
+    });
+}
+
+fn make_tray() -> Option<tray_icon::TrayIcon> {
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    let menu = Menu::new();
+    let open = MenuItem::with_id("open", "Open Glass", true, None);
+    let share = MenuItem::with_id("share", "Share this PC / Stop sharing", true, None);
+    let quit = MenuItem::with_id("quit", "Quit Glass", true, None);
+    let _ = menu.append_items(&[&open, &share, &PredefinedMenuItem::separator(), &quit]);
+    MenuEvent::set_event_handler(Some(|e: MenuEvent| {
+        tray_send(match e.id.as_ref() {
+            "open" => Msg::TrayOpen,
+            "share" => Msg::TrayShare,
+            "quit" => Msg::TrayQuit,
+            _ => return,
+        })
+    }));
+    tray_icon::TrayIconEvent::set_event_handler(Some(|e: tray_icon::TrayIconEvent| {
+        if let tray_icon::TrayIconEvent::DoubleClick { .. } = e {
+            tray_send(Msg::TrayOpen);
+        }
+    }));
+    let icon = tray_icon::Icon::from_rgba(icon_rgba(32), 32, 32).ok()?;
+    tray_icon::TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_tooltip("Glass")
+        .with_icon(icon)
+        .build()
+        .ok()
+}
+
+fn show(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
+
+fn save_report(file: &str, report: &str) {
+    use std::io::Write;
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+    {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join(file))
+        {
+            let _ = writeln!(f, "{report}");
+        }
+    }
+}
+
+impl GlassApp {
+    fn scan(&mut self) {
         let mine = fingerprint_hex(&self.device.fingerprint());
         let peers = self.device.peers();
-        let mut rows: Vec<Row> = Vec::new();
-        for f in browse::list() {
-            let fp = f.fp.clone().unwrap_or_default().to_lowercase();
-            if !fp.is_empty() && mine.starts_with(&fp) {
-                continue; // this PC itself
-            }
-            let paired = !fp.is_empty()
-                && peers.iter().any(|p| {
-                    p.roles & ROLE_HOST != 0 && fingerprint_hex(&p.fingerprint).starts_with(&fp)
-                });
-            let version_ok = f
-                .version
-                .as_deref()
-                .is_none_or(|v| v == glass_core::protocol::PROTOCOL_VERSION.to_string());
-            rows.push(Row {
-                name: f.name.clone(),
-                kind: match f.os.as_deref() {
-                    Some("mac") => "Mac".into(),
-                    Some("windows") => "PC".into(),
-                    _ => "?".into(),
-                },
-                address: f.address.clone(),
-                port: f.port,
-                status: if !version_ok {
-                    "different Glass version".into()
-                } else if paired {
-                    "\u{2713} paired".into()
-                } else {
-                    "not paired yet (PIN)".into()
-                },
-            });
-        }
-        if rows
-            .iter()
-            .map(|r| (&r.name, &r.address))
-            .ne(self.rows.iter().map(|r| (&r.name, &r.address)))
-            || rows
-                .iter()
-                .map(|r| &r.status)
-                .ne(self.rows.iter().map(|r| &r.status))
-        {
-            self.rows = rows;
-            self.fill_list();
-        }
-    }
-
-    fn fill_list(&self) {
-        unsafe {
-            let list = child(self.hwnd, ID_LIST);
-            SendMessageW(list, LVM_DELETEALLITEMS, None, None);
-            for (i, r) in self.rows.iter().enumerate() {
-                for (col, text) in [&r.name, &r.kind, &r.address, &r.status].iter().enumerate() {
-                    let t = wide(text);
-                    let mut item = LVITEMW {
-                        mask: LVIF_TEXT,
-                        iItem: i as i32,
-                        iSubItem: col as i32,
-                        pszText: PWSTR(t.as_ptr() as *mut u16),
-                        ..Default::default()
-                    };
-                    let msg = if col == 0 {
-                        LVM_INSERTITEMW
-                    } else {
-                        LVM_SETITEMW
-                    };
-                    SendMessageW(list, msg, None, Some(LPARAM(&mut item as *mut _ as isize)));
+        let me = PROTOCOL_VERSION.to_string();
+        self.machines = browse::list()
+            .into_iter()
+            .filter_map(|f| {
+                let fp = f.fp.clone().unwrap_or_default().to_lowercase();
+                if !fp.is_empty() && mine.starts_with(&fp) {
+                    return None; // this PC itself
                 }
-            }
-        }
+                Some(Machine {
+                    paired: !fp.is_empty()
+                        && peers.iter().any(|p| {
+                            p.roles & ROLE_HOST != 0
+                                && fingerprint_hex(&p.fingerprint).starts_with(&fp)
+                        }),
+                    version_ok: f.version.as_deref().is_none_or(|v| v == me),
+                    kind: match f.os.as_deref() {
+                        Some("mac") => "Mac",
+                        Some("windows") => "PC",
+                        _ => "Glass",
+                    },
+                    name: f.name,
+                    address: f.address,
+                    port: f.port,
+                })
+            })
+            .collect();
+        self.last_scan = Instant::now();
     }
 
-    fn selected_row(&self) -> Option<Row> {
-        unsafe {
-            let list = child(self.hwnd, ID_LIST);
-            let i = SendMessageW(
-                list,
-                LVM_GETNEXTITEM,
-                Some(WPARAM(usize::MAX)),
-                Some(LPARAM(LVNI_SELECTED as isize)),
-            );
-            self.rows.get(i.0 as usize).cloned().filter(|_| i.0 >= 0)
-        }
-    }
-
-    /// Connect to the selected machine (or the typed address).
-    fn connect(&mut self, from_list: bool) {
+    fn connect(&mut self, host: String, port: u16) {
         if self.connecting {
             return;
         }
-        let (host, port) = match (from_list, self.selected_row()) {
-            (true, Some(r)) => (r.address, r.port),
-            _ => {
-                let text = unsafe { get_text(child(self.hwnd, ID_ADDRESS)) };
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    match self.selected_row() {
-                        Some(r) => (r.address, r.port),
-                        None => {
-                            unsafe {
-                                set_text(
-                                    self.hwnd,
-                                    ID_STATUS,
-                                    "Pick a machine in the list or type its address.",
-                                )
-                            };
-                            return;
-                        }
-                    }
-                } else {
-                    match text.rsplit_once(':') {
-                        Some((h, p)) if p.parse::<u16>().is_ok() => {
-                            (h.to_string(), p.parse().unwrap())
-                        }
-                        _ => (text, DEFAULT_PORT),
-                    }
-                }
-            }
-        };
         if let Some(dir) = glass_core::identity::default_dir() {
             let a = if port == DEFAULT_PORT {
                 host.clone()
@@ -594,660 +369,749 @@ impl App {
             let _ = std::fs::write(dir.join("last-host.txt"), a);
         }
         self.connecting = true;
-        unsafe {
-            set_text(
-                self.hwnd,
-                ID_STATUS,
-                &format!("Connecting to {host} \u{2026}"),
-            )
+        self.status = format!("Connecting to {host} \u{2026}");
+        let (wake, device, s) = (
+            self.wake.clone(),
+            self.device.clone(),
+            self.settings.clone(),
+        );
+        std::thread::spawn(move || connect_worker(wake, device, host, port, None, s));
+    }
+
+    fn connect_typed(&mut self) {
+        let text = self.address.trim().to_string();
+        if text.is_empty() {
+            self.status = "Type the other machine's address (it shows it when sharing).".into();
+            return;
+        }
+        let (h, p) = match text.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
+            _ => (text, DEFAULT_PORT),
         };
-        let (hwnd, device) = (self.hwnd.0 as isize, self.device.clone());
-        std::thread::spawn(move || connect_worker(HWND(hwnd as *mut _), device, host, port, None));
+        self.connect(h, p);
     }
 
     fn toggle_share(&mut self) {
-        if let Some(s) = self.sharing.take() {
-            s.stop.store(true, Ordering::Relaxed);
+        if let Some(stop) = self.sharing.take() {
+            stop.store(true, Ordering::Relaxed);
             // Wake the listener so it sees `stop`.
             let _ = std::net::TcpStream::connect_timeout(
-                &std::net::SocketAddr::from(([127, 0, 0, 1], s.port)),
-                std::time::Duration::from_millis(500),
+                &std::net::SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)),
+                Duration::from_millis(500),
             );
-            unsafe {
-                set_text(self.hwnd, ID_SHARE, "Share this PC");
-                set_text(self.hwnd, ID_STATUS, "Stopping sharing \u{2026}");
-                set_text(self.hwnd, ID_PIN, "");
-            }
+            self.share_status = "Stopping \u{2026}".into();
+            self.pin = None;
             return;
         }
         let stop = Arc::new(AtomicBool::new(false));
-        let hwnd = self.hwnd.0 as isize;
+        let (w1, w2, w3, w4) = (
+            self.wake.clone(),
+            self.wake.clone(),
+            self.wake.clone(),
+            self.wake.clone(),
+        );
         let ui = super::HostUi {
-            event: Box::new(move |e| post(HWND(hwnd as *mut _), WM_HOST_EVENT, e)),
-            line: Box::new(move |l| post(HWND(hwnd as *mut _), WM_HOST_LINE, l.to_string())),
+            event: Box::new(move |e| w1.send(Msg::Host(e))),
+            line: Box::new(move |l| w2.send(Msg::HostLine(l.to_string()))),
             report: Box::new(move |r| {
                 save_report("results-host.txt", r);
-                post(HWND(hwnd as *mut _), WM_SESSION_REPORT, r.to_string())
+                w3.send(Msg::Report(r.to_string()))
             }),
             stop: stop.clone(),
         };
         std::thread::spawn(move || {
             let why = match super::host_with(&[], ui) {
-                Ok(()) => "Sharing stopped.".to_string(),
+                Ok(()) => String::new(),
                 Err(e) => format!("Sharing stopped: {e}"),
             };
-            post(HWND(hwnd as *mut _), WM_HOST_STOPPED, why);
+            w4.send(Msg::HostStopped(why));
         });
-        self.sharing = Some(Sharing {
-            stop,
-            port: DEFAULT_PORT,
-        });
-        unsafe {
-            set_text(self.hwnd, ID_SHARE, "Stop sharing");
-            set_text(
-                self.hwnd,
-                ID_STATUS,
-                "Sharing this PC: waiting for a viewer \u{2026}",
-            );
+        self.sharing = Some(stop);
+        self.share_status = "Waiting for a viewer \u{2026}".into();
+    }
+
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.quitting = true;
+        if self.sharing.is_some() {
+            self.toggle_share(); // closes once the host has stopped
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
-    fn host_event(&mut self, e: HostEvent) {
-        unsafe {
-            match e {
-                HostEvent::PairingPin { device, pin, addr, .. } => {
-                    let (a, b) = pin.split_at(3);
-                    set_text(self.hwnd, ID_PIN, &format!("PIN  {a} {b}"));
-                    set_text(
-                        self.hwnd,
-                        ID_STATUS,
-                        &format!(
-                            "\u{201C}{device}\u{201D} ({}) wants to pair. Type this PIN on that device (valid 2 minutes). Pair only your own devices.",
-                            addr.ip()
-                        ),
-                    );
-                    show(self.hwnd);
-                    let _ = FlashWindow(self.hwnd, true);
+    fn handle(&mut self, ctx: &egui::Context, m: Msg) {
+        match m {
+            Msg::AskPin(p, host, port) => {
+                self.dialog = Dialog::Pin {
+                    name: p.host_name().to_string(),
+                    pairing: Some(p),
+                    host,
+                    port,
+                    pin: String::new(),
+                };
+                show(ctx);
+            }
+            Msg::Failed(e) => {
+                self.connecting = false;
+                self.status = e.clone();
+                self.dialog = Dialog::Message("Couldn't connect".into(), e);
+                show(ctx);
+            }
+            Msg::Report(r) => {
+                self.connecting = false;
+                self.status = "Session ended. Results are saved next to Glass.exe.".into();
+                self.dialog = Dialog::Report(r);
+                show(ctx);
+            }
+            Msg::Status(s) => self.status = s,
+            Msg::Host(e) => self.host_event(ctx, e),
+            Msg::HostLine(l) => {
+                let l = l.trim();
+                if [
+                    "Viewer connected",
+                    "Input blocked",
+                    "Input works",
+                    "Viewer switched",
+                    "Waiting for a viewer",
+                    "Session ended",
+                ]
+                .iter()
+                .any(|p| l.starts_with(p))
+                {
+                    self.share_status = l.to_string();
                 }
-                HostEvent::Paired { device } => {
-                    set_text(self.hwnd, ID_PIN, "");
-                    set_text(self.hwnd, ID_STATUS, &format!("Paired with \u{201C}{device}\u{201D}. It can now view and control this PC."));
+            }
+            Msg::HostStopped(why) => {
+                self.sharing = None;
+                self.pin = None;
+                self.share_status = why;
+                if self.quitting {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                HostEvent::WrongPin { device, left } => set_text(
-                    self.hwnd,
-                    ID_STATUS,
-                    &format!("Wrong PIN from \u{201C}{device}\u{201D}. {left} more tries with this PIN."),
-                ),
-                HostEvent::PairingLocked => {
-                    set_text(self.hwnd, ID_PIN, "");
-                    set_text(self.hwnd, ID_STATUS, "Too many wrong PINs: pairing is off. Stop and start sharing to pair a device.");
-                }
-                HostEvent::Refused { fingerprint, addr } => set_text(
-                    self.hwnd,
-                    ID_STATUS,
-                    &format!("Refused a device that isn't paired ({}, id {fingerprint}). Pair it from that device first.", addr.ip()),
-                ),
-                HostEvent::Denied { device } => set_text(self.hwnd, ID_STATUS, &format!("Did not allow \u{201C}{device}\u{201D} to connect.")),
-                HostEvent::Loop { device } => set_text(
-                    self.hwnd,
-                    ID_STATUS,
-                    &format!("Refused \u{201C}{device}\u{201D}: this PC is already viewing it, so it would be a loop."),
-                ),
+            }
+            Msg::TrayOpen => show(ctx),
+            Msg::TrayShare => self.toggle_share(),
+            Msg::TrayQuit => self.quit(ctx),
+        }
+    }
+
+    fn host_event(&mut self, ctx: &egui::Context, e: HostEvent) {
+        match e {
+            HostEvent::PairingPin {
+                device, pin, addr, ..
+            } => {
+                let (a, b) = pin.split_at(3);
+                self.pin = Some((
+                    format!("{a} {b}"),
+                    format!(
+                        "\u{201C}{device}\u{201D} ({}) wants to pair. Type this PIN there. Pair only your own devices.",
+                        addr.ip()
+                    ),
+                ));
+                show(ctx);
+            }
+            HostEvent::Paired { device } => {
+                self.pin = None;
+                self.share_status = format!(
+                    "Paired with \u{201C}{device}\u{201D}. It can now view and control this PC."
+                );
+            }
+            HostEvent::WrongPin { device, left } => {
+                self.share_status = format!(
+                    "Wrong PIN from \u{201C}{device}\u{201D}: {left} more tries with this PIN."
+                )
+            }
+            HostEvent::PairingLocked => {
+                self.pin = None;
+                self.share_status =
+                    "Too many wrong PINs: pairing is off until sharing restarts.".into();
+            }
+            HostEvent::Refused { fingerprint, addr } => {
+                self.share_status = format!(
+                    "Refused a device that isn't paired ({}, id {fingerprint}).",
+                    addr.ip()
+                )
+            }
+            HostEvent::Denied { device } => {
+                self.share_status = format!("Did not allow \u{201C}{device}\u{201D}.")
+            }
+            HostEvent::Loop { device } => {
+                self.share_status = format!(
+                    "Refused \u{201C}{device}\u{201D}: this PC is viewing it, so it would loop."
+                )
             }
         }
     }
-
-    fn host_line(&mut self, l: &str) {
-        // Only the lines worth showing in the window.
-        if l.starts_with("Viewer connected")
-            || l.starts_with("Input blocked")
-            || l.starts_with("Input works")
-            || l.starts_with("Viewer switched")
-            || l.starts_with("Waiting for a viewer")
-        {
-            unsafe { set_text(self.hwnd, ID_STATUS, l.trim()) };
-        }
-    }
-}
-
-fn save_report(file: &str, report: &str) {
-    use std::io::Write;
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join(file))
-            {
-                let _ = writeln!(f, "{report}");
-            }
-        }
-    }
-}
-
-unsafe fn show(hwnd: HWND) {
-    let _ = ShowWindow(hwnd, SW_SHOW);
-    let _ = ShowWindow(hwnd, SW_RESTORE);
-    let _ = SetForegroundWindow(hwnd);
 }
 
 /// Connects (pairing first if needed, PIN from the UI), then views.
 fn connect_worker(
-    hwnd: HWND,
+    wake: Wake,
     device: Arc<Device>,
     host: String,
     port: u16,
     pin: Option<(Pairing, String)>,
+    s: Settings,
 ) {
-    let fail = |e: String| post(hwnd, WM_CONNECT_FAILED, e);
     if let Some((p, pin)) = pin {
         if let Err(e) = p.finish(&pin) {
-            return fail(match e {
+            return wake.send(Msg::Failed(match e {
                 ConnectError::WrongPin => {
-                    "That PIN wasn't right (or it expired). Connect again for a new try.".into()
+                    "That PIN wasn't right (or it expired). Connect again for a new PIN.".into()
                 }
                 e => format!("{host}: {e}"),
-            });
+            }));
         }
     }
-    let modes_file = glass_core::identity::default_dir()
-        .unwrap_or_default()
-        .join("view-modes.txt");
-    let _ = modes_file;
-    let prep = match viewer::prepare(MODE_FIT, false) {
+    let prep = match viewer::prepare(s.view, s.full_colour) {
         Ok(p) => p,
-        Err(e) => return fail(format!("Can't start the viewer: {e}")),
+        Err(e) => return wake.send(Msg::Failed(format!("Can't start the viewer: {e}"))),
     };
     match Client::connect_with(&device, &host, port, prep.hello) {
         Ok(c) => {
+            wake.send(Msg::Status(format!(
+                "Viewing \u{201C}{}\u{201D}.",
+                c.peer().name
+            )));
             let opts = viewer::Options {
                 windowed: false,
                 seconds: None,
                 rule: None,
-                full_colour: false,
+                full_colour: s.full_colour,
             };
-            post(hwnd, WM_HOST_LINE, String::new()); // clears "Connecting…" via refresh
             match viewer::run(c, prep, opts, &crate::banner()) {
-                Ok((report, _mode)) => {
+                Ok((report, _)) => {
                     save_report("results-viewer.txt", &report);
-                    post(hwnd, WM_SESSION_REPORT, report);
+                    wake.send(Msg::Report(report));
                 }
-                Err(e) => fail(format!("The viewer stopped: {e}")),
+                Err(e) => wake.send(Msg::Failed(format!("The viewer stopped: {e}"))),
             }
         }
         Err(ConnectError::NotPaired) => match pair_begin(&device, &host, port) {
-            Ok(p) => post(hwnd, WM_ASK_PIN, (p, host, port)),
-            Err(e) => fail(format!("{host}: {e}")),
+            Ok(p) => wake.send(Msg::AskPin(p, host, port)),
+            Err(e) => wake.send(Msg::Failed(format!("{host}: {e}"))),
         },
-        Err(e) => fail(format!("{host}: {e}")),
+        Err(e) => wake.send(Msg::Failed(format!("{host}: {e}"))),
     }
 }
 
-/// A small modal box asking for the PIN. None if cancelled.
-unsafe fn ask_pin(owner: HWND, host_name: &str) -> Option<String> {
-    let inst: HINSTANCE = GetModuleHandleW(None).ok()?.into();
-    let k = GetDpiForWindow(owner).max(96) as f64 / 96.0;
-    let px = |v: i32| (v as f64 * k).round() as i32;
-    let font = APP.with(|a| a.borrow().as_ref().map(|a| (a.font, a.big)))?;
-    let class = WNDCLASSEXW {
-        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        lpfnWndProc: Some(dialog_proc),
-        hInstance: inst,
-        hCursor: LoadCursorW(None, IDC_ARROW).ok()?,
-        hbrBackground: windows::Win32::Graphics::Gdi::GetSysColorBrush(
-            windows::Win32::Graphics::Gdi::COLOR_BTNFACE,
-        ),
-        lpszClassName: w!("GlassPin"),
-        ..Default::default()
-    };
-    RegisterClassExW(&class);
-    let mut r = RECT {
-        left: 0,
-        top: 0,
-        right: px(420),
-        bottom: px(190),
-    };
-    let _ = AdjustWindowRectExForDpi(
-        &mut r,
-        WS_CAPTION | WS_SYSMENU,
-        false,
-        WS_EX_DLGMODALFRAME,
-        GetDpiForWindow(owner),
-    );
-    let mut or = RECT::default();
-    let _ = GetWindowRect(owner, &mut or);
-    let (w, h) = (r.right - r.left, r.bottom - r.top);
-    let dlg = CreateWindowExW(
-        WS_EX_DLGMODALFRAME,
-        w!("GlassPin"),
-        w!("Pair with Glass"),
-        WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        or.left + ((or.right - or.left) - w) / 2,
-        or.top + ((or.bottom - or.top) - h) / 2,
-        w,
-        h,
-        Some(owner),
-        None,
-        Some(inst),
-        None,
-    )
-    .ok()?;
-    let mk =
-        |class: PCWSTR, text: &str, style: u32, r: (i32, i32, i32, i32), id: usize, f: HFONT| {
-            let t = wide(text);
-            if let Ok(c) = CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
-                class,
-                PCWSTR(t.as_ptr()),
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
-                px(r.0),
-                px(r.1),
-                px(r.2),
-                px(r.3),
-                Some(dlg),
-                Some(HMENU(id as *mut _)),
-                Some(inst),
-                None,
-            ) {
-                SendMessageW(c, WM_SETFONT, Some(WPARAM(f.0 as usize)), Some(LPARAM(1)));
-            }
-        };
-    mk(
-        w!("STATIC"),
-        &format!("\u{201C}{host_name}\u{201D} is showing a 6-digit PIN. Type it here. Pair only with your own devices."),
-        0,
-        (16, 12, 388, 44),
-        0,
-        font.0,
-    );
-    mk(
-        w!("EDIT"),
-        "",
-        (WS_BORDER | WS_TABSTOP).0 | ES_CENTER as u32 | ES_NUMBER as u32,
-        (110, 64, 200, 48),
-        1,
-        font.1,
-    );
-    mk(
-        w!("BUTTON"),
-        "Pair",
-        (WS_TABSTOP).0 | BS_DEFPUSHBUTTON as u32,
-        (196, 132, 100, 32),
-        2,
-        font.0,
-    );
-    mk(
-        w!("BUTTON"),
-        "Cancel",
-        (WS_TABSTOP).0,
-        (304, 132, 100, 32),
-        3,
-        font.0,
-    );
-    let edit = child(dlg, 1);
-    SendMessageW(edit, EM_SETLIMITTEXT, Some(WPARAM(6)), None);
-    let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(edit));
-    let _ = EnableWindow(owner, false);
-    DIALOG_RESULT.with(|r| *r.borrow_mut() = None);
-    let mut msg = MSG::default();
-    while DIALOG_RESULT.with(|r| r.borrow().is_none())
-        && GetMessageW(&mut msg, None, 0, 0).as_bool()
-    {
-        if !IsDialogMessageW(dlg, &msg).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+/// Theme-aware colours for tags.
+struct Palette {
+    accent: Color32,
+    on_accent: Color32,
+    strong: Color32,
+    weak: Color32,
+    ok: (Color32, Color32),
+    warn: (Color32, Color32),
+    kind: (Color32, Color32),
+}
+
+impl Palette {
+    fn of(v: &egui::Visuals) -> Self {
+        let dark = v.dark_mode;
+        Palette {
+            accent: if dark {
+                Color32::from_rgb(62, 127, 200)
+            } else {
+                Color32::from_rgb(23, 92, 170)
+            },
+            on_accent: Color32::WHITE,
+            strong: v.strong_text_color(),
+            weak: v.weak_text_color(),
+            ok: if dark {
+                (
+                    Color32::from_rgb(28, 70, 44),
+                    Color32::from_rgb(150, 230, 170),
+                )
+            } else {
+                (
+                    Color32::from_rgb(214, 242, 222),
+                    Color32::from_rgb(20, 100, 50),
+                )
+            },
+            warn: if dark {
+                (
+                    Color32::from_rgb(80, 64, 20),
+                    Color32::from_rgb(250, 215, 120),
+                )
+            } else {
+                (
+                    Color32::from_rgb(253, 240, 200),
+                    Color32::from_rgb(130, 90, 0),
+                )
+            },
+            kind: if dark {
+                (Color32::from_gray(64), Color32::from_gray(225))
+            } else {
+                (Color32::from_gray(226), Color32::from_gray(50))
+            },
         }
     }
-    let ok = DIALOG_RESULT.with(|r| r.borrow_mut().take()) == Some(true);
-    let pin = get_text(edit);
-    let _ = EnableWindow(owner, true);
-    let _ = DestroyWindow(dlg);
-    let _ = SetForegroundWindow(owner);
-    let pin: String = pin.chars().filter(char::is_ascii_digit).collect();
-    (ok && !pin.is_empty()).then_some(pin)
-}
 
-thread_local! {
-    static DIALOG_RESULT: RefCell<Option<bool>> = const { RefCell::new(None) };
-}
-
-unsafe extern "system" fn dialog_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_COMMAND => {
-            match wparam.0 & 0xFFFF {
-                2 | 1 if (wparam.0 >> 16) as u32 == BN_CLICKED || wparam.0 & 0xFFFF == 2 => {
-                    DIALOG_RESULT.with(|r| *r.borrow_mut() = Some(true))
-                }
-                3 => DIALOG_RESULT.with(|r| *r.borrow_mut() = Some(false)),
-                _ => {}
-            }
-            LRESULT(0)
-        }
-        WM_CLOSE => {
-            DIALOG_RESULT.with(|r| *r.borrow_mut() = Some(false));
-            LRESULT(0)
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    fn primary(&self, text: &str, w: f32) -> egui::Button<'static> {
+        egui::Button::new(
+            RichText::new(text.to_string())
+                .strong()
+                .color(self.on_accent),
+        )
+        .fill(self.accent)
+        .min_size(egui::vec2(w, 34.0))
     }
 }
 
-/// Session results with a Copy button.
-unsafe fn show_report(owner: HWND, report: &str) {
-    let text = report.replace('\n', "\r\n");
-    let t = wide(&format!(
-        "{text}\r\n\r\nCopy these with Ctrl+A, Ctrl+C (or press Yes to copy them now) and paste them back to Claude."
-    ));
-    let r = MessageBoxW(
-        Some(owner),
-        PCWSTR(t.as_ptr()),
-        w!("Glass session results"),
-        MB_YESNO | MB_ICONINFORMATION,
-    );
-    if r == IDYES {
-        copy_to_clipboard(owner, report);
-    }
+/// A small rounded tag ("Mac", "✓ paired").
+fn tag(ui: &mut egui::Ui, text: &str, (fill, fg): (Color32, Color32)) {
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).size(13.0).color(fg));
+        });
 }
 
-unsafe fn copy_to_clipboard(owner: HWND, text: &str) {
-    use windows::Win32::Foundation::{GlobalFree, HANDLE};
-    use windows::Win32::System::DataExchange::{
-        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
-    };
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-    const CF_UNICODETEXT: u32 = 13;
-    let w = wide(&text.replace('\n', "\r\n"));
-    if OpenClipboard(Some(owner)).is_err() {
-        return;
-    }
-    let _ = EmptyClipboard();
-    if let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, w.len() * 2) {
-        let p = GlobalLock(h) as *mut u16;
-        if !p.is_null() {
-            std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
-            let _ = GlobalUnlock(h);
-            if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0))).is_err() {
-                let _ = GlobalFree(Some(h));
-            }
-        }
-    }
-    let _ = CloseClipboard();
-}
-
-/// Paired devices with Forget (a simple numbered prompt keeps this small).
-unsafe fn paired_devices(owner: HWND, device: &Device) {
-    loop {
-        let peers = device.peers();
-        if peers.is_empty() {
-            MessageBoxW(
-                Some(owner),
-                w!("No paired devices yet."),
-                w!("Paired devices"),
-                MB_OK,
-            );
-            return;
-        }
-        let mut text = String::from("Paired with this PC:\r\n\r\n");
-        for p in &peers {
-            let mut roles = Vec::new();
-            if p.roles & ROLE_VIEWER != 0 {
-                roles.push("may view this PC");
-            }
-            if p.roles & ROLE_HOST != 0 {
-                roles.push("this PC may view it");
-            }
-            text.push_str(&format!(
-                "\u{2022} {}  (id {}; {})\r\n",
-                p.name,
-                fingerprint_short(&p.fingerprint),
-                roles.join(", ")
-            ));
-        }
-        text.push_str("\r\nForget one? Press Yes to choose the first one listed, No to close.\r\n(Forget others one at a time.)");
-        let t = wide(&text);
-        if MessageBoxW(
-            Some(owner),
-            PCWSTR(t.as_ptr()),
-            w!("Paired devices"),
-            MB_YESNO,
-        ) != IDYES
-        {
-            return;
-        }
-        let p = &peers[0];
-        let q = wide(&format!(
-            "Forget \u{201C}{}\u{201D}? It will have to pair again with a PIN.",
-            p.name
-        ));
-        if MessageBoxW(
-            Some(owner),
-            PCWSTR(q.as_ptr()),
-            w!("Forget"),
-            MB_OKCANCEL | MB_ICONWARNING,
-        ) == IDOK
-        {
-            let _ = device.forget(&p.fingerprint);
-        }
-    }
-}
-
-unsafe fn tray_menu(hwnd: HWND) {
-    let Ok(m) = CreatePopupMenu() else { return };
-    let sharing = with_app(|a| a.sharing.is_some()).unwrap_or(false);
-    let _ = AppendMenuW(m, MF_STRING, MENU_OPEN, w!("Open Glass"));
-    let share = wide(if sharing {
-        "Stop sharing"
+fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let v = ui.visuals().clone();
+    let fill = if v.dark_mode {
+        Color32::from_gray(38)
     } else {
-        "Share this PC"
-    });
-    let _ = AppendMenuW(m, MF_STRING, MENU_SHARE, PCWSTR(share.as_ptr()));
-    let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
-    let _ = AppendMenuW(m, MF_STRING, MENU_QUIT, w!("Quit Glass"));
-    let mut pt = POINT::default();
-    let _ = GetCursorPos(&mut pt);
-    let _ = SetForegroundWindow(hwnd);
-    let _ = TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, Some(0), hwnd, None);
-    let _ = DestroyMenu(m);
+        Color32::WHITE
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(v.widgets.noninteractive.bg_stroke)
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::same(14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        })
+        .inner
 }
 
-unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    // Messages that open nested loops (dialogs), or arrive while the app
-    // state is borrowed (DestroyWindow sends WM_DESTROY), are handled here.
-    match msg {
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            return LRESULT(0);
+impl eframe::App for GlassApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        while let Ok(m) = self.rx.try_recv() {
+            self.handle(ctx, m);
         }
-        WM_ASK_PIN => {
-            let (p, host, port): (Pairing, String, u16) = take(lparam);
-            let name = p.host_name().to_string();
-            match ask_pin(hwnd, &name) {
-                Some(pin) => {
-                    set_text(
-                        hwnd,
-                        ID_STATUS,
-                        &format!("Pairing with \u{201C}{name}\u{201D} \u{2026}"),
-                    );
-                    let device = with_app(|a| a.device.clone());
-                    if let Some(device) = device {
-                        let h = hwnd.0 as isize;
-                        std::thread::spawn(move || {
-                            connect_worker(HWND(h as *mut _), device, host, port, Some((p, pin)))
-                        });
-                    }
-                }
-                None => {
-                    drop(p);
-                    with_app(|a| a.connecting = false);
-                    set_text(hwnd, ID_STATUS, "Pairing cancelled.");
-                }
-            }
-            return LRESULT(0);
+        // Closing the window while sharing keeps Glass in the tray.
+        if ctx.input(|i| i.viewport().close_requested()) && self.sharing.is_some() && !self.quitting
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
-        WM_SESSION_REPORT => {
-            let report: String = take(lparam);
-            with_app(|a| {
-                a.connecting = false;
-            });
-            set_text(
-                hwnd,
-                ID_STATUS,
-                "Session ended. Results saved next to Glass.exe.",
-            );
-            show_report(hwnd, &report);
-            return LRESULT(0);
+        if self.last_scan.elapsed() > Duration::from_millis(1500) {
+            self.scan();
         }
-        WM_CONNECT_FAILED => {
-            let e: String = take(lparam);
-            with_app(|a| a.connecting = false);
-            set_text(hwnd, ID_STATUS, &e);
-            let t = wide(&e);
-            MessageBoxW(
-                Some(hwnd),
-                PCWSTR(t.as_ptr()),
-                w!("Couldn't connect"),
-                MB_OK | MB_ICONWARNING,
-            );
-            return LRESULT(0);
-        }
-        WM_COMMAND if wparam.0 & 0xFFFF == ID_PAIRED => {
-            if let Some(device) = with_app(|a| a.device.clone()) {
-                paired_devices(hwnd, &device);
-                with_app(|a| {
-                    a.rows.clear();
-                    a.refresh()
-                });
-            }
-            return LRESULT(0);
-        }
-        _ => {}
+        ctx.request_repaint_after(Duration::from_millis(1500));
     }
-    let handled = with_app(|a| -> Option<LRESULT> {
-        match msg {
-            WM_COMMAND => {
-                let id = wparam.0 & 0xFFFF;
-                match id {
-                    ID_CONNECT => a.connect(false),
-                    ID_REFRESH => {
-                        let _ = browse::start();
-                        a.rows.clear();
-                        a.refresh();
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let pal = Palette::of(ui.visuals());
+        let bg = if ui.visuals().dark_mode {
+            Color32::from_gray(24)
+        } else {
+            Color32::from_gray(243)
+        };
+
+        egui::Frame::new().fill(bg).inner_margin(Margin::same(20)).show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            // Header: title, theme, settings.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Glass").size(28.0).strong().color(pal.strong));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Settings").clicked() {
+                        self.dialog = Dialog::Settings;
                     }
-                    ID_SHARE | MENU_SHARE => a.toggle_share(),
-                    ID_ADMIN => {
-                        if let Ok(exe) = std::env::current_exe() {
-                            let e = wide(&exe.to_string_lossy());
-                            let share = a.sharing.is_some();
-                            let r = ShellExecuteW(
-                                Some(hwnd),
-                                w!("runas"),
-                                PCWSTR(e.as_ptr()),
-                                if share { w!("app --share") } else { w!("app") },
-                                None,
-                                SW_SHOWNORMAL,
-                            );
-                            if r.0 as isize > 32 {
-                                // The elevated copy takes over.
-                                if let Some(s) = a.sharing.take() {
-                                    s.stop.store(true, Ordering::Relaxed);
-                                    let _ = std::net::TcpStream::connect(("127.0.0.1", s.port));
+                    let before = self.settings.theme;
+                    egui::ComboBox::from_id_salt("theme")
+                        .selected_text(match self.settings.theme {
+                            ThemePreference::System => "Theme: System",
+                            ThemePreference::Light => "Theme: Light",
+                            ThemePreference::Dark => "Theme: Dark",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.settings.theme, ThemePreference::System, "System");
+                            ui.selectable_value(&mut self.settings.theme, ThemePreference::Light, "Light");
+                            ui.selectable_value(&mut self.settings.theme, ThemePreference::Dark, "Dark");
+                        });
+                    if self.settings.theme != before {
+                        ctx.set_theme(self.settings.theme);
+                        self.settings.save();
+                    }
+                });
+            });
+            ui.label(RichText::new(&self.status).color(pal.weak));
+            ui.add_space(4.0);
+
+            // Sharing.
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Share this PC").size(18.0).strong().color(pal.strong));
+                        let s = if !self.share_status.is_empty() {
+                            self.share_status.as_str()
+                        } else {
+                            "Let another Mac or PC view and control this PC."
+                        };
+                        ui.label(RichText::new(s).color(pal.weak));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let clicked = if self.sharing.is_some() {
+                            ui.add(egui::Button::new(RichText::new("Stop sharing").strong()).min_size(egui::vec2(140.0, 34.0)))
+                                .clicked()
+                        } else {
+                            ui.add(pal.primary("Start sharing", 140.0)).clicked()
+                        };
+                        if clicked {
+                            self.toggle_share();
+                        }
+                    });
+                });
+                if let Some((pin, text)) = &self.pin {
+                    ui.add_space(4.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new(format!("PIN  {pin}")).size(40.0).strong().color(pal.strong));
+                        ui.label(RichText::new(text).color(pal.weak));
+                    });
+                }
+                if self.sharing.is_some() && !super::blocker::self_elevated() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new("Admin windows (Task Manager, installers) ignore remote input unless Glass runs as administrator.")
+                                .size(13.0)
+                                .color(pal.weak),
+                        );
+                        if ui.small_button("Restart as administrator").clicked() && restart_elevated(true) {
+                            self.quit(&ctx);
+                        }
+                    });
+                }
+            });
+            ui.add_space(6.0);
+
+            // Machines.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Machines on this network").size(18.0).strong().color(pal.strong));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Paired devices").clicked() {
+                        self.dialog = Dialog::Paired;
+                    }
+                    if ui.button("Refresh").clicked() {
+                        let _ = browse::start();
+                        self.scan();
+                    }
+                });
+            });
+            let list_h = (ui.available_height() - 56.0).max(120.0);
+            let mut go = None;
+            egui::ScrollArea::vertical().max_height(list_h).auto_shrink([false, true]).show(ui, |ui| {
+                if self.machines.is_empty() {
+                    card(ui, |ui| {
+                        ui.label(
+                            RichText::new("Looking for Macs and PCs with Glass \u{2026}  Start sharing on the other machine, or type its address below.")
+                                .color(pal.weak),
+                        );
+                    });
+                }
+                for m in &self.machines {
+                    card(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(&m.name).size(17.0).strong().color(pal.strong));
+                                    tag(ui, m.kind, pal.kind);
+                                    if !m.version_ok {
+                                        tag(ui, "different Glass version", pal.warn);
+                                    } else if m.paired {
+                                        tag(ui, "\u{2713} paired", pal.ok);
+                                    } else {
+                                        tag(ui, "needs PIN", pal.warn);
+                                    }
+                                });
+                                ui.label(RichText::new(&m.address).color(pal.weak));
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add_enabled(!self.connecting && m.version_ok, pal.primary("Connect", 110.0)).clicked() {
+                                    go = Some((m.address.clone(), m.port));
                                 }
-                                a.quitting = true;
-                                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                            }
+                            });
+                        });
+                    });
+                }
+            });
+            if let Some((h, p)) = go {
+                self.connect(h, p);
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Or an address:");
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.address)
+                        .hint_text("e.g. 192.168.1.20")
+                        .desired_width(220.0),
+                );
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.add_enabled(!self.connecting, egui::Button::new("Connect")).clicked() || enter {
+                    self.connect_typed();
+                }
+            });
+        });
+
+        self.dialogs(&ctx);
+
+        // GLASS_DEBUG_SHOT=FILE.bmp: save the window after 3 s and quit (checks).
+        // egui's own capture: screen copies can't see an OpenGL window.
+        if let Some(t) = self.shot_at {
+            if t.elapsed() > Duration::from_secs(3) {
+                self.shot_at = None;
+                let path = std::env::var_os("GLASS_DEBUG_SHOT").unwrap_or_default();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
+                    egui::ScreenshotCallback::new(move |img| {
+                        let (w, h) = (img.size[0] as u32, img.size[1] as u32);
+                        let mut b = Vec::with_capacity(54 + img.pixels.len() * 4);
+                        b.extend_from_slice(b"BM");
+                        b.extend_from_slice(&(54 + w * h * 4).to_le_bytes());
+                        b.extend_from_slice(&[0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0]);
+                        b.extend_from_slice(&w.to_le_bytes());
+                        b.extend_from_slice(&(-(h as i32)).to_le_bytes());
+                        b.extend_from_slice(&[1, 0, 32, 0]);
+                        b.extend_from_slice(&[0; 24]);
+                        for p in &img.pixels {
+                            b.extend_from_slice(&[p.b(), p.g(), p.r(), 255]);
+                        }
+                        let _ = std::fs::write(&path, b);
+                        tray_send(Msg::TrayQuit);
+                    }),
+                ));
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+impl GlassApp {
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        match &mut self.dialog {
+            Dialog::None => {}
+            Dialog::Pin {
+                pairing,
+                host,
+                port,
+                pin,
+                name,
+            } => {
+                let mut submit = None;
+                egui::Modal::new(egui::Id::unique("pin")).show(ctx, |ui| {
+                    ui.set_width(380.0);
+                    ui.heading("Pair with Glass");
+                    ui.label(format!("\u{201C}{name}\u{201D} is showing a 6-digit PIN. Type it here."));
+                    ui.label(
+                        RichText::new("Pair only your own devices: a paired host sees what you type while you view it.")
+                            .size(13.0)
+                            .weak(),
+                    );
+                    let r = ui.add(
+                        egui::TextEdit::singleline(pin)
+                            .hint_text("123 456")
+                            .font(egui::TextStyle::Heading)
+                            .desired_width(200.0),
+                    );
+                    r.request_focus();
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        if ui.button("Pair").clicked() || enter {
+                            submit = Some(true);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            submit = Some(false);
+                        }
+                    });
+                });
+                if let Some(ok) = submit {
+                    let digits: String = pin.chars().filter(char::is_ascii_digit).collect();
+                    match (ok && !digits.is_empty(), pairing.take()) {
+                        (true, Some(p)) => {
+                            self.status = format!("Pairing with \u{201C}{name}\u{201D} \u{2026}");
+                            let (wake, device, s, h, pt) = (
+                                self.wake.clone(),
+                                self.device.clone(),
+                                self.settings.clone(),
+                                host.clone(),
+                                *port,
+                            );
+                            std::thread::spawn(move || {
+                                connect_worker(wake, device, h, pt, Some((p, digits)), s)
+                            });
+                        }
+                        _ => {
+                            self.connecting = false;
+                            self.status = "Pairing cancelled.".into();
                         }
                     }
-                    MENU_OPEN => unsafe { show(hwnd) },
-                    MENU_QUIT => {
-                        a.quitting = true;
-                        let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                    close = true;
+                }
+            }
+            Dialog::Report(text) => {
+                egui::Modal::new(egui::Id::unique("report")).show(ctx, |ui| {
+                    ui.set_width((ctx.content_rect().width() - 80.0).clamp(320.0, 760.0));
+                    ui.heading("Session results");
+                    ui.label(RichText::new("Copy these and paste them back to Claude.").weak());
+                    egui::ScrollArea::vertical()
+                        .max_height(380.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(text.as_str()).monospace().size(12.0),
+                                )
+                                .selectable(true),
+                            );
+                        });
+                    ui.horizontal(|ui| {
+                        if ui.button("Copy results").clicked() {
+                            ctx.copy_text(text.clone());
+                        }
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            }
+            Dialog::Message(title, text) => {
+                egui::Modal::new(egui::Id::unique("msg")).show(ctx, |ui| {
+                    ui.set_width(400.0);
+                    ui.heading(title.as_str());
+                    ui.label(text.as_str());
+                    if ui.button("OK").clicked() {
+                        close = true;
                     }
-                    _ => return None,
-                }
-                Some(LRESULT(0))
+                });
             }
-            WM_NOTIFY => {
-                let h = unsafe { &*(lparam.0 as *const NMHDR) };
-                if h.idFrom == ID_LIST && h.code == NM_DBLCLK {
-                    a.connect(true);
-                }
-                None
-            }
-            WM_TIMER if wparam.0 == TIMER_SHOT => {
-                unsafe {
-                    let _ = KillTimer(Some(hwnd), TIMER_SHOT);
-                    if let Some(p) = std::env::var_os("GLASS_DEBUG_SHOT") {
-                        super::viewer::save_shot(hwnd, std::path::Path::new(&p));
+            Dialog::Paired => {
+                let peers: Vec<Peer> = self.device.peers();
+                let mut forget = None;
+                egui::Modal::new(egui::Id::unique("paired")).show(ctx, |ui| {
+                    ui.set_width(480.0);
+                    ui.heading("Paired devices");
+                    if peers.is_empty() {
+                        ui.label(RichText::new("None yet.").weak());
                     }
-                    a.quitting = true;
-                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                }
-                Some(LRESULT(0))
-            }
-            WM_TIMER if wparam.0 == TIMER_REFRESH => {
-                a.refresh();
-                Some(LRESULT(0))
-            }
-            WM_HOST_EVENT => {
-                let e: HostEvent = unsafe { take(lparam) };
-                a.host_event(e);
-                Some(LRESULT(0))
-            }
-            WM_HOST_LINE => {
-                let l: String = unsafe { take(lparam) };
-                a.host_line(&l);
-                Some(LRESULT(0))
-            }
-            WM_HOST_STOPPED => {
-                let why: String = unsafe { take(lparam) };
-                a.sharing = None;
-                unsafe {
-                    set_text(hwnd, ID_SHARE, "Share this PC");
-                    set_text(hwnd, ID_PIN, "");
-                    set_text(hwnd, ID_STATUS, &why);
-                }
-                if a.quitting {
-                    unsafe {
-                        let _ = DestroyWindow(hwnd);
+                    for p in &peers {
+                        card(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(&p.name).strong());
+                                    let mut roles = Vec::new();
+                                    if p.roles & ROLE_VIEWER != 0 {
+                                        roles.push("may view this PC");
+                                    }
+                                    if p.roles & ROLE_HOST != 0 {
+                                        roles.push("this PC may view it");
+                                    }
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "id {}  \u{00B7}  {}",
+                                            fingerprint_short(&p.fingerprint),
+                                            roles.join(", ")
+                                        ))
+                                        .size(13.0)
+                                        .weak(),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("Forget").clicked() {
+                                            forget = Some(p.fingerprint);
+                                        }
+                                    },
+                                );
+                            });
+                        });
                     }
-                }
-                Some(LRESULT(0))
-            }
-            WM_TRAY => {
-                match (lparam.0 & 0xFFFF) as u32 {
-                    WM_LBUTTONDBLCLK | WM_LBUTTONUP => unsafe { show(hwnd) },
-                    WM_RBUTTONUP | WM_CONTEXTMENU => unsafe { tray_menu(hwnd) },
-                    _ => {}
-                }
-                Some(LRESULT(0))
-            }
-            WM_CLOSE => {
-                // While sharing, closing the window keeps Glass in the tray.
-                if a.sharing.is_some() && !a.quitting {
-                    unsafe {
-                        let _ = ShowWindow(hwnd, SW_HIDE);
+                    if ui.button("Close").clicked() {
+                        close = true;
                     }
-                    return Some(LRESULT(0));
+                });
+                if let Some(fp) = forget {
+                    let _ = self.device.forget(&fp);
+                    self.scan();
                 }
-                if let Some(s) = a.sharing.take() {
-                    s.stop.store(true, Ordering::Relaxed);
-                    let _ = std::net::TcpStream::connect_timeout(
-                        &std::net::SocketAddr::from(([127, 0, 0, 1], s.port)),
-                        std::time::Duration::from_millis(500),
+            }
+            Dialog::Settings => {
+                let mut s = self.settings.clone();
+                egui::Modal::new(egui::Id::unique("settings")).show(ctx, |ui| {
+                    ui.set_width(440.0);
+                    ui.heading("Settings");
+                    ui.label(RichText::new("Theme").strong());
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut s.theme, ThemePreference::System, "System");
+                        ui.radio_value(&mut s.theme, ThemePreference::Light, "Light");
+                        ui.radio_value(&mut s.theme, ThemePreference::Dark, "Dark");
+                    });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("When viewing a Mac, start in").strong());
+                    egui::ComboBox::from_id_salt("view")
+                        .width(300.0)
+                        .selected_text(viewer::mode_name(s.view))
+                        .show_ui(ui, |ui| {
+                            for m in [MODE_FIT, MODE_FIT_MORE_SPACE, MODE_FIT_LARGER, MODE_HOST_SCREEN] {
+                                ui.selectable_value(&mut s.view, m, viewer::mode_name(m));
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Colour").strong());
+                    ui.radio_value(&mut s.full_colour, false, "Fast (4:2:0): lowest lag");
+                    ui.radio_value(&mut s.full_colour, true, "Full colour (4:4:4): exact colours, a little more lag");
+                    ui.label(
+                        RichText::new("Both can be changed while viewing, from the bar at the top edge of the screen.")
+                            .size(13.0)
+                            .weak(),
                     );
+                    if ui.button("Done").clicked() {
+                        close = true;
+                    }
+                });
+                if s != self.settings {
+                    if s.theme != self.settings.theme {
+                        ctx.set_theme(s.theme);
+                    }
+                    self.settings = s;
+                    self.settings.save();
                 }
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
-                }
-                Some(LRESULT(0))
             }
-            _ => None,
         }
-    })
-    .flatten();
-    handled.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
+        if close {
+            self.dialog = Dialog::None;
+        }
+    }
+}
+
+/// Starts an elevated copy of Glass (Windows asks). True if it started.
+fn restart_elevated(share: bool) -> bool {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let e: Vec<u16> = exe
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let r = unsafe {
+        ShellExecuteW(
+            None,
+            w!("runas"),
+            PCWSTR(e.as_ptr()),
+            if share { w!("--share") } else { w!("") },
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    r.0 as isize > 32
 }

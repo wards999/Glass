@@ -205,7 +205,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private func noticeText(_ code: UInt8) -> String? {
         switch Int32(code) {
         case GLASS_NOTICE_INPUT_BLOCKED_ELEVATED:
-            return "⚠️ The PC is ignoring mouse and keyboard: a program running as administrator is in front. Click another window on the PC, or run host.cmd as administrator."
+            return "⚠️ The PC is ignoring mouse and keyboard: a program running as administrator is in front. Click another window on the PC, or use “Restart as administrator” in Glass on the PC."
         case GLASS_NOTICE_INPUT_BLOCKED_SECURE_DESKTOP:
             return "⚠️ The PC is showing a UAC prompt or the lock screen, which Glass can't see or control. Answer it on the PC itself."
         default:

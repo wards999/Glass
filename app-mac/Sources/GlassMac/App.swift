@@ -11,7 +11,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var connectWindow: NSWindow?
     private var hostField: NSTextField!
     private var connectButton: NSButton!
-    private var foundPopup: NSPopUpButton!
+    private var listStack: NSStackView!
+    private var machineButtons: [NSButton] = []
     private var found: [DiscoveredHost] = []
     private let browser = GlassBrowser()
     private let pairedMenu = NSMenu(title: "Paired Devices")
@@ -22,6 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     func applicationDidFinishLaunching(_ note: Notification) {
         buildMenu()
+        applyTheme()
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.main.async { if !self.openedFile { self.showConnect() } }
     }
@@ -159,84 +161,193 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func setBusy(_ title: String) {
         connectButton.isEnabled = false
         connectButton.title = title
+        machineButtons.forEach { $0.isEnabled = false }
+    }
+
+    // MARK: theme (System / Light / Dark)
+
+    private func applyTheme() {
+        switch UserDefaults.standard.string(forKey: "theme") {
+        case "light": NSApp.appearance = NSAppearance(named: .aqua)
+        case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
+        default: NSApp.appearance = nil
+        }
+    }
+
+    @objc private func pickTheme(_ sender: NSPopUpButton) {
+        let t = ["system", "light", "dark"][max(0, sender.indexOfSelectedItem)]
+        UserDefaults.standard.set(t, forKey: "theme")
+        applyTheme()
+    }
+
+    @objc private func showPaired(_ sender: NSButton) {
+        pairedMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
     }
 
     // MARK: discovery
 
     private func refreshFound() {
-        guard let foundPopup else { return }
-        foundPopup.removeAllItems()
+        guard let listStack else { return }
+        listStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        machineButtons = []
+        let busy = !(connectButton?.isEnabled ?? true)
         if found.isEmpty {
-            foundPopup.addItem(withTitle: "Searching… (or type the address below)")
-            foundPopup.isEnabled = false
+            let l = NSTextField(wrappingLabelWithString: "Looking for Macs and PCs with Glass\u{2026}  Start sharing on the other machine, or type its address below.")
+            l.textColor = .secondaryLabelColor
+            add(card(l))
             return
         }
-        foundPopup.isEnabled = true
-        foundPopup.addItem(withTitle: "Choose a machine…")
-        for h in found {
+        for (i, h) in found.enumerated() {
             let paired = GlassDevice.shared?.pairedHost(prefix: h.fingerprintPrefix) != nil
-            let v = h.version.map { $0 == String(glass_protocol_version()) ? "" : "  (different Glass version)" } ?? ""
-            foundPopup.addItem(withTitle: "\(h.name) (\(h.kind)) — \(h.address)\(paired ? "  ✓ paired" : "")\(v)")
+            let versionOK = h.version.map { $0 == String(glass_protocol_version()) } ?? true
+            let name = NSTextField(labelWithString: h.name)
+            name.font = .systemFont(ofSize: 15, weight: .semibold)
+            name.lineBreakMode = .byTruncatingTail
+            name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let status = !versionOK ? tag("different Glass version", .systemOrange)
+                : paired ? tag("\u{2713} paired", .systemGreen) : tag("needs PIN", .systemOrange)
+            let top = NSStackView(views: [name, tag(h.kind, .secondaryLabelColor), status])
+            top.spacing = 6
+            let addr = NSTextField(labelWithString: h.address)
+            addr.textColor = .secondaryLabelColor
+            let left = NSStackView(views: [top, addr])
+            left.orientation = .vertical
+            left.alignment = .leading
+            left.spacing = 3
+            let b = NSButton(title: "Connect", target: self, action: #selector(connectFound(_:)))
+            b.tag = i
+            b.bezelColor = .controlAccentColor
+            b.controlSize = .large
+            b.isEnabled = versionOK && !busy
+            machineButtons.append(b)
+            let row = NSStackView(views: [left, NSView(), b])
+            row.orientation = .horizontal
+            add(card(row))
         }
     }
 
-    @objc private func pickFound(_ sender: NSPopUpButton) {
-        let i = sender.indexOfSelectedItem - 1
-        guard i >= 0, i < found.count else { return }
-        let h = found[i]
+    private func add(_ v: NSView) {
+        listStack.addArrangedSubview(v)
+        v.widthAnchor.constraint(equalTo: listStack.widthAnchor).isActive = true
+    }
+
+    @objc private func connectFound(_ sender: NSButton) {
+        guard sender.tag < found.count, connectButton.isEnabled else { return }
+        let h = found[sender.tag]
         hostField.stringValue = h.port == GlassClient.defaultPort ? h.address : "\(h.address):\(h.port)"
+        connect()
     }
 
     private func buildConnectWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 230),
-                         styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 600),
+                         styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         w.title = "Glass \(appVersion)"
         w.isReleasedWhenClosed = false
         w.delegate = self
+        w.contentMinSize = NSSize(width: 480, height: 460)
 
-        let foundLabel = NSTextField(labelWithString: "Machines with Glass on this network:")
-        foundPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        foundPopup.target = self
-        foundPopup.action = #selector(pickFound(_:))
+        // Header: title and theme.
+        let title = NSTextField(labelWithString: "Glass")
+        title.font = .systemFont(ofSize: 26, weight: .bold)
+        let theme = NSPopUpButton(frame: .zero, pullsDown: false)
+        theme.addItems(withTitles: ["Theme: System", "Theme: Light", "Theme: Dark"])
+        let saved = UserDefaults.standard.string(forKey: "theme") ?? "system"
+        theme.selectItem(at: ["system", "light", "dark"].firstIndex(of: saved) ?? 0)
+        theme.target = self
+        theme.action = #selector(pickTheme(_:))
+        let header = NSStackView(views: [title, NSView(), theme])
+        let id = GlassDevice.shared.map { "  \u{00B7}  id \($0.fingerprintHexPrefix)" } ?? ""
+        let me = NSTextField(labelWithString: "This Mac: \u{201C}\(GlassDevice.computerName)\u{201D}\(id)")
+        me.textColor = .secondaryLabelColor
+
+        // Sharing.
+        let shareTitle = NSTextField(labelWithString: "Share this Mac")
+        shareTitle.font = .systemFont(ofSize: 16, weight: .semibold)
+        let shareNote = NSTextField(labelWithString: "Let another Mac or PC view and control this Mac.")
+        shareNote.textColor = .secondaryLabelColor
+        let shareText = NSStackView(views: [shareTitle, shareNote])
+        shareText.orientation = .vertical
+        shareText.alignment = .leading
+        shareText.spacing = 3
+        let share = NSButton(title: "Start Sharing\u{2026}", target: self, action: #selector(shareThisMac))
+        share.bezelColor = .controlAccentColor
+        share.controlSize = .large
+        let shareCard = card(NSStackView(views: [shareText, NSView(), share]))
+
+        // Machines.
+        let machines = NSTextField(labelWithString: "Machines on this network")
+        machines.font = .systemFont(ofSize: 16, weight: .semibold)
+        let paired = NSButton(title: "Paired Devices", target: self, action: #selector(showPaired(_:)))
+        let machinesHeader = NSStackView(views: [machines, NSView(), paired])
+        listStack = NSStackView()
+        listStack.orientation = .vertical
+        listStack.alignment = .leading
+        listStack.spacing = 8
+        listStack.translatesAutoresizingMaskIntoConstraints = false
+        let doc = FlippedView()
+        doc.translatesAutoresizingMaskIntoConstraints = false
+        doc.addSubview(listStack)
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.documentView = doc
+        scroll.setContentHuggingPriority(.defaultLow, for: .vertical)
+        NSLayoutConstraint.activate([
+            listStack.topAnchor.constraint(equalTo: doc.topAnchor),
+            listStack.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
+            listStack.trailingAnchor.constraint(equalTo: doc.trailingAnchor),
+            doc.bottomAnchor.constraint(equalTo: listStack.bottomAnchor),
+            doc.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            doc.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 140),
+        ])
         browser.onChange = { [weak self] hosts in
             // Not this Mac itself.
             let mine = GlassDevice.shared?.fingerprintHexPrefix ?? "-"
             self?.found = hosts.filter { $0.fingerprintPrefix?.lowercased() != mine }
             self?.refreshFound()
         }
-        let label = NSTextField(labelWithString: "Or the PC's address (host.cmd on the PC shows it):")
+
+        // A typed address.
+        let label = NSTextField(labelWithString: "Or an address:")
         hostField = NSTextField(string: UserDefaults.standard.string(forKey: "lastHost") ?? "")
         hostField.placeholderString = "e.g. 192.168.1.20"
-        hostField.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
         hostField.target = self
         hostField.action = #selector(connect)
         connectButton = NSButton(title: "Connect", target: self, action: #selector(connect))
         connectButton.keyEquivalent = "\r"
-        let open = NSButton(title: "Open Recording…", target: self, action: #selector(openRecording))
-        let share = NSButton(title: "Share This Mac…", target: self, action: #selector(shareThisMac))
-        let note = NSTextField(labelWithString: "Paired PCs only; everything is encrypted. Opens full screen; ⌃⌥⌘F window, ⌃⌥⌘W disconnect.\nTo control this Mac from a PC instead: Share This Mac.")
+        let addressRow = NSStackView(views: [label, hostField, connectButton, NSView()])
+        let open = NSButton(title: "Open Recording\u{2026}", target: self, action: #selector(openRecording))
+        open.controlSize = .small
+        let note = NSTextField(labelWithString: "Paired devices only; everything is encrypted. While viewing, move to the top edge for the bar.")
         note.textColor = .secondaryLabelColor
         note.font = .systemFont(ofSize: 11)
+        note.lineBreakMode = .byTruncatingTail
+        note.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let footer = NSStackView(views: [note, NSView(), open])
 
-        let buttons = NSStackView(views: [open, share, NSView(), connectButton])
-        buttons.orientation = .horizontal
-        let stack = NSStackView(views: [foundLabel, foundPopup, label, hostField, note, buttons])
+        let stack = NSStackView(views: [header, me, shareCard, machinesHeader, scroll, addressRow, footer])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.setCustomSpacing(18, after: shareCard)
+        stack.edgeInsets = NSEdgeInsets(top: 18, left: 20, bottom: 16, right: 20)
         stack.translatesAutoresizingMaskIntoConstraints = false
         let content = NSView()
         content.addSubview(stack)
-        NSLayoutConstraint.activate([
+        var cs = [
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             stack.topAnchor.constraint(equalTo: content.topAnchor),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            hostField.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
-            foundPopup.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
-            buttons.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40),
-        ])
+            hostField.widthAnchor.constraint(equalToConstant: 220),
+        ]
+        for v in [header, shareCard, machinesHeader, scroll, addressRow, footer] {
+            cs.append(v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40))
+        }
+        NSLayoutConstraint.activate(cs)
         w.contentView = content
         w.center()
         connectWindow = w
@@ -289,8 +400,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     private func offerPairing(_ host: String, _ port: UInt16) {
         let a = NSAlert()
-        a.messageText = "Pair with this PC?"
-        a.informativeText = "This Mac isn't paired with \(host) yet. Glass on the PC will show a 6-digit PIN in its host.cmd window for you to type here.\n\nPair only with your own PC: a paired PC sees what you type while viewing it."
+        a.messageText = "Pair with \(host)?"
+        a.informativeText = "This Mac isn't paired with it yet. Glass there will show a 6-digit PIN for you to type here.\n\nPair only your own devices: a paired host sees what you type while viewing it."
         a.addButton(withTitle: "Pair")
         a.addButton(withTitle: "Cancel")
         guard a.runModal() == .alertFirstButtonReturn else { showConnect(); return }
@@ -320,7 +431,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func askPin(_ p: GlassPairing, _ port: UInt16) {
         let a = NSAlert()
         a.messageText = "Type the PIN shown on \u{201C}\(p.hostName)\u{201D}"
-        a.informativeText = "It's in the host.cmd window on the PC, valid for 2 minutes."
+        a.informativeText = "It's shown in Glass on that machine, valid for 2 minutes."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 160, height: 28))
         field.font = .monospacedDigitSystemFont(ofSize: 18, weight: .medium)
         field.placeholderString = "123 456"
@@ -409,4 +520,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             showConnect()
         }
     }
+}
+
+/// Top-down layout for the scrolling machine list.
+private final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+/// A rounded card that follows light/dark.
+private func card(_ content: NSView) -> NSBox {
+    let b = NSBox()
+    b.boxType = .custom
+    b.titlePosition = .noTitle
+    b.cornerRadius = 12
+    b.borderWidth = 1
+    b.borderColor = .separatorColor
+    b.fillColor = .controlBackgroundColor
+    b.contentViewMargins = NSSize(width: 14, height: 12)
+    b.contentView = content
+    return b
+}
+
+/// A small rounded tag ("Mac", "✓ paired").
+private func tag(_ text: String, _ colour: NSColor) -> NSView {
+    let l = NSTextField(labelWithString: text)
+    l.font = .systemFont(ofSize: 11, weight: .medium)
+    l.textColor = colour
+    let b = NSBox()
+    b.boxType = .custom
+    b.titlePosition = .noTitle
+    b.cornerRadius = 8
+    b.borderWidth = 0
+    b.fillColor = colour.withAlphaComponent(0.16)
+    b.contentViewMargins = NSSize(width: 7, height: 2)
+    b.contentView = l
+    return b
 }

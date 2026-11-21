@@ -153,6 +153,11 @@ def main():
     with open(path, 'wb') as f:
         f.write(b'icns' + struct.pack('>I', 8 + len(body)) + body)
     print('wrote', path)
+    # Raw RGBA for the Windows app's window and tray icons (no decoder needed).
+    for size in (32, 64):
+        img = render(size, SMALL if size <= 32 else FULL, win_crop)
+        with open(os.path.join(ROOT, 'app-win', 'packaging', f'glass-{size}.rgba'), 'wb') as f:
+            f.write(img.tobytes())
     # A preview for the docs.
     with open(os.path.join(ROOT, 'design', 'icon', 'glass-icon-256.png'), 'wb') as f:
         f.write(icon_png(256, mac_crop))

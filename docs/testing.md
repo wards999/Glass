@@ -10,6 +10,24 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M3d test 5 (the new look, themes; replaces test 4)
+Use the zip and dmg from the same test build (protocol v7). Extract the zip
+on both PCs.
+1. **PC:** double-click **Glass.exe**. The new window opens (no black flash):
+   a "Share this PC" card and a card for each machine with Glass, tagged
+   Mac/PC and "paired" or "needs PIN".
+2. **Theme:** try Theme: Light / Dark / System (top right) on the PC and on
+   the Mac. Restart each app: the choice is kept.
+3. **Connect** from a machine's card. The PIN dialog appears the first time.
+   Use the bar, then disconnect: the results window opens with Copy.
+4. **Start sharing** on the PC; the PIN shows large in the card. Connect from
+   the Mac. Close the PC window while sharing: Glass stays in the tray
+   (right-click it for Open / Stop sharing / Quit).
+5. **No loops:** while the PC views the Mac, on the Mac (in the remote view)
+   connect back to the PC. It must refuse.
+6. **PC → PC** with the second PC, if handy.
+7. Send the results and anything that looked or felt wrong.
+
 ## M3d test 4 (the Glass window, machine list, no loops)
 Use the zip and dmg from the same test build (protocol v7). Extract the zip
 on both PCs.

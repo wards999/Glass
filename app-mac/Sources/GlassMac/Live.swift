@@ -120,7 +120,9 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     }
 
     func open() {
-        let w = CGFloat(client.info.width), h = CGFloat(client.info.height)
+        // A real size even if the stream hasn't said yet (0x0 breaks AppKit).
+        let w = CGFloat(max(client.info.width, 1) == 1 ? 1920 : client.info.width)
+        let h = CGFloat(max(client.info.height, 1) == 1 ? 1080 : client.info.height)
         let screen = NSScreen.main
         let scale = screen?.backingScaleFactor ?? 2
         // Windowed size: 1:1 pixels if that fits, else 80% of the screen.
@@ -522,6 +524,10 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     /// The host switched view or colour: new picture shape and pointer scale.
     private func streamChanged() {
         let i = client.info
+        // When the host stops, the stream drops to 0x0: never hand AppKit a
+        // 0:0 aspect ratio (leaving full screen then computes a NaN frame and
+        // throws: the m3d-test12/14 crashes).
+        guard i.width > 0, i.height > 0, !finished else { return }
         shownInfo = i
         window.contentAspectRatio = NSSize(width: Int(i.width), height: Int(i.height))
         updateDrawableSize()
@@ -630,6 +636,9 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         link?.invalidate()
         link = nil
         closingReason = reason
+        // Free resizing from here on (clears the aspect ratio), so leaving
+        // full screen can always work out a window size.
+        window.resizeIncrements = NSSize(width: 1, height: 1)
         // In full screen, leave it first and close once macOS has finished
         // (windowDidExitFullScreen). Showing the results (a modal alert)
         // during the exit animation made AppKit throw: m3d-test12 crash when

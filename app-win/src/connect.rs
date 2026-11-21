@@ -1,7 +1,8 @@
 //! `glass connect`: pair with a host if needed, then view and control it.
 //!
 //! `glass connect [HOST[:PORT]] [--pin PIN] [--seconds S] [--windowed]
-//!                [--keys pc|labelled] [--view mac|fit|space|larger] [--log FILE]`
+//!                [--keys pc|labelled] [--view mac|fit|space|larger] [--colour 444|420]
+//!                [--log FILE]`
 //!
 //! View modes (M3c): Ctrl+Alt+Shift+R while viewing cycles the host's own
 //! screen and three "fit to this PC" sizes; the last one is remembered per
@@ -45,6 +46,7 @@ pub fn connect(args: &[String]) -> Res<()> {
         windowed: false,
         seconds: None,
         rule: PcModifierRule::PcStyle,
+        full_colour: true,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -54,6 +56,13 @@ pub fn connect(args: &[String]) -> Res<()> {
             "--seconds" => seconds = Some(val()?.parse::<f64>()?),
             "--log" => log = Some(val()?.clone()),
             "--windowed" => opts.windowed = true,
+            "--colour" | "--color" => {
+                opts.full_colour = match val()?.as_str() {
+                    "444" | "4:4:4" => true,
+                    "420" | "4:2:0" => false,
+                    v => return Err(format!("--colour {v}: use 444 or 420").into()),
+                }
+            }
             "--view" => {
                 view = Some(match val()?.as_str() {
                     "mac" | "host" => 0,

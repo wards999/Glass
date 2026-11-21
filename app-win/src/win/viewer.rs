@@ -42,7 +42,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, VK_F, VK_Q, VK_R, VK_W,
+    ReleaseCapture, SetCapture, VK_C, VK_F, VK_Q, VK_R, VK_W,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -51,6 +51,8 @@ pub struct Options {
     pub windowed: bool,
     pub seconds: Option<f64>,
     pub rule: PcModifierRule,
+    /// Ask for 4:4:4 when possible (else 4:2:0, which uses less bandwidth).
+    pub full_colour: bool,
 }
 
 /// Made before connecting: the GPU, and what `Hello` tells the host.
@@ -104,6 +106,8 @@ const WM_TOGGLE_FULLSCREEN: u32 = WM_APP + 2;
 const WM_STREAM_CHANGED: u32 = WM_APP + 3;
 /// Posted by the keyboard hook: ask the host for the next view mode.
 const WM_NEXT_MODE: u32 = WM_APP + 4;
+/// Posted by the keyboard hook: full colour (4:4:4) on/off.
+const WM_TOGGLE_444: u32 = WM_APP + 5;
 const TIMER_CURSOR: usize = 1;
 
 /// Shared by the UI and render threads.
@@ -111,6 +115,8 @@ struct Shared {
     client: Client,
     /// This PC can decode 4:4:4, and it hasn't failed.
     can_444: AtomicBool,
+    /// The user wants 4:4:4 (Ctrl+Alt+Shift+C, `--colour`).
+    want_444: AtomicBool,
     /// The view mode last asked for.
     mode: AtomicU8,
     stop: AtomicBool,
@@ -121,6 +127,11 @@ struct Shared {
 }
 
 impl Shared {
+    /// 4:4:4 if this PC can decode it and the user wants it.
+    fn allow_444(&self) -> bool {
+        self.can_444.load(Ordering::Relaxed) && self.want_444.load(Ordering::Relaxed)
+    }
+
     fn end(&self, why: &str) {
         let mut r = self.reason.lock().unwrap_or_else(|e| e.into_inner());
         if r.is_none() {
@@ -263,6 +274,7 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
     let sh = Arc::new(Shared {
         client,
         can_444: AtomicBool::new(hello.caps & CAP_HEVC_444 != 0),
+        want_444: AtomicBool::new(opts.full_colour),
         mode: AtomicU8::new(hello.mode),
         stop: AtomicBool::new(false),
         reason: Mutex::new(None),
@@ -270,6 +282,10 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         rule: opts.rule,
     });
 
+    if !opts.full_colour && hello.caps & CAP_HEVC_444 != 0 {
+        // The host starts in 4:4:4 when it can; the user chose 4:2:0.
+        sh.client.set_mode(hello.mode, false);
+    }
     let hwnd = unsafe { create_window(&sh, mon, work, !opts.windowed)? };
     let (w, h) = client_size(hwnd);
     sh.size
@@ -1047,7 +1063,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let next = (sh.mode.load(Ordering::Relaxed) + 1) % MODE_COUNT;
                 sh.mode.store(next, Ordering::Relaxed);
                 println!("Asking the host for: {} ...", mode_name(next));
-                c.set_mode(next, sh.can_444.load(Ordering::Relaxed));
+                c.set_mode(next, sh.allow_444());
+                Some(LRESULT(0))
+            }
+            WM_TOGGLE_444 => {
+                let want = !sh.want_444.load(Ordering::Relaxed);
+                sh.want_444.store(want, Ordering::Relaxed);
+                if want && !sh.can_444.load(Ordering::Relaxed) {
+                    println!("Full colour (4:4:4) isn't available on this PC; staying on 4:2:0.");
+                } else {
+                    println!("Asking the host for {} ...", if want { "full colour (4:4:4)" } else { "4:2:0" });
+                }
+                c.set_mode(sh.mode.load(Ordering::Relaxed), sh.allow_444());
                 Some(LRESULT(0))
             }
             WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
@@ -1111,6 +1138,8 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                 if down && ui.ctrl && ui.alt && ui.shift {
                     let msg = if vk == VK_F.0 {
                         Some(WM_TOGGLE_FULLSCREEN)
+                    } else if vk == VK_C.0 {
+                        Some(WM_TOGGLE_444)
                     } else if vk == VK_R.0 {
                         Some(WM_NEXT_MODE)
                     } else if vk == VK_Q.0 || vk == VK_W.0 {

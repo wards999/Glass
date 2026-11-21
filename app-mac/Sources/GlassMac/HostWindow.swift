@@ -23,6 +23,8 @@ final class HostController: NSObject, NSWindowDelegate {
     private var lastReport: String?
     private var closed = false
     private var permissionTimer: Timer?
+    private var streamLabel: NSTextField!
+    private let testCard = TestCardController()
 
     func open() {
         buildWindow()
@@ -67,6 +69,8 @@ final class HostController: NSObject, NSWindowDelegate {
         pinLabel.font = .monospacedDigitSystemFont(ofSize: 34, weight: .bold)
         pinLabel.isHidden = true
         statusLabel = label("Starting…")
+        streamLabel = label("", size: 12)
+        streamLabel.textColor = .secondaryLabelColor
 
         screenRow = label("")
         screenButton = NSButton(title: "Open Settings…", target: self, action: #selector(openScreen))
@@ -80,11 +84,12 @@ final class HostController: NSObject, NSWindowDelegate {
         copyButton = NSButton(title: "Show Results", target: self, action: #selector(copyResults))
         copyButton.isEnabled = false
         let stop = NSButton(title: "Stop Sharing", target: self, action: #selector(stopSharing))
-        let buttons = NSStackView(views: [copyButton, NSView(), stop])
+        let card = NSButton(title: "Clarity Test Card", target: self, action: #selector(showTestCard))
+        let buttons = NSStackView(views: [copyButton, card, NSView(), stop])
 
         let sep = NSBox()
         sep.boxType = .separator
-        let stack = NSStackView(views: [title, addressLabel, pinLabel, statusLabel, sep, screenStack, accessStack, permNote, buttons])
+        let stack = NSStackView(views: [title, addressLabel, pinLabel, statusLabel, streamLabel, sep, screenStack, accessStack, permNote, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
@@ -98,7 +103,7 @@ final class HostController: NSObject, NSWindowDelegate {
             stack.topAnchor.constraint(equalTo: content.topAnchor),
             stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor),
         ]
-        for v in [title, addressLabel, statusLabel, sep, screenStack, accessStack, permNote, buttons] as [NSView] {
+        for v in [title, addressLabel, statusLabel, streamLabel, sep, screenStack, accessStack, permNote, buttons] as [NSView] {
             constraints.append(v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40))
         }
         NSLayoutConstraint.activate(constraints)
@@ -128,6 +133,9 @@ final class HostController: NSObject, NSWindowDelegate {
         do {
             let r = try HostRunner(device: device, options: .init(), banner: banner)
             r.onEvent = { [weak self] e in self?.event(e) }
+            r.onStreamChanged = { [weak self] line in
+                self?.streamLabel.stringValue = "Showing: \(line). The PC picks this with Ctrl+Alt+Shift+R."
+            }
             r.onConnected = { [weak self] name, addr in
                 self?.pinLabel.isHidden = true
                 self?.statusLabel.stringValue = "Connected: \u{201C}\(name)\u{201D} (\(addr)), encrypted. It sees this screen and controls the mouse and keyboard. Stop Sharing ends it."
@@ -180,6 +188,8 @@ final class HostController: NSObject, NSWindowDelegate {
     }
 
     @objc private func stopSharing() { window.close() }
+
+    @objc private func showTestCard() { testCard.show() }
 
     func windowWillClose(_ notification: Notification) {
         closed = true

@@ -3,9 +3,11 @@
 
 mod blocker;
 mod capture;
+mod cuda;
 mod cursor;
 mod d3d;
 mod decode;
+mod decode444;
 pub mod dpapi;
 mod encode;
 mod inject;
@@ -459,6 +461,7 @@ pub fn host(args: &[String]) -> Res<()> {
             width: w as u16,
             height: h as u16,
             fps: mon.refresh_hz as u16,
+            mode: glass_core::protocol::MODE_HOST_SCREEN, // LATER(M7): IddCx virtual display
         };
         println!("\nWaiting for a viewer on port {} ...", listener.port());
         let mut injector = inject::Injector {

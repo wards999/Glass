@@ -3,6 +3,10 @@
 //! `glass connect [HOST[:PORT]] [--pin PIN] [--seconds S] [--windowed]
 //!                [--keys pc|labelled] [--log FILE]`
 //!
+//! View modes (M3c): Ctrl+Alt+Shift+R while viewing cycles the host's own
+//! screen and three "fit to this PC" sizes; the last one is remembered per
+//! host address (`view-modes.txt`) and asked for when connecting.
+//!
 //! Keys: by default the PC's Ctrl acts as the Mac's ⌘ (so Ctrl+C copies)
 //! and Win as ⌃; `--keys labelled` sends them as labelled (for a PC host).
 //! LATER(M7): the host tells the viewer its OS, so this picks itself.
@@ -92,10 +96,14 @@ pub fn connect(args: &[String]) -> Res<()> {
     }
     let (host, port) = parse_address(&addr)?;
     let err = |e: ConnectError| -> Box<dyn Error> { format!("{host}:{port}: {e}").into() };
+    let modes_file = default_dir().unwrap_or_default().join("view-modes.txt");
+    let mode = saved_mode(&modes_file, &addr);
+    let prep = viewer::prepare(mode)?;
+    let hello = prep.hello;
 
     let mut fixed_pin = pin;
     let client = loop {
-        match Client::connect(&device, &host, port) {
+        match Client::connect_with(&device, &host, port, hello) {
             Ok(c) => break c,
             Err(ConnectError::NotPaired) => {
                 println!("This PC isn't paired with {host} yet. Asking it to show a PIN ...");
@@ -133,13 +141,20 @@ pub fn connect(args: &[String]) -> Res<()> {
     let info = client.info();
     println!(
         "Connected to \"{}\" ({}x{} @ {} Hz, encrypted). Ctrl+Alt+Shift+F: window / full screen, \
-         Ctrl+Alt+Shift+Q: disconnect.",
+         Ctrl+Alt+Shift+R: view ({}), Ctrl+Alt+Shift+Q: disconnect.{}",
         client.peer().name,
         info.width,
         info.height,
-        info.fps
+        info.fps,
+        viewer::mode_name(mode),
+        if hello.caps & glass_core::protocol::CAP_HEVC_444 != 0 {
+            " Full colour (4:4:4) is on when the host can send it."
+        } else {
+            ""
+        }
     );
-    let report = viewer::run(client, opts, &crate::banner())?;
+    let (report, last_mode) = viewer::run(client, prep, opts, &crate::banner())?;
+    save_mode(&modes_file, &addr, last_mode);
     println!("\n{report}");
     if let Some(path) = log {
         let mut f = std::fs::OpenOptions::new()
@@ -152,9 +167,44 @@ pub fn connect(args: &[String]) -> Res<()> {
     Ok(())
 }
 
+/// The view mode last used with `addr` (0 = the host's own screen).
+fn saved_mode(file: &std::path::Path, addr: &str) -> u8 {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.rsplit_once(' '))
+        .find(|(a, _)| *a == addr)
+        .and_then(|(_, m)| m.parse().ok())
+        .unwrap_or(0)
+}
+
+fn save_mode(file: &std::path::Path, addr: &str, mode: u8) {
+    let old = std::fs::read_to_string(file).unwrap_or_default();
+    let mut lines: Vec<String> = old
+        .lines()
+        .filter(|l| l.rsplit_once(' ').is_some_and(|(a, _)| a != addr))
+        .map(str::to_string)
+        .collect();
+    lines.push(format!("{addr} {mode}"));
+    let _ = std::fs::write(file, lines.join("\n") + "\n");
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_address;
+    use super::{parse_address, save_mode, saved_mode};
+
+    #[test]
+    fn modes_are_remembered_per_address() {
+        let f = std::env::temp_dir().join(format!("glass-modes-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&f);
+        assert_eq!(saved_mode(&f, "192.168.4.28"), 0);
+        save_mode(&f, "192.168.4.28", 2);
+        save_mode(&f, "mac.local:47811", 1);
+        save_mode(&f, "192.168.4.28", 3);
+        assert_eq!(saved_mode(&f, "192.168.4.28"), 3);
+        assert_eq!(saved_mode(&f, "mac.local:47811"), 1);
+        let _ = std::fs::remove_file(&f);
+    }
 
     #[test]
     fn addresses() {

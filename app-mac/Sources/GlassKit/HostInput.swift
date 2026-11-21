@@ -12,7 +12,7 @@ public func macKeyboardIsISO() -> Bool {
 /// Injects the viewer's input with CGEvent (needs Accessibility). Runs on
 /// core's UDP thread; all state is touched only there.
 public final class MacInputInjector: GlassInputHandler {
-    private let bounds: CGRect
+    private var _bounds: CGRect
     private let iso: Bool
     private let source = CGEventSource(stateID: .hidSystemState)
     /// Count only (CI / test pattern): nothing reaches macOS.
@@ -27,7 +27,7 @@ public final class MacInputInjector: GlassInputHandler {
     private var _counts = (keys: 0, clicks: 0, scrolls: 0, moves: 0)
 
     public init(display: HostDisplay, dryRun: Bool = false) {
-        bounds = display.bounds
+        _bounds = display.bounds
         iso = macKeyboardIsISO()
         self.dryRun = dryRun
         pos = CGPoint(x: display.bounds.midX, y: display.bounds.midY)
@@ -35,8 +35,12 @@ public final class MacInputInjector: GlassInputHandler {
 
     public var counts: (keys: Int, clicks: Int, scrolls: Int, moves: Int) { lock.withLock { _counts } }
 
+    /// The display input lands on (a view-mode change switches it).
+    public func setDisplay(_ d: HostDisplay) { lock.withLock { _bounds = d.bounds } }
+
     private func point(_ x: UInt16, _ y: UInt16) -> CGPoint {
-        CGPoint(x: bounds.minX + Double(x) / 65535 * max(bounds.width - 1, 1),
+        let bounds = lock.withLock { _bounds }
+        return CGPoint(x: bounds.minX + Double(x) / 65535 * max(bounds.width - 1, 1),
                 y: bounds.minY + Double(y) / 65535 * max(bounds.height - 1, 1))
     }
 

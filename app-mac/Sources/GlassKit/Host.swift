@@ -174,6 +174,22 @@ public final class GlassHostSession {
     public var streaming: Bool { ptr.map { glass_session_streaming($0) } ?? false }
     public func takeKeyframeRequest() -> Bool { ptr.map { glass_session_take_keyframe_request($0) } ?? false }
     public var inputSeq: UInt32 { ptr.map { glass_session_input_seq($0) } ?? 0 }
+    /// What the viewer said about itself: screen size, refresh, decode caps, wanted mode.
+    public var viewer: GLASS_ViewerHello { ptr.map { glass_session_viewer($0) } ?? GLASS_ViewerHello() }
+
+    /// A view-mode change the viewer asked for.
+    public func takeModeRequest() -> (mode: UInt8, allow444: Bool)? {
+        guard let ptr else { return nil }
+        var m: UInt8 = 0
+        var a = false
+        return glass_session_take_mode_request(ptr, &m, &a) ? (m, a) : nil
+    }
+
+    /// Tells the viewer the stream changes from the next IDR on.
+    @discardableResult
+    public func sendStreamChange(_ info: GLASS_StreamInfo) -> Bool {
+        ptr.map { glass_session_send_stream_change($0, info) } ?? false
+    }
     public var counters: GLASS_HostCounters { ptr.map { glass_session_counters($0) } ?? GLASS_HostCounters() }
 
     /// Sends an Annex-B frame. 1 sent, 0 not yet (viewer address unknown), -1 error.

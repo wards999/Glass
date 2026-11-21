@@ -31,6 +31,8 @@ View and control the Mac from this PC (connect.cmd):
   2. Double-click connect.cmd and type that address. The first time, the Mac
      shows a 6-digit PIN: type it here. The Mac opens full screen.
      Ctrl+Alt+Shift+F   window / full screen
+     Ctrl+Alt+Shift+R   view: the Mac's screen, or fit to this PC (like now /
+                        more space / larger); remembered for that Mac
      Ctrl+Alt+Shift+Q   disconnect (results print here and go to results-viewer.txt)
   Every other key goes to the Mac. Ctrl acts as Cmd (Ctrl+C copies), Win as
   Ctrl, Alt as Option. For a PC host instead: connect.cmd --keys labelled.

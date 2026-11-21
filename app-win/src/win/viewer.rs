@@ -8,22 +8,28 @@
 //!   friends go to the host while the window is in front), mouse messages,
 //!   and the host's pointer shape as this PC's own cursor (no round trip).
 //! - Local chords, never sent: Ctrl+Alt+Shift+F full screen/window,
-//!   Ctrl+Alt+Shift+Q disconnect.
+//!   Ctrl+Alt+Shift+R next view mode (M3c), Ctrl+Alt+Shift+Q disconnect.
+//! - 4:2:0 decodes on D3D11VA (any GPU); 4:4:4 on NVDEC (`decode444.rs`),
+//!   falling back to asking the host for 4:2:0 if that fails.
 //!
 //! LATER(M5): on-screen stats overlay; display-linked pacing.
 
-use super::decode::Decoder;
+use super::decode::{Decoder, Picture};
+use super::decode444::{self, CudaDecoder, Planar};
 use super::present::{fit, Presenter};
 use super::{d3d, Res};
 use glass_core::clock;
 use glass_core::input::{BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT};
 use glass_core::keymap::{pc_key_for_mac, win_scan_to_hid, PcModifierRule};
-use glass_core::net::{Client, Wait};
-use glass_core::protocol::{StreamInfo, NOTICE_NONE};
+use glass_core::net::{Client, ViewerHello, Wait};
+use glass_core::protocol::{
+    CAP_HEVC_444, MODE_COUNT, MODE_FIT, MODE_FIT_LARGER, MODE_FIT_MORE_SPACE, NOTICE_NONE,
+};
+use glass_core::recording::CHROMA_444;
 use glass_core::stats::{StatRing, Summary};
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use windows::core::{w, PCWSTR};
@@ -35,7 +41,9 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_F, VK_Q, VK_W};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, VK_F, VK_Q, VK_R, VK_W,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// How the viewer runs.
@@ -45,15 +53,66 @@ pub struct Options {
     pub rule: PcModifierRule,
 }
 
+/// Made before connecting: the GPU, and what `Hello` tells the host.
+pub struct Prepared {
+    gpu: d3d::Gpu,
+    pub hello: ViewerHello,
+    /// Monitor the window opens on: (full rect, work area, "WxH @ Hz").
+    monitor: (RECT, RECT, String),
+}
+
+/// The GPU, the screen under the pointer and whether 4:4:4 can be decoded
+/// (NVDEC); `mode` is the view mode to ask for.
+pub fn prepare(mode: u8) -> Res<Prepared> {
+    d3d::init_process();
+    // FFmpeg's own warnings would clutter the console; errors are reported.
+    unsafe { ffmpeg_sys_next::av_log_set_level(ffmpeg_sys_next::AV_LOG_ERROR) };
+    let gpu = d3d::Gpu::new_for_viewer()?;
+    let (mon, work, desc, hz) = monitor_at_pointer();
+    let caps = if decode444::available(&gpu.device) {
+        CAP_HEVC_444
+    } else {
+        0
+    };
+    Ok(Prepared {
+        hello: ViewerHello {
+            display_w: (mon.right - mon.left) as u16,
+            display_h: (mon.bottom - mon.top) as u16,
+            refresh_hz: hz,
+            caps,
+            mode: mode.min(MODE_COUNT - 1),
+        },
+        gpu,
+        monitor: (mon, work, desc),
+    })
+}
+
+/// "Mac's screen", "fit to this PC", ...
+pub fn mode_name(m: u8) -> &'static str {
+    match m {
+        MODE_FIT => "fit to this PC (like the Mac's own screen)",
+        MODE_FIT_MORE_SPACE => "fit to this PC, more space (1:1, smaller text)",
+        MODE_FIT_LARGER => "fit to this PC, larger",
+        _ => "the host's own screen (scaled to fit)",
+    }
+}
+
 const WM_RENDER_DONE: u32 = WM_APP + 1;
 /// Posted by the keyboard hook: toggle full screen (outside the hook).
 const WM_TOGGLE_FULLSCREEN: u32 = WM_APP + 2;
+/// Posted by the render thread: the stream's size/mode changed.
+const WM_STREAM_CHANGED: u32 = WM_APP + 3;
+/// Posted by the keyboard hook: ask the host for the next view mode.
+const WM_NEXT_MODE: u32 = WM_APP + 4;
 const TIMER_CURSOR: usize = 1;
 
 /// Shared by the UI and render threads.
 struct Shared {
     client: Client,
-    info: StreamInfo,
+    /// This PC can decode 4:4:4, and it hasn't failed.
+    can_444: AtomicBool,
+    /// The view mode last asked for.
+    mode: AtomicU8,
     stop: AtomicBool,
     reason: Mutex<Option<String>>,
     /// Client size, `w << 32 | h` (UI -> render).
@@ -79,7 +138,11 @@ struct Report {
     superseded: u64,
     decode_errors: u64,
     last_error: Option<String>,
+    /// What was shown, in order ("fit to this PC 2560x1440 4:4:4 (NVDEC)").
+    views: Vec<String>,
     exact_present: bool,
+    /// On-screen times Windows reported as earlier than the present call.
+    stats_before_submit: u64,
     encode: StatRing,
     network: StatRing,
     queue: StatRing,
@@ -140,8 +203,8 @@ fn span(later: u64, earlier: u64) -> u32 {
     later.saturating_sub(earlier).min(u32::MAX as u64) as u32
 }
 
-/// The monitor under the pointer: (full rect, work area, "WxH @ Hz").
-fn monitor_at_pointer() -> (RECT, RECT, String) {
+/// The monitor under the pointer: (full rect, work area, "WxH @ Hz", Hz).
+fn monitor_at_pointer() -> (RECT, RECT, String, u16) {
     unsafe {
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -153,13 +216,13 @@ fn monitor_at_pointer() -> (RECT, RECT, String) {
             dmSize: std::mem::size_of::<DEVMODEW>() as u16,
             ..Default::default()
         };
-        let desc = if EnumDisplaySettingsW(
+        let ok = EnumDisplaySettingsW(
             PCWSTR(info.szDevice.as_ptr()),
             ENUM_CURRENT_SETTINGS,
             &mut dm,
         )
-        .as_bool()
-        {
+        .as_bool();
+        let desc = if ok {
             format!(
                 "{}x{} @ {} Hz",
                 dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency
@@ -167,7 +230,13 @@ fn monitor_at_pointer() -> (RECT, RECT, String) {
         } else {
             "unknown display".into()
         };
-        (info.monitorInfo.rcMonitor, info.monitorInfo.rcWork, desc)
+        let hz = if ok { dm.dmDisplayFrequency as u16 } else { 0 };
+        (
+            info.monitorInfo.rcMonitor,
+            info.monitorInfo.rcWork,
+            desc,
+            hz,
+        )
     }
 }
 
@@ -182,16 +251,19 @@ fn client_size(hwnd: HWND) -> (u32, u32) {
     )
 }
 
-/// Shows `client` until it ends; returns the report.
-pub fn run(client: Client, opts: Options, banner: &str) -> Res<String> {
-    d3d::init_process();
-    let gpu = d3d::Gpu::new_for_viewer()?;
-    let info = client.info();
+/// Shows `client` until it ends; returns the report and the view mode last
+/// asked for (to remember for this host).
+pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(String, u8)> {
+    let Prepared {
+        gpu,
+        hello,
+        monitor: (mon, work, display),
+    } = prep;
     let started = clock::now_us();
-    let (mon, work, display) = monitor_at_pointer();
     let sh = Arc::new(Shared {
         client,
-        info,
+        can_444: AtomicBool::new(hello.caps & CAP_HEVC_444 != 0),
+        mode: AtomicU8::new(hello.mode),
         stop: AtomicBool::new(false),
         reason: Mutex::new(None),
         size: AtomicU64::new(0),
@@ -258,6 +330,7 @@ pub fn run(client: Client, opts: Options, banner: &str) -> Res<String> {
         .clone()
         .unwrap_or_else(|| "viewer closed".into());
     let host = sh.client.host();
+    let info = sh.client.info();
     let mut out = String::new();
     use std::fmt::Write;
     let _ = writeln!(out, "{banner}");
@@ -316,11 +389,25 @@ pub fn run(client: Client, opts: Options, banner: &str) -> Res<String> {
     );
     let _ = writeln!(
         out,
-        "  decoder: D3D11VA hardware | present timing: {}",
-        if r.exact_present {
-            "DXGI frame statistics"
+        "  shown: {} | 4:4:4 decode on this PC: {} | present timing: {}",
+        r.views.join(" -> "),
+        if hello.caps & CAP_HEVC_444 == 0 {
+            "no"
+        } else if sh.can_444.load(Ordering::Relaxed) {
+            "yes (NVDEC)"
         } else {
-            "estimated (no frame statistics)"
+            "failed"
+        },
+        if !r.exact_present {
+            "estimated (no frame statistics)".to_string()
+        } else if r.stats_before_submit > 0 {
+            format!(
+                "DXGI frame statistics ({} of {} implausible, counted as the present call)",
+                r.stats_before_submit,
+                r.present.summary().count
+            )
+        } else {
+            "DXGI frame statistics".to_string()
         }
     );
     if let Some(e) = &r.last_error {
@@ -339,7 +426,41 @@ pub fn run(client: Client, opts: Options, banner: &str) -> Res<String> {
     ] {
         let _ = writeln!(out, "{}", line(name, &s.summary()));
     }
-    Ok(out)
+    Ok((out, sh.mode.load(Ordering::Relaxed)))
+}
+
+/// The decoder for the current stream: D3D11VA (4:2:0), or NVDEC (4:4:4).
+enum Dec {
+    Hw(Decoder),
+    Nv(CudaDecoder),
+}
+
+enum Pic {
+    Hw(Picture),
+    Nv(Planar),
+}
+
+fn view_line(info: &glass_core::protocol::StreamInfo, dec: &Dec) -> String {
+    format!(
+        "{} {}x{} {} ({})",
+        match info.mode {
+            0 => "host's screen",
+            MODE_FIT => "fit",
+            MODE_FIT_MORE_SPACE => "fit, more space",
+            _ => "fit, larger",
+        },
+        info.width,
+        info.height,
+        if info.chroma == CHROMA_444 {
+            "4:4:4"
+        } else {
+            "4:2:0"
+        },
+        match dec {
+            Dec::Hw(_) => "D3D11VA",
+            Dec::Nv(_) => "NVDEC",
+        }
+    )
 }
 
 /// A present waiting for its on-screen time.
@@ -359,7 +480,18 @@ fn render_loop(
     seconds: Option<f64>,
 ) -> Res<()> {
     let c = &sh.client;
-    let mut dec = Decoder::new(device)?;
+    let make = |info: &glass_core::protocol::StreamInfo| -> Res<Dec> {
+        Ok(if info.chroma == CHROMA_444 {
+            Dec::Nv(CudaDecoder::new(device)?)
+        } else {
+            Dec::Hw(Decoder::new(device)?)
+        })
+    };
+    let mut info = c.info();
+    let mut seen_changes = c.info_changes();
+    let mut dec = make(&info)?;
+    r.views.push(view_line(&info, &dec));
+    let mut errors_in_row = 0u32;
     let size = sh.size.load(Ordering::Relaxed);
     let mut pres = Presenter::new(device, hwnd, ((size >> 32) as u32, size as u32))?;
     let mut pending: VecDeque<Pending> = VecDeque::with_capacity(16);
@@ -400,8 +532,32 @@ fn render_loop(
             break;
         }
 
+        // The host changed the stream (view mode, size, chroma).
+        if c.info_changes() != seen_changes {
+            seen_changes = c.info_changes();
+            let new = c.info();
+            if new.chroma != info.chroma || matches!(dec, Dec::Nv(_)) != (new.chroma == CHROMA_444)
+            {
+                match make(&new) {
+                    Ok(d) => dec = d,
+                    Err(e) => {
+                        // Can't decode 4:4:4 here after all: ask for 4:2:0.
+                        r.last_error = Some(e.to_string());
+                        sh.can_444.store(false, Ordering::Relaxed);
+                        c.set_mode(sh.mode.load(Ordering::Relaxed), false);
+                    }
+                }
+            }
+            info = new;
+            r.views.push(view_line(&info, &dec));
+            errors_in_row = 0;
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_STREAM_CHANGED, WPARAM(0), LPARAM(0));
+            }
+        }
+
         // Decode everything waiting; show only the newest picture.
-        let mut newest: Option<(super::decode::Picture, u64, u32)> = None;
+        let mut newest: Option<(Pic, u64, u32)> = None;
         let mut timeout = Duration::from_millis(20);
         loop {
             match c.wait_frame(timeout) {
@@ -416,11 +572,15 @@ fn render_loop(
                         r.network
                             .push(span(meta.last_packet_us, capture + meta.encode_us as u64));
                     }
-                    let res = dec.decode(data);
+                    let res = match &mut dec {
+                        Dec::Hw(d) => d.decode(data).map(|p| p.map(Pic::Hw)),
+                        Dec::Nv(d) => d.decode(data).map(|p| p.map(Pic::Nv)),
+                    };
                     c.release_frame();
                     r.decode.push(span(clock::now_us(), t0));
                     match res {
                         Ok(Some(pic)) => {
+                            errors_in_row = 0;
                             if newest.is_some() {
                                 r.superseded += 1;
                             }
@@ -431,6 +591,12 @@ fn render_loop(
                             r.decode_errors += 1;
                             r.last_error = Some(e.to_string());
                             c.request_keyframe();
+                            errors_in_row += 1;
+                            if errors_in_row == 30 && matches!(dec, Dec::Nv(_)) {
+                                // 4:4:4 keeps failing here: ask for 4:2:0.
+                                sh.can_444.store(false, Ordering::Relaxed);
+                                c.set_mode(sh.mode.load(Ordering::Relaxed), false);
+                            }
                         }
                     }
                     timeout = Duration::ZERO;
@@ -445,7 +611,10 @@ fn render_loop(
 
         if let Some((pic, capture, input_seq)) = newest {
             r.wait.push(pres.wait_ready(100) as u32);
-            pres.draw(&pic)?;
+            match &pic {
+                Pic::Hw(p) => pres.draw(p)?,
+                Pic::Nv(p) => pres.draw_planar(p)?,
+            }
             let submit = clock::now_us();
             let id = pres.present()?;
             r.presented += 1;
@@ -470,6 +639,14 @@ fn render_loop(
                     }
                     pending.pop_front();
                     if p.id == count {
+                        // Windows sometimes reports a time before the
+                        // present (composed windows): don't trust those.
+                        let shown = if shown < p.submit {
+                            r.stats_before_submit += 1;
+                            p.submit
+                        } else {
+                            shown
+                        };
                         record(r, p, shown, &mut last_shown);
                     }
                 }
@@ -518,7 +695,7 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
         (WS_OVERLAPPEDWINDOW, windowed_rect)
     };
     let title = wide(&format!(
-        "Glass - {}  (Ctrl+Alt+Shift+F full screen, Ctrl+Alt+Shift+Q disconnect)",
+        "Glass - {}  (Ctrl+Alt+Shift+F full screen, +R view, +Q disconnect)",
         sh.client.peer().name
     ));
     let hwnd = CreateWindowExW(
@@ -571,10 +748,8 @@ impl Ui {
         self.sh
             .size
             .store((w as u64) << 32 | h as u64, Ordering::Relaxed);
-        self.dest = fit(
-            (w, h),
-            (self.sh.info.width as u32, self.sh.info.height as u32),
-        );
+        let info = self.sh.client.info();
+        self.dest = fit((w, h), (info.width as u32, info.height as u32));
         if self.dest.right - self.dest.left != self.dest_width {
             self.dest_width = self.dest.right - self.dest.left;
             self.cursor_gen = self.cursor_gen.wrapping_sub(1); // rescale the pointer
@@ -649,7 +824,7 @@ impl Ui {
         let shape = (info.width, info.height, info.hot_x, info.hot_y);
         let n = info.width as usize * info.height as usize * 4;
         if n > 0 && self.rgba.len() >= n {
-            let scale = self.dest_width.max(1) as f64 / self.sh.info.width.max(1) as f64;
+            let scale = self.dest_width.max(1) as f64 / self.sh.client.info().width.max(1) as f64;
             if let Some(c) = unsafe { make_cursor(&self.rgba[..n], shape, scale) } {
                 if let Some(old) = self.host_cursor.replace(c) {
                     unsafe {
@@ -847,6 +1022,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 ui.toggle_fullscreen();
                 Some(LRESULT(0))
             }
+            WM_STREAM_CHANGED => {
+                ui.layout();
+                let i = c.info();
+                println!(
+                    "Now showing: {} at {}x{}, {}.",
+                    mode_name(i.mode),
+                    i.width,
+                    i.height,
+                    if i.chroma == CHROMA_444 {
+                        "full colour 4:4:4"
+                    } else {
+                        "4:2:0"
+                    }
+                );
+                Some(LRESULT(0))
+            }
+            WM_NEXT_MODE => {
+                let next = (sh.mode.load(Ordering::Relaxed) + 1) % MODE_COUNT;
+                sh.mode.store(next, Ordering::Relaxed);
+                println!("Asking the host for: {} ...", mode_name(next));
+                c.set_mode(next, sh.can_444.load(Ordering::Relaxed));
+                Some(LRESULT(0))
+            }
             WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
                 // Let go of everything so nothing stays held on the host.
                 c.input_release_all();
@@ -906,25 +1104,18 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                     _ => {}
                 }
                 if down && ui.ctrl && ui.alt && ui.shift {
-                    let chord = if vk == VK_F.0 {
-                        Some(true)
+                    let msg = if vk == VK_F.0 {
+                        Some(WM_TOGGLE_FULLSCREEN)
+                    } else if vk == VK_R.0 {
+                        Some(WM_NEXT_MODE)
                     } else if vk == VK_Q.0 || vk == VK_W.0 {
-                        Some(false)
+                        Some(WM_CLOSE)
                     } else {
                         None
                     };
-                    if let Some(full) = chord {
+                    if let Some(msg) = msg {
                         ui.sh.client.input_release_all();
-                        if full {
-                            let _ = PostMessageW(
-                                Some(ui.hwnd),
-                                WM_TOGGLE_FULLSCREEN,
-                                WPARAM(0),
-                                LPARAM(0),
-                            );
-                        } else {
-                            let _ = PostMessageW(Some(ui.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-                        }
+                        let _ = PostMessageW(Some(ui.hwnd), msg, WPARAM(0), LPARAM(0));
                         return true;
                     }
                 }

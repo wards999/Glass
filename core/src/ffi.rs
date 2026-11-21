@@ -8,7 +8,7 @@ use crate::input::InputAction;
 use crate::keymap::{self, ModifierRule};
 use crate::net::{
     pair_begin, Client, ClientStats, ConnectError, CursorInfo, HostCounters, HostEvent,
-    HostListener, HostOptions, HostSession, LiveFrameMeta, Pairing, Wait,
+    HostListener, HostOptions, HostSession, LiveFrameMeta, Pairing, ViewerHello, Wait,
 };
 use crate::packet::OutFrame;
 use crate::protocol::{CursorShape, StreamInfo};
@@ -437,7 +437,12 @@ pub unsafe extern "C" fn glass_client_connect(
         set_err(err, ConnectError::Resolve as i32);
         return std::ptr::null_mut();
     };
-    match Client::connect(&(*d).0, host, port) {
+    // The Mac viewer decodes 4:4:4 (VideoToolbox). LATER(M7): its screen size.
+    let hello = ViewerHello {
+        caps: crate::protocol::CAP_HEVC_444,
+        ..Default::default()
+    };
+    match Client::connect_with(&(*d).0, host, port, hello) {
         Ok(c) => {
             set_err(err, 0);
             Box::into_raw(Box::new(c))
@@ -962,6 +967,47 @@ pub unsafe extern "C" fn glass_session_take_keyframe_request(s: *const HostSessi
     (*s).take_keyframe_request()
 }
 
+/// The viewer's screen, decode capabilities and wanted view mode (`Hello`).
+///
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_viewer(s: *const HostSession) -> ViewerHello {
+    (*s).viewer
+}
+
+/// Takes a view-mode change the viewer asked for. False if none.
+///
+/// # Safety
+/// `s` from `glass_host_accept`; `mode` and `allow_444` writable.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_take_mode_request(
+    s: *const HostSession,
+    mode: *mut u8,
+    allow_444: *mut bool,
+) -> bool {
+    match (*s).take_mode_request() {
+        Some((m, a)) => {
+            *mode = m;
+            *allow_444 = a;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Tells the viewer the stream changes from the next IDR on.
+///
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_send_stream_change(
+    s: *mut HostSession,
+    info: StreamInfo,
+) -> bool {
+    (*s).send_stream_change(info).is_ok()
+}
+
 /// Latest input packet applied; stamp it on the next captured frame.
 ///
 /// # Safety
@@ -1330,6 +1376,7 @@ mod tests {
         use std::sync::atomic::AtomicU64;
         static INPUTS: AtomicU64 = AtomicU64::new(0);
         static PINS: AtomicU64 = AtomicU64::new(0);
+        static MODE_SEEN: AtomicU64 = AtomicU64::new(0);
         unsafe extern "C" fn on_event(_ctx: *mut c_void, e: *const HostEventC) {
             if (*e).kind == HOST_EVENT_PAIRING_PIN {
                 assert_eq!(
@@ -1374,6 +1421,7 @@ mod tests {
                 width: 64,
                 height: 32,
                 fps: 60,
+                mode: 0,
             };
             let acceptor = std::thread::spawn(move || {
                 let hp = hp;
@@ -1400,6 +1448,27 @@ mod tests {
                             }
                             std::thread::sleep(Duration::from_millis(5));
                         }
+                        // The viewer's Hello, then a mode switch round trip.
+                        let v = glass_session_viewer(s);
+                        assert_eq!((v.display_w, v.display_h, v.refresh_hz), (2560, 1440, 165));
+                        assert_eq!((v.caps, v.mode), (crate::protocol::CAP_HEVC_444, 1));
+                        let (mut m, mut a) = (0u8, true);
+                        for _ in 0..500 {
+                            if glass_session_take_mode_request(s, &mut m, &mut a) {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        assert_eq!((m, a), (2, false));
+                        let changed = StreamInfo {
+                            width: 128,
+                            mode: m,
+                            ..info
+                        };
+                        assert!(glass_session_send_stream_change(s, changed));
+                        while MODE_SEEN.load(Ordering::Relaxed) == 0 {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
                         let mut name = [0 as c_char; 64];
                         glass_session_peer_name(s, name.as_mut_ptr(), name.len());
                         assert_eq!(
@@ -1416,7 +1485,14 @@ mod tests {
             let p = pair_begin(&viewer, "127.0.0.1", port).unwrap();
             assert_eq!(p.host_name(), "FFI Mac");
             p.finish("112233").unwrap();
-            let c = Client::connect(&viewer, "127.0.0.1", port).unwrap();
+            let hello = crate::net::ViewerHello {
+                display_w: 2560,
+                display_h: 1440,
+                refresh_hz: 165,
+                caps: crate::protocol::CAP_HEVC_444,
+                mode: 1,
+            };
+            let c = Client::connect_with(&viewer, "127.0.0.1", port, hello).unwrap();
             let mut frames = 0;
             while frames < 5 {
                 if let Wait::Frame(..) = c.wait_frame(Duration::from_secs(5)) {
@@ -1431,6 +1507,13 @@ mod tests {
             while INPUTS.load(Ordering::Relaxed) < 2 {
                 std::thread::sleep(Duration::from_millis(5));
             }
+            assert_eq!(c.info_changes(), 0);
+            c.set_mode(2, false);
+            while c.info_changes() == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!((c.info().width, c.info().mode), (128, 2));
+            MODE_SEEN.store(1, Ordering::Relaxed);
             drop(c);
             // Third accept is woken up.
             std::thread::sleep(Duration::from_millis(100));

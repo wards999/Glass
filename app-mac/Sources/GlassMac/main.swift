@@ -25,8 +25,9 @@ func usage() {
       GlassMac connect HOST[:PORT] [--pin PIN] [--seconds S]
                                          live viewer; prints results when it ends.
                                          Not paired yet: --pin with the PIN the host shows.
-      GlassMac host [--test-pattern] [--pin PIN] [--port P] [--mbps M] [--seconds S]
+      GlassMac host [--test-pattern] [--pin PIN] [--port P] [--mbps M] [--seconds S] [--no-444] [--measure]
                                          share this Mac; with --seconds, exits after one session.
+                                         --measure: sharpness (PSNR) of what is sent.
                                          --test-pattern: synthetic picture, input not injected.
       GlassMac check-444                 can this Mac hardware-encode HEVC 4:4:4?
     Or open Glass.app and connect to the PC (run host.cmd there), or Share This Mac.
@@ -88,6 +89,8 @@ if args.first == "play", args.count >= 2 {
     func value(_ flag: String) -> String? { args.firstIndex(of: flag).flatMap { args.dropFirst($0 + 1).first } }
     var o = HostRunner.Options()
     o.testPattern = args.contains("--test-pattern")
+    o.allow444 = !args.contains("--no-444")
+    HostRunner.measureQuality = args.contains("--measure")
     o.fixedPin = value("--pin")
     if let p = value("--port").flatMap({ UInt16($0) }) { o.port = p }
     if let m = value("--mbps").flatMap({ Int($0) }) { o.mbps = m }
@@ -103,6 +106,7 @@ if args.first == "play", args.count >= 2 {
     do {
         let runner = try HostRunner(device: device, options: o, banner: banner)
         runner.onEvent = { print($0.text) }
+        runner.onStreamChanged = { print("Streaming: \($0)") }
         runner.onConnected = { name, addr in print("Viewer connected: \u{201C}\(name)\u{201D} from \(addr) (encrypted)") }
         runner.onSessionEnd = { report in
             print(report)

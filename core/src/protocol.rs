@@ -1,10 +1,12 @@
 //! Wire formats. `docs/protocol.md` is the source of truth; keep them in sync and
 //! bump [`PROTOCOL_VERSION`] on any change.
 
-/// Protocol version. 4 = M6: the control connection is mutual TLS 1.3 with
-/// pinned certificates, PIN pairing messages, and every UDP datagram is
-/// AES-GCM sealed (`seal.rs`). v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 4;
+/// Protocol version. 5 = M3c: the viewer describes its screen and what it
+/// can decode in `Hello`, picks a view mode (`SetMode`), and the host
+/// announces new stream parameters mid-session (`StreamChange`).
+/// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
+/// datagrams. v3 = M3: input, cursor, `HostNotice`.
+pub const PROTOCOL_VERSION: u8 = 5;
 
 /// Default TCP control port; the host's UDP media socket uses the same number.
 pub const DEFAULT_PORT: u16 = 47800;
@@ -152,7 +154,25 @@ pub struct StreamInfo {
     pub height: u16,
     /// Host display refresh rate (capture rate cap).
     pub fps: u16,
+    /// `MODE_*` the host is streaming.
+    pub mode: u8,
 }
+
+/// View modes (viewer's choice; the host may fall back to `MODE_HOST_SCREEN`).
+/// The host's own screen, scaled on the viewer to fit.
+pub const MODE_HOST_SCREEN: u8 = 0;
+/// A host display at the viewer's pixel size; things look about as big as on
+/// the host's own screen (Mac: HiDPI "looks like" viewer size / 1.5).
+pub const MODE_FIT: u8 = 1;
+/// A host display at the viewer's pixel size at 1x: most space, smaller text.
+pub const MODE_FIT_MORE_SPACE: u8 = 2;
+/// A host display at the viewer's pixel size at 2x: larger text.
+pub const MODE_FIT_LARGER: u8 = 3;
+pub const MODE_COUNT: u8 = 4;
+
+/// `Hello::caps` bits.
+/// The viewer can decode HEVC 4:4:4 (8-bit).
+pub const CAP_HEVC_444: u8 = 1;
 
 /// `HostNotice` codes: why the host can't do what the viewer expects.
 pub const NOTICE_NONE: u8 = 0;
@@ -207,11 +227,15 @@ pub fn encode_pair(kind: u8, body: &[u8], out: &mut Vec<u8>) -> bool {
 /// type + body) then `u8 type` then the body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
-    /// Client -> host, first message. Display size is informational until M7.
+    /// Client -> host, first message: the viewer's screen (pixels, Hz; 0 =
+    /// unknown), what it can decode (`CAP_*`) and the view mode it wants.
     Hello {
         version: u8,
         display_w: u16,
         display_h: u16,
+        refresh_hz: u16,
+        caps: u8,
+        mode: u8,
     },
     /// Host -> client reply to Hello.
     Welcome {
@@ -247,6 +271,16 @@ pub enum Control {
     HostNotice {
         code: u8,
     },
+    /// Client -> host: switch to view mode `mode` (`MODE_*`); `allow_444`
+    /// false asks for 4:2:0 (e.g. after 4:4:4 failed to decode).
+    SetMode {
+        mode: u8,
+        allow_444: bool,
+    },
+    /// Host -> client: from the next IDR on, frames have these parameters.
+    StreamChange {
+        info: StreamInfo,
+    },
 }
 
 /// Largest encoded control message (including the 2-byte length).
@@ -272,6 +306,8 @@ impl Control {
             Control::Bye => 7,
             Control::CursorVisible { .. } => 9,
             Control::HostNotice { .. } => 10,
+            Control::SetMode { .. } => 15,
+            Control::StreamChange { .. } => 16,
         }
     }
 
@@ -287,10 +323,22 @@ impl Control {
                 version,
                 display_w,
                 display_h,
+                refresh_hz,
+                caps,
+                mode,
             } => {
                 put(&[version]);
                 put(&display_w.to_be_bytes());
                 put(&display_h.to_be_bytes());
+                put(&refresh_hz.to_be_bytes());
+                put(&[caps, mode]);
+            }
+            Control::SetMode { mode, allow_444 } => put(&[mode, allow_444 as u8]),
+            Control::StreamChange { info } => {
+                put(&[info.codec, info.chroma, info.mode, 0]);
+                put(&info.width.to_be_bytes());
+                put(&info.height.to_be_bytes());
+                put(&info.fps.to_be_bytes());
             }
             Control::Welcome {
                 version,
@@ -298,7 +346,7 @@ impl Control {
                 udp_port,
                 session_id,
             } => {
-                put(&[version, info.codec, info.chroma, 0]);
+                put(&[version, info.codec, info.chroma, info.mode]);
                 put(&info.width.to_be_bytes());
                 put(&info.height.to_be_bytes());
                 put(&info.fps.to_be_bytes());
@@ -340,13 +388,15 @@ impl Control {
         let u32_at = |i: usize| u32::from_be_bytes(b[i..i + 4].try_into().unwrap());
         let u64_at = |i: usize| u64::from_be_bytes(b[i..i + 8].try_into().unwrap());
         let want = match kind {
-            1 => 5,
+            1 => 9,
             2 => 16,
             3 => 1,
             4 => 12,
             5 => 20,
             6 | 7 => 0,
             9 | 10 => 1,
+            15 => 2,
+            16 => 10,
             _ => return Err(ControlError::Malformed),
         };
         if b.len() != want {
@@ -357,12 +407,16 @@ impl Control {
                 version: b[0],
                 display_w: u16_at(1),
                 display_h: u16_at(3),
+                refresh_hz: u16_at(5),
+                caps: b[7],
+                mode: b[8],
             },
             2 => Control::Welcome {
                 version: b[0],
                 info: StreamInfo {
                     codec: b[1],
                     chroma: b[2],
+                    mode: b[3],
                     width: u16_at(4),
                     height: u16_at(6),
                     fps: u16_at(8),
@@ -383,6 +437,20 @@ impl Control {
             6 => Control::KeyframeRequest,
             9 => Control::CursorVisible { visible: b[0] != 0 },
             10 => Control::HostNotice { code: b[0] },
+            15 => Control::SetMode {
+                mode: b[0],
+                allow_444: b[1] != 0,
+            },
+            16 => Control::StreamChange {
+                info: StreamInfo {
+                    codec: b[0],
+                    chroma: b[1],
+                    mode: b[2],
+                    width: u16_at(4),
+                    height: u16_at(6),
+                    fps: u16_at(8),
+                },
+            },
             _ => Control::Bye,
         };
         Ok(msg)
@@ -506,6 +574,23 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 display_w: 2940,
                 display_h: 1912,
+                refresh_hz: 120,
+                caps: CAP_HEVC_444,
+                mode: MODE_FIT_MORE_SPACE,
+            },
+            Control::SetMode {
+                mode: MODE_FIT,
+                allow_444: false,
+            },
+            Control::StreamChange {
+                info: StreamInfo {
+                    codec: 1,
+                    chroma: 1,
+                    width: 2560,
+                    height: 1440,
+                    fps: 60,
+                    mode: MODE_FIT,
+                },
             },
             Control::Welcome {
                 version: PROTOCOL_VERSION,
@@ -515,6 +600,7 @@ mod tests {
                     width: 2560,
                     height: 1440,
                     fps: 165,
+                    mode: MODE_HOST_SCREEN,
                 },
                 udp_port: 47800,
                 session_id: 0xA1B2_C3D4,

@@ -3,9 +3,18 @@
 //! scales into the letterboxed picture area in one pass.
 
 use super::decode::{Color, Picture};
+use super::decode444::Planar;
 use super::Res;
 use windows::core::Interface;
 use windows::Win32::Foundation::{HANDLE, HWND, RECT};
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D::{ID3DBlob, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Buffer, ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView,
+    ID3D11SamplerState, ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BUFFER_DESC,
+    D3D11_COMPARISON_NEVER, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_FILTER_MIN_MAG_MIP_POINT,
+    D3D11_SAMPLER_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT,
+};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoContext1, ID3D11VideoDevice,
     ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
@@ -58,7 +67,114 @@ struct Processor {
     color: Option<Color>,
 }
 
+/// YCbCr 4:4:4 planes -> RGB (shader path for NVDEC pictures).
+struct Shader {
+    vs: ID3D11VertexShader,
+    ps: ID3D11PixelShader,
+    point: ID3D11SamplerState,
+    linear: ID3D11SamplerState,
+    cb: ID3D11Buffer,
+    color: Option<Color>,
+}
+
+const SHADER: &str = r#"
+Texture2D<float> Y : register(t0);
+Texture2D<float> U : register(t1);
+Texture2D<float> V : register(t2);
+SamplerState S : register(s0);
+cbuffer C : register(b0) { float4 m0; float4 m1; float4 m2; float4 off; };
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VSOut vs(uint id : SV_VertexID) {
+    VSOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.uv = uv;
+    o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+float4 ps(VSOut i) : SV_Target {
+    float3 yuv = float3(Y.Sample(S, i.uv), U.Sample(S, i.uv), V.Sample(S, i.uv)) - off.xyz;
+    return float4(saturate(float3(dot(m0.xyz, yuv), dot(m1.xyz, yuv), dot(m2.xyz, yuv))), 1);
+}
+"#;
+
+/// Rows of the YCbCr -> RGB matrix and the offsets, as the shader takes them.
+fn matrix(c: Color) -> [f32; 16] {
+    let (kr, kb) = if c.bt709 {
+        (0.2126f32, 0.0722f32)
+    } else {
+        (0.299, 0.114)
+    };
+    let kg = 1.0 - kr - kb;
+    let (ys, cs, yoff) = if c.full_range {
+        (1.0f32, 1.0f32, 0.0f32)
+    } else {
+        (255.0 / 219.0, 255.0 / 224.0, 16.0 / 255.0)
+    };
+    let rv = 2.0 * (1.0 - kr);
+    let bu = 2.0 * (1.0 - kb);
+    let gu = -bu * kb / kg;
+    let gv = -rv * kr / kg;
+    let coff = 128.0 / 255.0;
+    [
+        ys,
+        0.0,
+        rv * cs,
+        0.0, //
+        ys,
+        gu * cs,
+        gv * cs,
+        0.0, //
+        ys,
+        bu * cs,
+        0.0,
+        0.0, //
+        yoff,
+        coff,
+        coff,
+        0.0,
+    ]
+}
+
+unsafe fn compile(entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Res<ID3DBlob> {
+    let mut code = None;
+    let mut errors = None;
+    let r = D3DCompile(
+        SHADER.as_ptr() as *const _,
+        SHADER.len(),
+        windows::core::s!("glass"),
+        None,
+        None,
+        entry,
+        target,
+        0,
+        0,
+        &mut code,
+        Some(&mut errors),
+    );
+    if let Err(e) = r {
+        let msg = errors
+            .map(|b: ID3DBlob| {
+                let s = std::slice::from_raw_parts(
+                    b.GetBufferPointer() as *const u8,
+                    b.GetBufferSize(),
+                );
+                String::from_utf8_lossy(s).into_owned()
+            })
+            .unwrap_or_default();
+        return Err(format!("shader: {e} {msg}").into());
+    }
+    Ok(code.ok_or("no shader code")?)
+}
+
+fn blob(b: &ID3DBlob) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()) }
+}
+
 pub struct Presenter {
+    device: ID3D11Device,
+    ctx: ID3D11DeviceContext,
+    shader: Option<Shader>,
+    rtv: Option<ID3D11RenderTargetView>,
     vdev: ID3D11VideoDevice,
     vctx: ID3D11VideoContext,
     swap: IDXGISwapChain2,
@@ -108,6 +224,10 @@ impl Presenter {
             swap.SetMaximumFrameLatency(1)?;
             let waitable = swap.GetFrameLatencyWaitableObject();
             Ok(Self {
+                device: device.clone(),
+                ctx: device.GetImmediateContext()?,
+                shader: None,
+                rtv: None,
                 vdev: device.cast()?,
                 vctx: device.GetImmediateContext()?.cast()?,
                 swap,
@@ -126,6 +246,7 @@ impl Presenter {
             return Ok(());
         }
         self.out_view = None;
+        self.rtv = None;
         unsafe {
             self.swap
                 .ResizeBuffers(0, size.0, size.1, DXGI_FORMAT_UNKNOWN, FLAGS)?
@@ -306,6 +427,104 @@ impl Presenter {
             let [s] = streams;
             drop(std::mem::ManuallyDrop::into_inner(s.pInputSurface));
             r?;
+        }
+        Ok(())
+    }
+
+    fn shader(&mut self) -> Res<&mut Shader> {
+        if self.shader.is_none() {
+            unsafe {
+                let vsb = compile(windows::core::s!("vs"), windows::core::s!("vs_4_0"))?;
+                let psb = compile(windows::core::s!("ps"), windows::core::s!("ps_4_0"))?;
+                let mut vs = None;
+                self.device
+                    .CreateVertexShader(blob(&vsb), None, Some(&mut vs))?;
+                let mut ps = None;
+                self.device
+                    .CreatePixelShader(blob(&psb), None, Some(&mut ps))?;
+                let sampler = |filter| -> Res<ID3D11SamplerState> {
+                    let d = D3D11_SAMPLER_DESC {
+                        Filter: filter,
+                        AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                        AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                        AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                        ComparisonFunc: D3D11_COMPARISON_NEVER,
+                        MaxLOD: f32::MAX,
+                        ..Default::default()
+                    };
+                    let mut s = None;
+                    self.device.CreateSamplerState(&d, Some(&mut s))?;
+                    Ok(s.ok_or("no sampler")?)
+                };
+                let point = sampler(D3D11_FILTER_MIN_MAG_MIP_POINT)?;
+                let linear = sampler(D3D11_FILTER_MIN_MAG_MIP_LINEAR)?;
+                let bd = D3D11_BUFFER_DESC {
+                    ByteWidth: 64,
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                    ..Default::default()
+                };
+                let mut cb = None;
+                self.device.CreateBuffer(&bd, None, Some(&mut cb))?;
+                self.shader = Some(Shader {
+                    vs: vs.ok_or("no vertex shader")?,
+                    ps: ps.ok_or("no pixel shader")?,
+                    point,
+                    linear,
+                    cb: cb.ok_or("no constant buffer")?,
+                    color: None,
+                });
+            }
+        }
+        Ok(self.shader.as_mut().unwrap())
+    }
+
+    /// Draws a 4:4:4 picture (three planes) letterboxed into the back buffer.
+    /// Pixel-exact when the picture fits 1:1, bilinear when scaled.
+    pub fn draw_planar(&mut self, p: &Planar) -> Res<()> {
+        let size = self.size;
+        let ctx = self.ctx.clone();
+        unsafe {
+            if self.rtv.is_none() {
+                let back: ID3D11Texture2D = self.swap.GetBuffer(0)?;
+                let mut v = None;
+                self.device
+                    .CreateRenderTargetView(&back, None, Some(&mut v))?;
+                self.rtv = v;
+            }
+            let rtv = self.rtv.clone().ok_or("no render target")?;
+            let dst = fit(size, (p.width, p.height));
+            let one_to_one = (dst.right - dst.left) as u32 == p.width
+                && (dst.bottom - dst.top) as u32 == p.height;
+            let sh = self.shader()?;
+            if sh.color != Some(p.color) {
+                let m = matrix(p.color);
+                ctx.UpdateSubresource(&sh.cb, 0, None, m.as_ptr() as *const _, 0, 0);
+                sh.color = Some(p.color);
+            }
+            ctx.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]);
+            ctx.OMSetRenderTargets(Some(&[Some(rtv)]), None);
+            let vp = D3D11_VIEWPORT {
+                TopLeftX: dst.left as f32,
+                TopLeftY: dst.top as f32,
+                Width: (dst.right - dst.left) as f32,
+                Height: (dst.bottom - dst.top) as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            };
+            ctx.RSSetViewports(Some(&[vp]));
+            ctx.IASetInputLayout(None);
+            ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.VSSetShader(&sh.vs, None);
+            ctx.PSSetShader(&sh.ps, None);
+            let [a, b, c] = p.planes.clone();
+            ctx.PSSetShaderResources(0, Some(&[Some(a), Some(b), Some(c)]));
+            let s = if one_to_one { &sh.point } else { &sh.linear };
+            ctx.PSSetSamplers(0, Some(&[Some(s.clone())]));
+            ctx.PSSetConstantBuffers(0, Some(&[Some(sh.cb.clone())]));
+            ctx.Draw(3, 0);
+            ctx.PSSetShaderResources(0, Some(&[None, None, None]));
+            ctx.OMSetRenderTargets(None, None);
         }
         Ok(())
     }

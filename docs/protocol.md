@@ -1,6 +1,6 @@
 # Glass protocol
 
-**Version 4 (M6).** Paired devices only: mutual TLS 1.3 on the control
+**Version 5 (M3c).** View modes and stream changes on top of v4. Paired devices only: mutual TLS 1.3 on the control
 connection, every UDP datagram sealed with AES-128-GCM. LAN, IPv4. This file
 is the source of truth for packet formats and control messages;
 `core/src/protocol.rs`, `packet.rs`, `input.rs`, `seal.rs`, `tls.rs` and
@@ -82,8 +82,8 @@ Framing (inside TLS): `u16 length` (type + body) · `u8 type` · body. Max
 
 | Type | Name | Direction | Body |
 |---|---|---|---|
-| 1 | Hello | viewer → host | `version u8`, `display_w u16`, `display_h u16` (0 = unknown; used from M7) |
-| 2 | Welcome | host → viewer | `version u8`, `codec u8`, `chroma u8`, `reserved u8`, `width u16`, `height u16`, `fps u16`, `udp_port u16`, `session_id u32` |
+| 1 | Hello | viewer → host | `version u8`, `display_w u16`, `display_h u16`, `refresh_hz u16` (the viewer's screen in pixels, 0 = unknown), `caps u8` (bit 0: can decode HEVC 4:4:4), `mode u8` (view mode wanted, below) |
+| 2 | Welcome | host → viewer | `version u8`, `codec u8`, `chroma u8`, `mode u8`, `width u16`, `height u16`, `fps u16`, `udp_port u16`, `session_id u32` |
 | 3 | Reject | host → viewer | `reason u8`: 1 version mismatch, 2 busy, 3 not paired, 4 denied by the host's user, 5 pairing locked (too many wrong PINs), 6 wrong or expired PIN |
 | 4 | Ping | viewer → host | `seq u32`, `client_ts u64` |
 | 5 | Pong | host → viewer | `seq u32`, `client_ts u64` (echoed), `host_ts u64` (host clock when the Ping was read) |
@@ -96,6 +96,10 @@ Framing (inside TLS): `u16 length` (type + body) · `u8 type` · body. Max
 | 12 | PairReady | host → viewer | `name` UTF-8, ≤ 63 bytes; the host is showing a PIN |
 | 13 | PairPake | either | SPAKE2 message, 33 bytes |
 | 14 | PairConfirm | either | HMAC-SHA256, 32 bytes |
+| 15 | SetMode | viewer → host | `mode u8`, `allow_444 u8` (0 asks for 4:2:0, e.g. after 4:4:4 failed to decode). A host that can't change ignores it. |
+| 16 | StreamChange | host → viewer | `codec u8`, `chroma u8`, `mode u8`, `reserved u8`, `width u16`, `height u16`, `fps u16`: frames have these parameters from the next IDR on. |
+
+View modes (`mode`): **0** the host's own screen (scaled to fit by the viewer); **1** fit: a host display at the viewer's pixel size that looks about as big as the host's own screen (Mac: HiDPI virtual display, "looks like" viewer size ÷ 1.5); **2** fit, more space: the viewer's size at 1×; **3** fit, larger: the viewer's size at 2×. `Welcome` always describes mode 0 at 4:2:0; the host then switches (a `StreamChange` followed by an IDR) if `Hello` asked for another mode or allows 4:4:4.
 
 `codec`: 1 = HEVC. `chroma`: 0 = 4:2:0, 1 = 4:4:4. `fps` is the host
 display's refresh rate (capture only sends changed frames, so the real rate varies).
@@ -238,6 +242,7 @@ protocol version, `fp` first 8 bytes of the fingerprint (hex), `ip`, `port`.
 Advisory only: trust comes from the pinned fingerprint, never from discovery.
 
 ## Changelog
+- v5 — M3c view modes: `Hello` carries the viewer's refresh rate, decode capabilities and wanted mode; `Welcome`'s reserved byte is the mode; `SetMode` (15) and `StreamChange` (16).
 - v4 — M6 security: mutual TLS 1.3 with pinned self-signed certificates,
   PIN pairing (SPAKE2 + exporter-bound confirmation, messages 11–14), reject
   reasons 3–6, every UDP datagram AES-128-GCM sealed (24 bytes: video chunks

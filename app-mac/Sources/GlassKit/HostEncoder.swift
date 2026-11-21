@@ -33,6 +33,9 @@ public final class HEVCEncoder {
     /// doesn't report it (the low-latency encoder doesn't).
     private var requiredHardware = false
     public private(set) var lowLatencyRateControl = false
+    /// Chroma format of the first keyframe, read back from the stream
+    /// (1 = 4:2:0, 3 = 4:4:4).
+    public private(set) var producedChroma: Int?
     private var session: VTCompressionSession?
     private var out: UnsafeMutableRawPointer
     private var outCap: Int
@@ -146,6 +149,7 @@ public final class HEVCEncoder {
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[String: Any]]
         let notSync = (attachments?.first?[kCMSampleAttachmentKey_NotSync as String] as? Bool) ?? false
         let keyframe = !notSync
+        if keyframe, producedChroma == nil { producedChroma = Self.chromaFormat(of: sb) }
 
         // Sample bytes (copied only if the block buffer isn't contiguous).
         let len = CMBlockBufferGetDataLength(block)

@@ -16,9 +16,15 @@ let package = Package(
     platforms: [.macOS(.v14)],
     targets: [
         .systemLibrary(name: "CGlassCore", path: "Sources/CGlassCore"),
+        // Private CGVirtualDisplay (M3c), looked up at run time.
+        .target(
+            name: "CVirtualDisplay",
+            cSettings: [.unsafeFlags(["-fobjc-arc"])],
+            linkerSettings: [.linkedFramework("CoreGraphics"), .linkedFramework("Foundation")]
+        ),
         .target(
             name: "GlassKit",
-            dependencies: ["CGlassCore"],
+            dependencies: ["CGlassCore", "CVirtualDisplay"],
             linkerSettings: [.unsafeFlags(["-L", coreLibDir])]
         ),
         .executableTarget(name: "GlassMac", dependencies: ["GlassKit", "CGlassCore"]),

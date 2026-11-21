@@ -65,6 +65,7 @@ impl Replay {
             width: h.width as u16,
             height: h.height as u16,
             fps: h.fps as u16,
+            mode: crate::protocol::MODE_HOST_SCREEN,
         };
         // Loopback only when testing on a random port; LAN otherwise.
         let mut listener = if port == 0 {

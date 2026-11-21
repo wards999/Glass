@@ -119,11 +119,13 @@
 #define GLASS_WRONG_TOTAL 10
 
 /**
- * Protocol version. 4 = M6: the control connection is mutual TLS 1.3 with
- * pinned certificates, PIN pairing messages, and every UDP datagram is
- * AES-GCM sealed (`seal.rs`). v3 = M3: input, cursor, `HostNotice`.
+ * Protocol version. 5 = M3c: the viewer describes its screen and what it
+ * can decode in `Hello`, picks a view mode (`SetMode`), and the host
+ * announces new stream parameters mid-session (`StreamChange`).
+ * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
+ * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 4
+#define GLASS_PROTOCOL_VERSION 5
 
 /**
  * Default TCP control port; the host's UDP media socket uses the same number.
@@ -141,6 +143,36 @@
 #define GLASS_FLAG_REFINEMENT (1 << 1)
 
 #define GLASS_PUNCH_SIZE 8
+
+/**
+ * View modes (viewer's choice; the host may fall back to `MODE_HOST_SCREEN`).
+ * The host's own screen, scaled on the viewer to fit.
+ */
+#define GLASS_MODE_HOST_SCREEN 0
+
+/**
+ * A host display at the viewer's pixel size; things look about as big as on
+ * the host's own screen (Mac: HiDPI "looks like" viewer size / 1.5).
+ */
+#define GLASS_MODE_FIT 1
+
+/**
+ * A host display at the viewer's pixel size at 1x: most space, smaller text.
+ */
+#define GLASS_MODE_FIT_MORE_SPACE 2
+
+/**
+ * A host display at the viewer's pixel size at 2x: larger text.
+ */
+#define GLASS_MODE_FIT_LARGER 3
+
+#define GLASS_MODE_COUNT 4
+
+/**
+ * `Hello::caps` bits.
+ * The viewer can decode HEVC 4:4:4 (8-bit).
+ */
+#define GLASS_CAP_HEVC_444 1
 
 /**
  * `HostNotice` codes: why the host can't do what the viewer expects.
@@ -433,6 +465,10 @@ typedef struct {
    * Host display refresh rate (capture rate cap).
    */
   uint16_t fps;
+  /**
+   * `MODE_*` the host is streaming.
+   */
+  uint8_t mode;
 } GLASS_StreamInfo;
 
 /**
@@ -593,6 +629,23 @@ typedef struct {
 } GLASS_InputActionC;
 
 typedef void (*GLASS_InputFn)(void *ctx, const GLASS_InputActionC *action);
+
+/**
+ * What a viewer said about itself in `Hello` (0 = unknown).
+ */
+typedef struct {
+  uint16_t display_w;
+  uint16_t display_h;
+  uint16_t refresh_hz;
+  /**
+   * `protocol::CAP_*` bits.
+   */
+  uint8_t caps;
+  /**
+   * `protocol::MODE_*` the viewer wants.
+   */
+  uint8_t mode;
+} GLASS_ViewerHello;
 
 /**
  * What the host knows about a frame when it sends it.
@@ -1071,6 +1124,30 @@ bool glass_session_streaming(const GLASS_HostSession *s);
  * `s` from `glass_host_accept`.
  */
 bool glass_session_take_keyframe_request(const GLASS_HostSession *s);
+
+/**
+ * The viewer's screen, decode capabilities and wanted view mode (`Hello`).
+ *
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+GLASS_ViewerHello glass_session_viewer(const GLASS_HostSession *s);
+
+/**
+ * Takes a view-mode change the viewer asked for. False if none.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`; `mode` and `allow_444` writable.
+ */
+bool glass_session_take_mode_request(const GLASS_HostSession *s, uint8_t *mode, bool *allow_444);
+
+/**
+ * Tells the viewer the stream changes from the next IDR on.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+bool glass_session_send_stream_change(GLASS_HostSession *s, GLASS_StreamInfo info);
 
 /**
  * Latest input packet applied; stamp it on the next captured frame.

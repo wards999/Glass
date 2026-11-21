@@ -300,6 +300,19 @@ pub struct HostCounters {
 /// Called on the host's UDP thread for every input action, in order.
 pub type InputSink = Box<dyn FnMut(InputAction) + Send>;
 
+/// What a viewer said about itself in `Hello` (0 = unknown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(C)]
+pub struct ViewerHello {
+    pub display_w: u16,
+    pub display_h: u16,
+    pub refresh_hz: u16,
+    /// `protocol::CAP_*` bits.
+    pub caps: u8,
+    /// `protocol::MODE_*` the viewer wants.
+    pub mode: u8,
+}
+
 struct HostShared {
     stop: AtomicBool,
     connected: AtomicBool,
@@ -311,6 +324,8 @@ struct HostShared {
     input_seq: AtomicU32,
     input: Mutex<InputCounters>,
     rejected: AtomicU64,
+    /// Pending `SetMode`: `1 << 16 | allow_444 << 8 | mode`, 0 = none.
+    mode_req: AtomicU32,
 }
 
 /// One connected viewer. Dropping it ends the session (and releases any
@@ -327,6 +342,8 @@ pub struct HostSession {
     pub peer_tcp: SocketAddr,
     /// The paired viewer's name.
     pub peer_name: String,
+    /// Its screen, decode capabilities and wanted view mode.
+    pub viewer: ViewerHello,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -399,12 +416,28 @@ impl HostListener {
         tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
         let mut ch = tls::handshake(tcp, tls::server_conn(&self.tls)?)?;
         let mut reader = ControlReader::new();
-        let version = match reader.read_one(&mut ch.reader)? {
+        let (version, viewer) = match reader.read_one(&mut ch.reader)? {
             Incoming::Pair(PAIR_START, name) => {
                 self.pair(&mut ch, &mut reader, &name, peer_tcp)?;
                 return Ok(None);
             }
-            Incoming::Control(Control::Hello { version, .. }) => version,
+            Incoming::Control(Control::Hello {
+                version,
+                display_w,
+                display_h,
+                refresh_hz,
+                caps,
+                mode,
+            }) => (
+                version,
+                ViewerHello {
+                    display_w,
+                    display_h,
+                    refresh_hz,
+                    caps,
+                    mode,
+                },
+            ),
             // A viewer that doesn't know us looked and left.
             Incoming::Control(Control::Bye) => return Ok(None),
             _ => return Err(invalid("expected Hello")),
@@ -464,6 +497,7 @@ impl HostListener {
             input_seq: AtomicU32::new(0),
             input: Mutex::new(InputCounters::default()),
             rejected: AtomicU64::new(0),
+            mode_req: AtomicU32::new(0),
         });
         let mut threads = Vec::new();
 
@@ -492,6 +526,10 @@ impl HostListener {
                         Message::Control(Control::KeyframeRequest) => {
                             sh.keyframe_requests.fetch_add(1, Ordering::Relaxed);
                             sh.keyframe.store(true, Ordering::Relaxed);
+                        }
+                        Message::Control(Control::SetMode { mode, allow_444 }) => {
+                            let v = 1 << 16 | (allow_444 as u32) << 8 | mode as u32;
+                            sh.mode_req.store(v, Ordering::Relaxed);
                         }
                         Message::Control(Control::Bye) => {
                             return Err(io::ErrorKind::ConnectionAborted.into())
@@ -564,6 +602,7 @@ impl HostListener {
             cursor_buf: Vec::with_capacity(FRAME_MAX),
             peer_tcp,
             peer_name: peer.name,
+            viewer,
             threads,
         }))
     }
@@ -660,6 +699,18 @@ impl HostSession {
     /// Takes a pending keyframe request (viewer asked, or a new UDP peer).
     pub fn take_keyframe_request(&self) -> bool {
         self.shared.keyframe.swap(false, Ordering::Relaxed)
+    }
+
+    /// A view-mode change the viewer asked for: `(mode, allow_444)`.
+    pub fn take_mode_request(&self) -> Option<(u8, bool)> {
+        let v = self.shared.mode_req.swap(0, Ordering::Relaxed);
+        (v != 0).then_some((v as u8, (v >> 8) & 1 != 0))
+    }
+
+    /// Tells the viewer the stream changes (size, chroma, mode) from the next
+    /// IDR on. Send it, then encode the new stream starting with an IDR.
+    pub fn send_stream_change(&mut self, info: StreamInfo) -> io::Result<()> {
+        send_control(&self.out, Control::StreamChange { info })
     }
 
     /// Latest input packet applied (stamp it on the next captured frame).
@@ -1012,13 +1063,16 @@ struct ClientShared {
     queue: FrameQueue,
     input: Mutex<InputTx>,
     cursor: Mutex<CursorState>,
+    /// Current stream parameters (`Welcome`, then each `StreamChange`).
+    info: Mutex<StreamInfo>,
+    info_changes: AtomicU32,
 }
 
 /// A viewer connection. Exactly one thread may call `wait_frame`/`release_frame`.
 /// Input methods may be called from any thread.
 pub struct Client {
     shared: Arc<ClientShared>,
-    info: StreamInfo,
+    ctl: TlsWriter,
     host: SocketAddrV4,
     peer: Peer,
     threads: Vec<JoinHandle<()>>,
@@ -1151,6 +1205,16 @@ impl Client {
     /// starts receiving. A host we haven't paired with gives
     /// `ConnectError::NotPaired` before anything about us is sent.
     pub fn connect(device: &Arc<Device>, host: &str, port: u16) -> Result<Self, ConnectError> {
+        Self::connect_with(device, host, port, ViewerHello::default())
+    }
+
+    /// [`Self::connect`], telling the host about this viewer (`hello`).
+    pub fn connect_with(
+        device: &Arc<Device>,
+        host: &str,
+        port: u16,
+        hello: ViewerHello,
+    ) -> Result<Self, ConnectError> {
         let (mut ch, addr) = open_channel(device, host, port)?;
         let hs = |_| ConnectError::Handshake;
         let Some(peer) = device.peer_with(&ch.peer, ROLE_HOST) else {
@@ -1161,8 +1225,11 @@ impl Client {
             &ch.writer,
             Control::Hello {
                 version: PROTOCOL_VERSION,
-                display_w: 0, // LATER(M7): request native resolution.
-                display_h: 0,
+                display_w: hello.display_w,
+                display_h: hello.display_h,
+                refresh_hz: hello.refresh_hz,
+                caps: hello.caps,
+                mode: hello.mode,
             },
         )
         .map_err(hs)?;
@@ -1220,12 +1287,15 @@ impl Client {
             queue: FrameQueue::new(),
             input: Mutex::new(tx),
             cursor: Mutex::new(CursorState::default()),
+            info: Mutex::new(info),
+            info_changes: AtomicU32::new(0),
         });
         let Channel {
             reader: tls_in,
             writer,
             ..
         } = ch;
+        let ctl = writer.clone();
         let threads = vec![
             spawn_receiver(
                 shared.clone(),
@@ -1237,15 +1307,28 @@ impl Client {
         ];
         Ok(Self {
             shared,
-            info,
+            ctl,
             host: addr,
             peer,
             threads,
         })
     }
 
+    /// Current stream parameters (they change after a `StreamChange`).
     pub fn info(&self) -> StreamInfo {
-        self.info
+        *lock(&self.shared.info)
+    }
+
+    /// Counts `StreamChange`s so far (poll to notice one).
+    pub fn info_changes(&self) -> u32 {
+        self.shared.info_changes.load(Ordering::Acquire)
+    }
+
+    /// Asks the host for view mode `mode` (`MODE_*`); `allow_444` false
+    /// asks for 4:2:0. The host answers with a `StreamChange` (or not, if it
+    /// can't change; a PC host always shows its own screen).
+    pub fn set_mode(&self, mode: u8, allow_444: bool) {
+        let _ = send_control(&self.ctl, Control::SetMode { mode, allow_444 });
     }
 
     pub fn host(&self) -> SocketAddrV4 {
@@ -1491,6 +1574,12 @@ fn spawn_control(
                     }
                     Message::Control(Control::HostNotice { code }) => {
                         sh.host_notice.store(code, Ordering::Relaxed);
+                    }
+                    Message::Control(Control::StreamChange { info }) => {
+                        *lock(&sh.info) = info;
+                        sh.info_changes.fetch_add(1, Ordering::Release);
+                        // The next IDR starts the new stream.
+                        sh.want_keyframe.store(true, Ordering::Relaxed);
                     }
                     Message::Control(Control::CursorVisible { visible }) => {
                         let mut c = lock(&sh.cursor);

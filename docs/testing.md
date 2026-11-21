@@ -10,6 +10,31 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M3c (sharp text, view modes, 4:4:4)
+Use the zip and dmg from the same test build (protocol v5).
+1. **Mac:** install the new Glass.app, open it, and click **Share This Mac…**.
+   The permissions should still be granted; if macOS asks again, say so.
+2. **PC:** extract the zip, run `connect.cmd`, and type the Mac's address. It
+   starts on the Mac's own screen, as in M3b. The window should say full
+   colour (4:4:4) is on.
+3. **On the Mac** (from the PC), click **Clarity Test Card** in the Share
+   window.
+4. Press **Ctrl+Alt+Shift+R** to step through the four views:
+   - the Mac's screen
+   - fit, like now
+   - fit, more space
+   - fit, larger
+   The Mac's own screen mirrors the "fit" views, and returns to normal when
+   you go back to the Mac's screen or disconnect. In each view, look at the
+   test card (small coloured text, 1-pixel stripes) and at normal apps, and
+   note which view you'd keep.
+5. Ctrl+Alt+Shift+Q to disconnect. Send:
+   - the connect.cmd text, and
+   - the Mac's results (Show Results ▸ Copy). They include sharpness (PSNR)
+     from the test card.
+   Also say which view looked best, and whether the Mac's screen came back
+   to normal afterwards.
+
 ## M3b (the PC views and controls the Mac)
 Use the zip and dmg from the same test build.
 1. **Mac:** install the new Glass.app over the old one (Applications), open

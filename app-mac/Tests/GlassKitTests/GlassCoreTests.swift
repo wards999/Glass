@@ -8,7 +8,7 @@ final class GlassCoreTests: XCTestCase {
     func testCoreLinksAndReportsVersions() {
         XCTAssertFalse(GlassCore.version.isEmpty)
         XCTAssertEqual(GlassCore.version.split(separator: ".").count, 3)
-        XCTAssertEqual(GlassCore.protocolVersion, 4)
+        XCTAssertEqual(GlassCore.protocolVersion, 5)
     }
 }
 
@@ -262,7 +262,8 @@ final class HostTests: XCTestCase {
         let host = try GlassHost(device: hostDevice, port: 0, fixedPin: "246810") { e in
             if e.kind == .pairingPin { pinLock.withLock { pins.append(e.pin) } }
         }
-        let info = GLASS_StreamInfo(codec: UInt8(GLASS_CODEC_HEVC), chroma: UInt8(GLASS_CHROMA_420), width: 64, height: 32, fps: 60)
+        let info = GLASS_StreamInfo(codec: UInt8(GLASS_CODEC_HEVC), chroma: UInt8(GLASS_CHROMA_420), width: 64, height: 32, fps: 60,
+                                    mode: UInt8(GLASS_MODE_HOST_SCREEN))
         let rec = Recorder()
         let ready = expectation(description: "session")
         let sessionLock = NSLock()
@@ -293,6 +294,10 @@ final class HostTests: XCTestCase {
         let s = try XCTUnwrap(sessionLock.withLock { session })
         XCTAssertEqual(s.peerName, "PC")
         XCTAssertEqual(s.peerAddress, "127.0.0.1")
+        // The Mac viewer says it decodes 4:4:4 and wants the host's own screen.
+        XCTAssertEqual(s.viewer.caps & UInt8(GLASS_CAP_HEVC_444), UInt8(GLASS_CAP_HEVC_444))
+        XCTAssertEqual(s.viewer.mode, UInt8(GLASS_MODE_HOST_SCREEN))
+        XCTAssertNil(s.takeModeRequest())
 
         // Frames reach the viewer intact once its UDP punch has arrived.
         let bytes: [UInt8] = [0, 0, 0, 1, 0x26, 1, 0xAA, 0x55]

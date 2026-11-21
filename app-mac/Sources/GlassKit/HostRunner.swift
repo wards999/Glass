@@ -135,6 +135,8 @@ private final class HostSessionRun {
     var pipeline: Pipeline?
     var virtual: VirtualDisplay?
     var current: GLASS_StreamInfo
+    /// The encoder couldn't make 4:4:4 here: don't try again this session.
+    var no444 = false
     var history: [String] = []
     let failLock = NSLock()
     var failure: String?
@@ -203,7 +205,7 @@ private final class HostSessionRun {
                 note = " (virtual display unavailable: showing the Mac's screen)"
             }
         }
-        let use444 = allow444 && o.allow444 && (viewer.caps & UInt8(GLASS_CAP_HEVC_444)) != 0
+        let use444 = allow444 && !no444 && o.allow444 && (viewer.caps & UInt8(GLASS_CAP_HEVC_444)) != 0
         let info = GLASS_StreamInfo(codec: UInt8(GLASS_CODEC_HEVC),
                                     chroma: UInt8(use444 ? GLASS_CHROMA_444 : GLASS_CHROMA_420),
                                     width: UInt16(disp.width), height: UInt16(disp.height),
@@ -255,6 +257,13 @@ private final class HostSessionRun {
             if let req = q.sync(execute: { s.takeModeRequest() }) {
                 configure(mode: req.mode, allow444: req.allow444)
             }
+            // Asked for 4:4:4 but the encoder made 4:2:0: say so and switch,
+            // rather than leave the viewer failing to decode.
+            if current.chroma == UInt8(GLASS_CHROMA_444),
+               let produced = q.sync(execute: { pipeline?.encoder.producedChroma }), produced != 3 {
+                no444 = true
+                configure(mode: current.mode, allow444: false)
+            }
             Thread.sleep(forTimeInterval: 0.1)
         }
         cursorTimer.cancel()
@@ -281,6 +290,7 @@ private final class HostSessionRun {
         out.append("Host: Mac display \(d.width)x\(d.height) @ \(d.fps) Hz\(o.testPattern ? " (test pattern)" : "") | HEVC \(o.mbps) Mbps | encoder \(t.hardware ? "hardware" : "SOFTWARE")\(t.lowLatency ? ", low-latency rate control" : "") | encoded chroma \(chroma)")
         out.append("Session with \u{201C}\(s.peerName)\u{201D} (\(s.peerAddress)) ended after \(String(format: "%.1f", secs)) s (\(reason))")
         out.append("  streamed: " + history.joined(separator: " -> "))
+        if no444 { out.append("  NOTE: the encoder produced 4:2:0 when asked for 4:4:4, so this session switched to 4:2:0.") }
         out.append(String(format: "  frames sent %ld (%.1f fps), IDRs %ld (idle re-sends %ld), viewer keyframe requests %ld, not sent (viewer not ready) %ld",
                           t.frames, Double(t.frames) / secs, t.idrs, t.idleIDRs, Int(counters.keyframe_requests), t.notSent))
         out.append(String(format: "  bitrate %.1f Mbps avg | %ld packets", Double(t.bytes) * 8 / secs / 1e6, Int(counters.packets_sent)))

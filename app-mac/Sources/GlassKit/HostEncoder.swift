@@ -57,7 +57,9 @@ public final class HEVCEncoder {
             [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true],
             [:],
         ]
-        for (i, spec) in specs.enumerated() {
+        // The low-latency encoder only does 4:2:0 (m3c-test2: 4:4:4 input
+        // still came out 4:2:0), so 4:4:4 starts at plain hardware.
+        for (i, spec) in specs.enumerated() where !(config.chroma444 && i == 0) {
             var s: VTCompressionSession?
             let source: [CFString: Any] = [
                 kCVPixelBufferPixelFormatTypeKey: config.chroma444

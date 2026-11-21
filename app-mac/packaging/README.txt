@@ -28,16 +28,17 @@ Live viewer:
   Windows key, Option as Alt. Connection > PC-Style Modifiers swaps Cmd/Ctrl.
   macOS keeps Cmd+Tab, Cmd+Space and Mission Control for itself.
 
-Share This Mac (the PC views and controls this Mac):
-  Click "Share This Mac..." in the connect window. macOS needs two permissions,
-  which the window checks and links to:
+Share this Mac (another Mac or PC views and controls this Mac):
+  Turn on the "Share this Mac" switch at the bottom of the Glass window. The
+  card opens up and shows this Mac's address, any missing permission with a
+  link to it, and who is connected:
     - Screen Recording (to show this screen): allow it, then quit and reopen Glass.
-    - Accessibility (for the PC's mouse and keyboard).
+    - Accessibility (for the other device's mouse and keyboard).
   Test builds are signed with the same certificate each time, so these
   permissions stay granted across builds.
-  On the PC, run connect.cmd and type the address the window shows. The
-  first time, this window shows a 6-digit PIN to type on the PC. After a
-  session, "Copy Results" copies its numbers. Stop Sharing ends it.
+  The other device sees this Mac in its Glass list. The first time, the card
+  shows a 6-digit pairing code to type there. After a session, "Show Results"
+  copies its numbers. Turn the switch off to stop sharing.
   Check for sharp text later (M3c):  GlassMac check-444  (see below).
 
 Recordings (M1): "Open Recording..." in the connect window, or double-click a .glsr.

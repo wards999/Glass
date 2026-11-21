@@ -20,6 +20,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var shareSwitch: NSSwitch?
     private var themeButton: NSButton?
     private var settingsPopover: NSPopover?
+    private var shareNote: NSTextField?
+    private var shareIcon: NSImageView?
+    private var shareTile: LayerView?
+    private var shareStack: NSStackView?
     private var found: [DiscoveredHost] = []
     private let browser = GlassBrowser()
     private let pairedMenu = NSMenu(title: "Paired Devices")
@@ -41,6 +45,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationWillTerminate(_ note: Notification) {
+        hostController?.stop()
+    }
 
     // MARK: menus
 
@@ -95,18 +103,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     // MARK: host (M3b)
 
+    /// Sharing runs inside the main window's share card.
     @objc private func shareThisMac() {
-        if hostController != nil { return }
-        browser.stop()
-        connectWindow?.orderOut(nil)
+        showConnect()
+        guard hostController == nil else { return }
         let h = HostController()
-        h.onClose = { [weak self] in
-            self?.hostController = nil
-            self?.showConnect()
-        }
+        h.onStatus = { [weak self] s in self?.shareNote?.stringValue = s }
         hostController = h
         shareSwitch?.state = .on
-        h.open()
+        shareIcon?.contentTintColor = .systemGreen
+        shareTile?.fill = NSColor.systemGreen.withAlphaComponent(0.14)
+        if let shareStack {
+            shareStack.addArrangedSubview(h.detail)
+            h.detail.widthAnchor.constraint(equalTo: shareStack.widthAnchor).isActive = true
+        }
+        h.start()
+    }
+
+    private func stopSharing() {
+        guard let h = hostController else { return }
+        h.stop()
+        h.detail.removeFromSuperview()
+        hostController = nil
+        shareSwitch?.state = .off
+        shareIcon?.contentTintColor = .secondaryLabelColor
+        shareTile?.fill = Look.track
+        shareNote?.stringValue = "Off \u{00B7} other devices can\u{2019}t connect"
     }
 
     // MARK: paired devices
@@ -347,7 +369,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc private func shareSwitched(_ sender: NSSwitch) {
-        if sender.state == .on { shareThisMac() }
+        if sender.state == .on { shareThisMac() } else { stopSharing() }
     }
 
     @objc private func lookAgain() {
@@ -356,7 +378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func buildConnectWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 640),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 700),
                          styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                          backing: .buffered, defer: false)
         w.title = "Glass"
@@ -447,15 +469,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         // Sharing, at the bottom.
         let shareTile = LayerView(fill: Look.track, stroke: nil, radius: 11)
+        self.shareTile = shareTile
         let shareIcon = NSImageView(image: NSImage(systemSymbolName: "laptopcomputer", accessibilityDescription: nil) ?? NSImage())
         shareIcon.symbolConfiguration = .init(pointSize: 20, weight: .regular)
         shareIcon.contentTintColor = .secondaryLabelColor
         center(shareIcon, in: shareTile, size: 44)
+        self.shareIcon = shareIcon
         let shareTitle = NSTextField(labelWithString: "Share this Mac")
         shareTitle.font = .systemFont(ofSize: 15, weight: .semibold)
         let shareNote = NSTextField(labelWithString: "Off \u{00B7} other devices can\u{2019}t connect")
         shareNote.font = .systemFont(ofSize: 12)
         shareNote.textColor = .secondaryLabelColor
+        shareNote.lineBreakMode = .byTruncatingTail
+        shareNote.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        self.shareNote = shareNote
         let shareText = NSStackView(views: [shareTitle, shareNote])
         shareText.orientation = .vertical
         shareText.alignment = .leading
@@ -467,7 +494,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let shareRow = NSStackView(views: [shareTile, shareText, NSView(), toggle])
         shareRow.spacing = 12
         shareRow.alignment = .centerY
-        let shareCard = Card(shareRow)
+        let shareBody = NSStackView(views: [shareRow])
+        shareBody.orientation = .vertical
+        shareBody.alignment = .leading
+        shareBody.spacing = 12
+        shareRow.widthAnchor.constraint(equalTo: shareBody.widthAnchor).isActive = true
+        shareStack = shareBody
+        let shareCard = Card(shareBody)
 
         let stack = NSStackView(views: [header, devicesHeader, scroll, addressLink!, addressRow!, shareCard])
         stack.orientation = .vertical
@@ -492,7 +525,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         NSLayoutConstraint.activate(cs)
         w.contentView = content
-        w.setContentSize(NSSize(width: 440, height: 640))
+        w.setContentSize(NSSize(width: 440, height: 700))
         w.center()
         connectWindow = w
     }
@@ -747,7 +780,7 @@ final class Card: LayerView {
     required init?(coder: NSCoder) { fatalError("not used") }
 }
 
-private func center(_ v: NSView, in box: NSView, size: CGFloat) {
+func center(_ v: NSView, in box: NSView, size: CGFloat) {
     v.translatesAutoresizingMaskIntoConstraints = false
     box.addSubview(v)
     NSLayoutConstraint.activate([

@@ -3,131 +3,165 @@ import CGlassCore
 import Foundation
 import GlassKit
 
-/// "Share This Mac": the Mac as host. Shows what the PC needs (address,
-/// PIN when pairing), the permissions macOS needs, who is connected, and
-/// the last session's results.
-final class HostController: NSObject, NSWindowDelegate {
-    var onClose: () -> Void = {}
+/// "Share this Mac": the Mac as host, shown inside the main window's share
+/// card (no window of its own). `detail` is what the card shows while
+/// sharing: this Mac's address, the pairing code in large tiles, who is
+/// connected, missing permissions, and the last session's results.
+final class HostController: NSObject {
+    /// A short line for the card's header ("Waiting for a viewer…").
+    var onStatus: (String) -> Void = { _ in }
 
-    private var window: NSWindow!
+    let detail = NSStackView()
     private var statusLabel: NSTextField!
-    private var pinLabel: NSTextField!
-    private var addressLabel: NSTextField!
-    private var screenRow: NSTextField!
-    private var screenButton: NSButton!
-    private var accessRow: NSTextField!
-    private var accessButton: NSButton!
-    private var copyButton: NSButton!
+    private var pinBox: NSStackView!
+    private var pinTitle: NSTextField!
+    private var pinDigits: [NSTextField] = []
+    private var streamLabel: NSTextField!
+    private var screenRow: NSStackView!
+    private var accessRow: NSStackView!
+    private var permNote: NSTextField!
+    private var resultsButton: NSButton!
     private var runner: HostRunner?
     private let advertiser = GlassAdvertiser()
     private var lastReport: String?
-    private var closed = false
+    private var stopped = false
     private var permissionTimer: Timer?
-    private var streamLabel: NSTextField!
     private let testCard = TestCardController()
 
-    func open() {
-        buildWindow()
+    override init() {
+        super.init()
+        build()
+    }
+
+    func start() {
         refreshPermissions()
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             self?.refreshPermissions()
         }
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         if !HostPermissions.screenRecording { HostPermissions.requestScreenRecording() }
         if !HostPermissions.accessibility { HostPermissions.requestAccessibility() }
         startSharing()
     }
 
-    private func label(_ s: String, size: CGFloat = 13, weight: NSFont.Weight = .regular) -> NSTextField {
+    func stop() {
+        stopped = true
+        permissionTimer?.invalidate()
+        permissionTimer = nil
+        advertiser.stop()
+        runner?.stop()
+        runner = nil
+    }
+
+    // MARK: views
+
+    private func text(_ s: String, size: CGFloat = 12, colour: NSColor = .secondaryLabelColor,
+                      weight: NSFont.Weight = .regular) -> NSTextField {
         let l = NSTextField(wrappingLabelWithString: s)
         l.font = .systemFont(ofSize: size, weight: weight)
+        l.textColor = colour
         l.isSelectable = true
         return l
     }
 
-    private func buildWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 380),
-                         styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
-        w.title = "Glass — Share This Mac"
-        w.isReleasedWhenClosed = false
-        w.delegate = self
-        window = w
+    private func permissionRow(_ what: String, _ action: Selector) -> NSStackView {
+        let icon = NSImageView(image: NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil) ?? NSImage())
+        icon.contentTintColor = .systemOrange
+        let label = text(what)
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let open = NSButton(title: "Open Settings\u{2026}", target: self, action: action)
+        open.controlSize = .small
+        let row = NSStackView(views: [icon, label, NSView(), open])
+        row.spacing = 6
+        row.alignment = .centerY
+        return row
+    }
 
-        let device = GlassDevice.shared
-        let id = device.map { d in
-            d.fingerprintShort
-        } ?? "?"
-        let title = label("Sharing this Mac: \u{201C}\(GlassDevice.computerName)\u{201D}  (id \(id))", size: 14, weight: .semibold)
-        let ips = localIPv4Addresses()
-        addressLabel = label(ips.isEmpty
-            ? "Not on a network?"
-            : "On the PC, run connect.cmd and type this Mac's address:  \(ips[0])", size: 14)
-        addressLabel.font = .monospacedSystemFont(ofSize: 14, weight: .medium)
-        pinLabel = label("", size: 34, weight: .bold)
-        pinLabel.font = .monospacedDigitSystemFont(ofSize: 34, weight: .bold)
-        pinLabel.isHidden = true
-        statusLabel = label("Starting…")
-        streamLabel = label("", size: 12)
-        streamLabel.textColor = .secondaryLabelColor
-
-        screenRow = label("")
-        screenButton = NSButton(title: "Open Settings…", target: self, action: #selector(openScreen))
-        accessRow = label("")
-        accessButton = NSButton(title: "Open Settings…", target: self, action: #selector(openAccess))
-        let screenStack = NSStackView(views: [screenRow, NSView(), screenButton])
-        let accessStack = NSStackView(views: [accessRow, NSView(), accessButton])
-        let permNote = label("After allowing Screen Recording, quit Glass (⌘Q) and open it again.", size: 11)
-        permNote.textColor = .secondaryLabelColor
-
-        copyButton = NSButton(title: "Show Results", target: self, action: #selector(copyResults))
-        copyButton.isEnabled = false
-        let stop = NSButton(title: "Stop Sharing", target: self, action: #selector(stopSharing))
-        let card = NSButton(title: "Clarity Test Card", target: self, action: #selector(showTestCard))
-        let buttons = NSStackView(views: [copyButton, card, NSView(), stop])
-
+    private func build() {
         let sep = NSBox()
         sep.boxType = .separator
-        let stack = NSStackView(views: [title, addressLabel, pinLabel, statusLabel, streamLabel, sep, screenStack, accessStack, permNote, buttons])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 10
-        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        let content = NSView()
-        content.addSubview(stack)
-        var constraints = [
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: content.topAnchor),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor),
-        ]
-        for v in [title, addressLabel, statusLabel, streamLabel, sep, screenStack, accessStack, permNote, buttons] as [NSView] {
-            constraints.append(v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -40))
+
+        let ips = localIPv4Addresses()
+        let addrTitle = text("This Mac\u{2019}s address")
+        let addr = NSTextField(labelWithString: ips.first ?? "not on a network")
+        addr.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+        addr.isSelectable = true
+        let addrRow = NSStackView(views: [addrTitle, NSView(), addr])
+
+        // The pairing code, in tiles like the PC's.
+        pinTitle = text("", size: 13, colour: .labelColor, weight: .semibold)
+        pinTitle.alignment = .center
+        let pinHint = text("Type it on that device. Pair only your own devices.", size: 11)
+        pinHint.alignment = .center
+        let tiles = NSStackView()
+        tiles.spacing = 7
+        for i in 0..<6 {
+            let digit = NSTextField(labelWithString: "")
+            digit.font = .monospacedDigitSystemFont(ofSize: 24, weight: .semibold)
+            digit.alignment = .center
+            let tile = LayerView(fill: Look.track, stroke: nil, radius: 9)
+            digit.translatesAutoresizingMaskIntoConstraints = false
+            tile.addSubview(digit)
+            NSLayoutConstraint.activate([
+                tile.widthAnchor.constraint(equalToConstant: 38),
+                tile.heightAnchor.constraint(equalToConstant: 48),
+                digit.centerXAnchor.constraint(equalTo: tile.centerXAnchor),
+                digit.centerYAnchor.constraint(equalTo: tile.centerYAnchor),
+            ])
+            tiles.addArrangedSubview(tile)
+            if i == 2 { tiles.setCustomSpacing(16, after: tile) }
+            pinDigits.append(digit)
         }
-        NSLayoutConstraint.activate(constraints)
-        w.contentView = content
+        let box = NSStackView(views: [pinTitle, pinHint, tiles])
+        box.orientation = .vertical
+        box.alignment = .centerX
+        box.spacing = 4
+        box.setCustomSpacing(10, after: pinHint)
+        box.isHidden = true
+        pinBox = box
+
+        statusLabel = text("Starting\u{2026}")
+        streamLabel = text("", size: 11, colour: .tertiaryLabelColor)
+        streamLabel.isHidden = true
+
+        screenRow = permissionRow("Screen Recording is needed to show this screen.", #selector(openScreen))
+        accessRow = permissionRow("Accessibility is needed for the other device\u{2019}s mouse and keyboard.", #selector(openAccess))
+        permNote = text("After allowing Screen Recording, quit Glass (\u{2318}Q) and open it again.", size: 11)
+
+        let results = NSButton(title: "Show Results", target: self, action: #selector(copyResults))
+        results.controlSize = .small
+        results.isEnabled = false
+        resultsButton = results
+        let card = NSButton(title: "Clarity Test Card", target: self, action: #selector(showTestCard))
+        card.controlSize = .small
+        let buttons = NSStackView(views: [results, card, NSView()])
+
+        let views: [NSView] = [sep, addrRow, box, statusLabel, streamLabel, screenRow, accessRow, permNote, buttons]
+        for v in views { detail.addArrangedSubview(v) }
+        detail.orientation = .vertical
+        detail.alignment = .leading
+        detail.spacing = 8
+        detail.setCustomSpacing(12, after: box)
+        for v in views {
+            v.widthAnchor.constraint(equalTo: detail.widthAnchor).isActive = true
+        }
     }
 
     private func refreshPermissions() {
         let screen = HostPermissions.screenRecording, access = HostPermissions.accessibility
-        screenRow.stringValue = screen
-            ? "✓ Screen Recording: allowed"
-            : "✗ Screen Recording: needed to show this screen (Privacy & Security ▸ Screen & System Audio Recording)"
-        screenButton.isHidden = screen
-        accessRow.stringValue = access
-            ? "✓ Accessibility: allowed"
-            : "✗ Accessibility: needed for the PC's mouse and keyboard (Privacy & Security ▸ Accessibility)"
-        accessButton.isHidden = access
+        screenRow.isHidden = screen
+        accessRow.isHidden = access
+        permNote.isHidden = screen
     }
 
     @objc private func openScreen() { HostPermissions.openScreenRecordingSettings() }
     @objc private func openAccess() { HostPermissions.openAccessibilitySettings() }
 
+    // MARK: sharing
+
     private func startSharing() {
         guard let device = GlassDevice.shared else {
-            statusLabel.stringValue = "Couldn't read or create this Mac's Glass identity."
+            statusLabel.stringValue = "Couldn\u{2019}t read or create this Mac\u{2019}s Glass identity."
+            onStatus("Couldn\u{2019}t start")
             return
         }
         do {
@@ -135,32 +169,37 @@ final class HostController: NSObject, NSWindowDelegate {
             r.onEvent = { [weak self] e in self?.event(e) }
             r.onStreamChanged = { [weak self] line in
                 self?.testCard.nowShowing = line
-                self?.streamLabel.stringValue = "Showing: \(line). The PC picks this with Ctrl+Alt+Shift+R."
+                self?.streamLabel.stringValue = "Showing: \(line)"
+                self?.streamLabel.isHidden = false
             }
             r.onConnected = { [weak self] name, addr in
-                self?.pinLabel.isHidden = true
-                self?.statusLabel.stringValue = "Connected: \u{201C}\(name)\u{201D} (\(addr)), encrypted. It sees this screen and controls the mouse and keyboard. Stop Sharing ends it."
+                self?.pinBox.isHidden = true
+                self?.statusLabel.stringValue = "\u{201C}\(name)\u{201D} (\(addr)) sees this screen and controls the mouse and keyboard. Encrypted. Turn the switch off to end it."
+                self?.onStatus("Connected to \u{201C}\(name)\u{201D}")
             }
             r.onSessionEnd = { [weak self] report in
                 print(report)
-                // Stop Sharing during a session: the window is gone, so show
-                // the results on their own (with Copy).
-                guard let self, !self.closed else {
+                // Switched off during a session: show the results on their own.
+                guard let self, !self.stopped else {
                     showResults(report)
                     return
                 }
                 self.lastReport = report
-                self.copyButton.isEnabled = true
-                self.statusLabel.stringValue = "Session ended. Show Results, then Copy results and paste them to Claude. Waiting for the PC…"
+                self.resultsButton.isEnabled = true
+                self.streamLabel.isHidden = true
+                self.statusLabel.stringValue = "Session ended. Show Results to copy them. Waiting for the next viewer."
+                self.onStatus("Waiting for a viewer\u{2026}")
             }
             runner = r
             r.start()
             advertiser.start(name: GlassDevice.computerName, port: r.host.port,
                              fingerprintPrefix: device.fingerprintHexPrefix, ip: localIPv4Addresses().first)
             let d = r.display
-            statusLabel.stringValue = "Waiting for the PC… (\(d.width)x\(d.height) @ \(d.fps) Hz, port \(r.host.port))"
+            statusLabel.stringValue = "Other devices see this Mac in their Glass list. Sharing \(d.width)\u{00D7}\(d.height) at \(d.fps) Hz."
+            onStatus("Waiting for a viewer\u{2026}")
         } catch {
             statusLabel.stringValue = "\(error)"
+            onStatus("Couldn\u{2019}t start")
         }
     }
 
@@ -168,37 +207,28 @@ final class HostController: NSObject, NSWindowDelegate {
         print(e.text)
         switch e.kind {
         case .pairingPin:
-            pinLabel.stringValue = "PIN  \(e.pin.prefix(3)) \(e.pin.suffix(3))"
-            pinLabel.isHidden = false
-            statusLabel.stringValue = "\u{201C}\(e.device)\u{201D} (\(e.address)) wants to pair. Type this PIN on the PC (valid 2 minutes). Pair only your own devices."
+            pinTitle.stringValue = "Pairing code for \u{201C}\(e.device)\u{201D}"
+            for (label, c) in zip(pinDigits, e.pin) { label.stringValue = String(c) }
+            pinBox.isHidden = false
+            statusLabel.stringValue = "\u{201C}\(e.device)\u{201D} (\(e.address)) wants to pair. The code is valid for 2 minutes."
+            onStatus("Pairing with \u{201C}\(e.device)\u{201D}")
+            NSApp.activate(ignoringOtherApps: true)
             _ = NSApp.requestUserAttention(.criticalRequest)
         case .paired:
-            pinLabel.isHidden = true
+            pinBox.isHidden = true
             statusLabel.stringValue = e.text
         default:
+            pinBox.isHidden = true
             statusLabel.stringValue = e.text
         }
     }
 
     @objc private func copyResults() {
         guard let r = lastReport else { return }
-        // Show them too: a silent copy looked like nothing happened.
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(r, forType: .string)
         showResults(r)
     }
 
-    @objc private func stopSharing() { window.close() }
-
     @objc private func showTestCard() { testCard.show() }
-
-    func windowWillClose(_ notification: Notification) {
-        closed = true
-        permissionTimer?.invalidate()
-        permissionTimer = nil
-        advertiser.stop()
-        runner?.stop()
-        runner = nil
-        onClose()
-    }
 }

@@ -116,3 +116,18 @@ frames**, NVDEC on the PC. But it costs a lot:
 - **What would make 4:4:4 worth it:** a faster capture path, a higher bitrate
   or refinement while the screen is still (M5, or M7 for still-region
   refinement).
+- **The user's verdict:** in 4:4:4 the red/blue stripes matched the Mac's
+  screen and looked better than 4:2:0, but dragging felt laggier, and the lag
+  **grew over time**.
+  - Cause: encoding a 4:4:4 frame (plus the test card's sharpness probe) took
+    about a frame's time, so ScreenCaptureKit's queue filled and every frame
+    shown was older.
+  - The MacBook Air is fanless; thermal slowdown would make that worse.
+  - Fixed for test5:
+    - Capture runs on its own queue, and only the newest frame waits for the
+      encoder (stale frames are skipped and counted).
+    - The probe decodes off the hot path.
+    - The virtual display is kept when only the colour changes.
+    - **4:2:0 is the default** (`Hello` bit `CAP_PREFER_420`), with 4:4:4 a
+      choice: Ctrl+Alt+Shift+C, or `--colour 444`.
+

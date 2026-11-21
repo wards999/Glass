@@ -46,7 +46,8 @@ pub fn connect(args: &[String]) -> Res<()> {
         windowed: false,
         seconds: None,
         rule: PcModifierRule::PcStyle,
-        full_colour: true,
+        // 4:2:0 by default: in m3c-test4 4:4:4 cost ~25 ms on the Mac.
+        full_colour: false,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -118,7 +119,7 @@ pub fn connect(args: &[String]) -> Res<()> {
     let modes_file = default_dir().unwrap_or_default().join("view-modes.txt");
     // --view wins; otherwise the view last used with this host.
     let mode = view.unwrap_or_else(|| saved_mode(&modes_file, &addr));
-    let prep = viewer::prepare(mode)?;
+    let prep = viewer::prepare(mode, opts.full_colour)?;
     let hello = prep.hello;
 
     let mut fixed_pin = pin;
@@ -167,10 +168,12 @@ pub fn connect(args: &[String]) -> Res<()> {
         info.height,
         info.fps,
         viewer::mode_name(mode),
-        if hello.caps & glass_core::protocol::CAP_HEVC_444 != 0 {
-            " Full colour (4:4:4) is on when the host can send it."
-        } else {
+        if hello.caps & glass_core::protocol::CAP_HEVC_444 == 0 {
             ""
+        } else if opts.full_colour {
+            " Full colour (4:4:4) is on when the host can send it (Ctrl+Alt+Shift+C: 4:2:0)."
+        } else {
+            " Ctrl+Alt+Shift+C: full colour (4:4:4), sharper coloured detail but slower."
         }
     );
     let (report, last_mode) = viewer::run(client, prep, opts, &crate::banner())?;

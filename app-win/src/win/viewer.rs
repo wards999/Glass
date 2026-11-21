@@ -23,7 +23,8 @@ use glass_core::input::{BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE,
 use glass_core::keymap::{pc_key_for_mac, win_scan_to_hid, PcModifierRule};
 use glass_core::net::{Client, ViewerHello, Wait};
 use glass_core::protocol::{
-    CAP_HEVC_444, MODE_COUNT, MODE_FIT, MODE_FIT_LARGER, MODE_FIT_MORE_SPACE, NOTICE_NONE,
+    CAP_HEVC_444, CAP_PREFER_420, MODE_COUNT, MODE_FIT, MODE_FIT_LARGER, MODE_FIT_MORE_SPACE,
+    NOTICE_NONE,
 };
 use glass_core::recording::CHROMA_444;
 use glass_core::stats::{StatRing, Summary};
@@ -64,18 +65,22 @@ pub struct Prepared {
 }
 
 /// The GPU, the screen under the pointer and whether 4:4:4 can be decoded
-/// (NVDEC); `mode` is the view mode to ask for.
-pub fn prepare(mode: u8) -> Res<Prepared> {
+/// (NVDEC); `mode` is the view mode to ask for; `full_colour` asks for 4:4:4
+/// from the start (else 4:2:0, switchable later).
+pub fn prepare(mode: u8, full_colour: bool) -> Res<Prepared> {
     d3d::init_process();
     // FFmpeg's own warnings would clutter the console; errors are reported.
     unsafe { ffmpeg_sys_next::av_log_set_level(ffmpeg_sys_next::AV_LOG_ERROR) };
     let gpu = d3d::Gpu::new_for_viewer()?;
     let (mon, work, desc, hz) = monitor_at_pointer();
-    let caps = if decode444::available(&gpu.device) {
+    let mut caps = if decode444::available(&gpu.device) {
         CAP_HEVC_444
     } else {
         0
     };
+    if !full_colour {
+        caps |= CAP_PREFER_420;
+    }
     Ok(Prepared {
         hello: ViewerHello {
             display_w: (mon.right - mon.left) as u16,
@@ -282,10 +287,6 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         rule: opts.rule,
     });
 
-    if !opts.full_colour && hello.caps & CAP_HEVC_444 != 0 {
-        // The host starts in 4:4:4 when it can; the user chose 4:2:0.
-        sh.client.set_mode(hello.mode, false);
-    }
     let hwnd = unsafe { create_window(&sh, mon, work, !opts.windowed)? };
     let (w, h) = client_size(hwnd);
     sh.size
@@ -419,8 +420,7 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         } else if r.stats_before_submit > 0 {
             format!(
                 "DXGI frame statistics ({} of {} implausible, counted as the present call)",
-                r.stats_before_submit,
-                r.presented
+                r.stats_before_submit, r.presented
             )
         } else {
             "DXGI frame statistics".to_string()

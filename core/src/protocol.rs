@@ -173,6 +173,9 @@ pub const MODE_COUNT: u8 = 4;
 /// `Hello::caps` bits.
 /// The viewer can decode HEVC 4:4:4 (8-bit).
 pub const CAP_HEVC_444: u8 = 1;
+/// The viewer wants 4:2:0 to start with (faster; it may still switch to
+/// 4:4:4 later with `SetMode`).
+pub const CAP_PREFER_420: u8 = 2;
 
 /// `HostNotice` codes: why the host can't do what the viewer expects.
 pub const NOTICE_NONE: u8 = 0;

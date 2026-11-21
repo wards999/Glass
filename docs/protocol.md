@@ -82,7 +82,7 @@ Framing (inside TLS): `u16 length` (type + body) · `u8 type` · body. Max
 
 | Type | Name | Direction | Body |
 |---|---|---|---|
-| 1 | Hello | viewer → host | `version u8`, `display_w u16`, `display_h u16`, `refresh_hz u16` (the viewer's screen in pixels, 0 = unknown), `caps u8` (bit 0: can decode HEVC 4:4:4), `mode u8` (view mode wanted, below) |
+| 1 | Hello | viewer → host | `version u8`, `display_w u16`, `display_h u16`, `refresh_hz u16` (the viewer's screen in pixels, 0 = unknown), `caps u8` (bit 0: can decode HEVC 4:4:4; bit 1: start in 4:2:0), `mode u8` (view mode wanted, below) |
 | 2 | Welcome | host → viewer | `version u8`, `codec u8`, `chroma u8`, `mode u8`, `width u16`, `height u16`, `fps u16`, `udp_port u16`, `session_id u32` |
 | 3 | Reject | host → viewer | `reason u8`: 1 version mismatch, 2 busy, 3 not paired, 4 denied by the host's user, 5 pairing locked (too many wrong PINs), 6 wrong or expired PIN |
 | 4 | Ping | viewer → host | `seq u32`, `client_ts u64` |

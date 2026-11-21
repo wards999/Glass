@@ -119,6 +119,8 @@ public final class HostRunner {
 private final class Totals {
     let encode = Stats(), delivery = Stats(), vtEncode = Stats(), send = Stats(), interval = Stats()
     var frames = 0, idrs = 0, notSent = 0, idleIDRs = 0, bytes = 0
+    /// Captured frames dropped because a newer one arrived while encoding.
+    var stale = 0
     var frameId: UInt32 = 0
     var psnrY: [Double] = [], psnrC: [Double] = []
     var producedChroma: Int?
@@ -137,6 +139,8 @@ private final class HostSessionRun {
     var current: GLASS_StreamInfo
     /// The encoder couldn't make 4:4:4 here: don't try again this session.
     var no444 = false
+    var virtualDisp: HostDisplay?
+    var virtualNote = ""
     var history: [String] = []
     let failLock = NSLock()
     var failure: String?
@@ -170,8 +174,13 @@ private final class HostSessionRun {
     func configure(mode: UInt8, allow444: Bool) {
         pipeline?.stop()
         pipeline = nil
-        virtual?.destroy()
-        virtual = nil
+        // Only the colour changes: keep the virtual display (re-creating it
+        // re-arranges the Mac's windows for nothing).
+        let reuse = virtual != nil && mode == current.mode
+        if !reuse {
+            virtual?.destroy()
+            virtual = nil
+        }
         let o = runner.options
         let viewer = q.sync { s.viewer }
         var disp = runner.display
@@ -196,6 +205,10 @@ private final class HostSessionRun {
             if o.testPattern {
                 disp = HostDisplay(id: disp.id, width: vw, height: vh, fps: 60, bounds: disp.bounds)
                 actual = mode
+            } else if reuse, let vd = virtualDisp {
+                disp = vd
+                actual = mode
+                note = virtualNote
             } else if VirtualDisplay.available,
                       let v = VirtualDisplay(name: "Glass \(vw)x\(vh)", pointsW: pw, pointsH: ph, hiDPI: hidpi,
                                              hz: 60, mirror: runner.display.id) {
@@ -204,6 +217,8 @@ private final class HostSessionRun {
                 disp = HostDisplay(id: v.id, width: vw, height: vh, fps: 60, bounds: CGDisplayBounds(v.id))
                 actual = mode
                 note = " (virtual display, looks like \(pw)x\(ph)\(hidpi ? " HiDPI" : ""))"
+                virtualDisp = disp
+                virtualNote = note
             } else {
                 note = " (virtual display unavailable: showing the Mac's screen)"
             }
@@ -238,7 +253,8 @@ private final class HostSessionRun {
     func run() -> String {
         let started = GlassClock.nowUs()
         let viewer = q.sync { s.viewer }
-        configure(mode: viewer.mode, allow444: true)
+        // 4:4:4 from the start unless the viewer prefers 4:2:0.
+        configure(mode: viewer.mode, allow444: viewer.caps & UInt8(GLASS_CAP_PREFER_420) == 0)
 
         let cursorTimer = DispatchSource.makeTimerSource(queue: .main)
         cursorTimer.schedule(deadline: .now(), repeating: .milliseconds(33))
@@ -304,6 +320,7 @@ private final class HostSessionRun {
         out.append(t.vtEncode.line("  VideoToolbox"))
         out.append(t.send.line("send (packetise)"))
         out.append(t.interval.line("capture interval"))
+        out.append("  stale frames skipped (encoder still busy, newest frame wins): \(t.stale)")
         if !t.psnrY.isEmpty {
             func p50(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
             let good = t.psnrY.filter { $0 >= 45 }.count
@@ -329,17 +346,26 @@ private final class Pipeline {
     let converter: Converter?
     var probe: QualityProbe?
     let idle: DispatchSourceTimer
-    var lastFrame: CVPixelBuffer?
-    var lastCapture: UInt64 = 0
+    var lastFrame: CVPixelBuffer? // under lock
+    var lastCapture: UInt64 = 0 // under lock
     var forceKey = true // a new stream starts with an IDR
     var count = 0
+    /// Capture runs here; encoding on the session queue. If the encoder is
+    /// still busy when frames arrive, only the newest waits: the picture is
+    /// never more than one frame behind (m3c-test4: lag grew while dragging).
+    let captureQ = DispatchQueue(label: "glass.capture", qos: .userInteractive)
+    /// The sharpness probe decodes and compares off the hot path.
+    let probeQ = DispatchQueue(label: "glass.probe", qos: .utility)
+    private let lock = NSLock()
+    private var pending: (CVPixelBuffer, UInt64)?
+    private var busy = false
 
     init(run: HostSessionRun, display: HostDisplay, chroma444: Bool) throws {
         self.run = run
         let o = run.runner.options
         source = o.testPattern
-            ? TestPatternSource(width: display.width, height: display.height, fps: display.fps, queue: run.q)
-            : ScreenSource(display: display, queue: run.q, bgra: chroma444)
+            ? TestPatternSource(width: display.width, height: display.height, fps: display.fps, queue: captureQ)
+            : ScreenSource(display: display, queue: captureQ, bgra: chroma444)
         encoder = try HEVCEncoder(.init(width: display.width, height: display.height, fps: display.fps,
                                         bitrate: o.mbps * 1_000_000, chroma444: chroma444))
         converter = chroma444 ? Converter(width: display.width, height: display.height) : nil
@@ -351,10 +377,16 @@ private final class Pipeline {
     func start() {
         let t = run.totals
         source.start({ [self] pb, captureUs in
-            if lastCapture > 0 { t.interval.push(UInt32(clamping: captureUs &- lastCapture)) }
+            lock.lock()
+            if lastCapture > 0, captureUs > lastCapture { t.interval.push(UInt32(clamping: captureUs - lastCapture)) }
             lastCapture = captureUs
             lastFrame = pb
-            encodeAndSend(pb, captureUs, force: false)
+            if pending != nil { t.stale += 1 }
+            pending = (pb, captureUs)
+            let kick = !busy
+            busy = true
+            lock.unlock()
+            if kick { run.q.async { [self] in drain() } }
         }, { [weak self] error in
             if let error { self?.run.fail("screen capture stopped: \(error.localizedDescription)") }
         })
@@ -362,23 +394,45 @@ private final class Pipeline {
         // requests (and a new stream's first IDR) with the last picture.
         idle.schedule(deadline: .now() + .milliseconds(50), repeating: .milliseconds(50))
         idle.setEventHandler { [weak self] in
-            guard let self, let pb = self.lastFrame, GlassClock.nowUs() &- self.lastCapture > 50_000 else { return }
+            guard let self else { return }
+            let (frame, last) = self.lock.withLock { (self.lastFrame, self.lastCapture) }
+            guard let pb = frame, GlassClock.nowUs() &- last > 50_000 else { return }
             if self.forceKey || self.run.s.takeKeyframeRequest() {
                 t.idleIDRs += 1
                 let now = GlassClock.nowUs()
-                self.lastCapture = now
+                self.lock.withLock { self.lastCapture = now }
                 self.encodeAndSend(pb, now, force: true)
             }
         }
         idle.resume()
     }
 
+    /// Encodes the newest waiting frame until none is left (session queue).
+    private func drain() {
+        while true {
+            lock.lock()
+            guard let (pb, ts) = pending else {
+                busy = false
+                lock.unlock()
+                return
+            }
+            pending = nil
+            lock.unlock()
+            encodeAndSend(pb, ts, force: false)
+        }
+    }
+
     /// Stops capture and waits until nothing of this pipeline runs.
     func stop() {
         source.stop()
         idle.cancel()
+        captureQ.sync {}
         run.q.sync {}
-        lastFrame = nil
+        probeQ.sync {}
+        lock.withLock {
+            lastFrame = nil
+            pending = nil
+        }
     }
 
     private func encodeAndSend(_ pb: CVPixelBuffer, _ captureUs: UInt64, force: Bool) {
@@ -427,9 +481,18 @@ private final class Pipeline {
                 } else {
                     run.fail("sending failed")
                 }
-                if let probe, let p = probe.feed(data, source: frame, measure: measure) {
-                    t.psnrY.append(p.y)
-                    t.psnrC.append(p.c)
+                if let probe, let base = data.baseAddress {
+                    // Decode and compare on the probe queue (a copy: `data`
+                    // is only valid here).
+                    let copy = Data(bytes: base, count: data.count)
+                    let source = frame
+                    probeQ.async {
+                        let p = copy.withUnsafeBytes { probe.feed($0, source: source, measure: measure) }
+                        if let p {
+                            t.psnrY.append(p.y)
+                            t.psnrC.append(p.c)
+                        }
+                    }
                 }
             }
             if t.producedChroma == nil { t.producedChroma = encoder.producedChroma }

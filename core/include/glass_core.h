@@ -175,6 +175,12 @@
 #define GLASS_CAP_HEVC_444 1
 
 /**
+ * The viewer wants 4:2:0 to start with (faster; it may still switch to
+ * 4:4:4 later with `SetMode`).
+ */
+#define GLASS_CAP_PREFER_420 2
+
+/**
  * `HostNotice` codes: why the host can't do what the viewer expects.
  */
 #define GLASS_NOTICE_NONE 0

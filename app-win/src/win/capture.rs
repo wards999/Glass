@@ -1,5 +1,7 @@
-//! Monitor capture via Windows.Graphics.Capture. Frames stay on the GPU as
-//! BGRA D3D11 textures; only changed frames are delivered.
+//! Monitor capture. Normally Windows.Graphics.Capture; the agent the Glass
+//! service runs uses Desktop Duplication (`dda.rs`) instead, which can show
+//! the lock screen and UAC prompts (M3f). Frames stay on the GPU as BGRA
+//! D3D11 textures; only changed frames are delivered.
 
 use super::{d3d::Gpu, Res};
 use windows::core::Interface;
@@ -32,7 +34,7 @@ pub struct Monitor {
     pub height: u32,
     pub refresh_hz: u32,
     pub primary: bool,
-    hmon: HMONITOR,
+    pub(super) hmon: HMONITOR,
 }
 
 pub fn monitors() -> Res<Vec<Monitor>> {
@@ -99,17 +101,73 @@ pub struct Frame {
     /// Compositor timestamp (SystemRelativeTime), µs on the QPC clock.
     pub ts_us: u64,
     pub size: (u32, u32),
-    _frame: windows::Graphics::Capture::Direct3D11CaptureFrame,
+    _frame: Option<windows::Graphics::Capture::Direct3D11CaptureFrame>,
 }
 
-pub struct Capture {
+/// Either capture method, behind one interface.
+pub enum Capture {
+    Wgc(Wgc),
+    Dda(super::dda::Dda),
+}
+
+impl Capture {
+    /// `desktops`: Desktop Duplication, following the lock screen and UAC
+    /// prompts (the service's agent); otherwise Windows.Graphics.Capture.
+    pub fn start(gpu: &Gpu, mon: &Monitor, desktops: bool) -> Res<Self> {
+        Ok(if desktops {
+            Capture::Dda(super::dda::Dda::start(
+                gpu,
+                mon.hmon,
+                (mon.width, mon.height),
+            )?)
+        } else {
+            Capture::Wgc(Wgc::start(gpu, mon)?)
+        })
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Capture::Wgc(c) => c.size(),
+            Capture::Dda(c) => c.size(),
+        }
+    }
+
+    pub fn wait(&mut self, timeout_ms: u32) {
+        match self {
+            Capture::Wgc(c) => c.wait(timeout_ms),
+            Capture::Dda(c) => c.wait(timeout_ms),
+        }
+    }
+
+    pub fn next_frame(&mut self) -> Res<Option<Frame>> {
+        match self {
+            Capture::Wgc(c) => c.next_frame(),
+            Capture::Dda(c) => Ok(c.next_frame()?.map(|(texture, size)| Frame {
+                texture,
+                ts_us: glass_core::clock::now_us(),
+                size,
+                _frame: None,
+            })),
+        }
+    }
+
+    /// Desktop switches seen (lock screen, UAC), for the report.
+    pub fn desktop_switches(&self) -> u64 {
+        match self {
+            Capture::Wgc(_) => 0,
+            Capture::Dda(c) => c.switches,
+        }
+    }
+}
+
+pub struct Wgc {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
     event: HANDLE,
     size: (u32, u32),
 }
 
-impl Capture {
+impl Wgc {
     pub fn start(gpu: &Gpu, mon: &Monitor) -> Res<Self> {
         let item: GraphicsCaptureItem = unsafe {
             windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?
@@ -170,12 +228,12 @@ impl Capture {
             texture,
             ts_us,
             size: (cs.Width as u32, cs.Height as u32),
-            _frame: frame,
+            _frame: Some(frame),
         }))
     }
 }
 
-impl Drop for Capture {
+impl Drop for Wgc {
     fn drop(&mut self) {
         let _ = self.session.Close();
         let _ = self.pool.Close();

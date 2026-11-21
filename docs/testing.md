@@ -10,6 +10,24 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M3f test 1 (the Windows service: unattended access)
+On the PC to be reached from far away (QUIETPC), from the extracted zip:
+1. Open **Glass.exe** > gear > **Unattended access** > **Install service …**.
+   Windows asks for administrator rights; a window shows what it did, then
+   press Enter. (Or run `glass-cli service install` as administrator.)
+2. The share card now says **Always on** with a **Service** tag.
+3. From the other PC (or the Mac), connect to it. You should see its screen.
+4. **Lock it** (Win+L on the remote view, or lock it at the PC). The viewer
+   should show the lock screen; click and type the password in the viewer to
+   sign in.
+5. Open something that asks for admin rights (e.g. right-click Command Prompt
+   > Run as administrator): the UAC prompt should show and answer in the viewer.
+6. Through Windows Remote Desktop: connect to QUIETPC with Remote Desktop, then
+   view it with Glass: you see its own screen (locked while Remote Desktop is
+   connected) and can sign in there (this ends the Remote Desktop session).
+7. Send back the viewer results, `C:\ProgramData\Glass\service.log`, and
+   anything odd. Remove it again any time from the same Settings section.
+
 ## M3d test 6 (the redesigned window; replaces tests 4 and 5)
 Use the zip and dmg from the same test build (protocol v7). Extract the zip
 on both PCs.

@@ -73,3 +73,13 @@ Commands (glass-cli.exe, from a Command Prompt in this folder):
 Ports: TCP and UDP 47800 (change with --port; on the Mac, type address:port).
 
 FFmpeg (LGPL) DLLs are included; see FFmpeg-LICENSE.txt.
+
+Unattended access (the Glass service, M3f):
+  To use this PC from far away, including its lock screen, sign-in and UAC
+  prompts: Glass > gear > Unattended access > Install service (Windows asks
+  for administrator rights), or as administrator:  glass-cli service install
+  It copies this build to C:\Program Files\Glass, keeps this PC's pairings,
+  allows it through Windows Firewall on private networks and starts it.
+  Installing again from a newer build updates it.
+  Remove it:  Settings > Remove service, or  glass-cli service uninstall
+  Log: C:\ProgramData\Glass\service.log

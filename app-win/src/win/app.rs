@@ -161,6 +161,11 @@ struct GlassApp {
     viewing: Option<String>,
     /// Someone is viewing this PC (sharing, in a session).
     viewer_on: bool,
+    /// The Glass service (unattended access, M3f) and its agent's status.
+    svc: super::service::State,
+    svc_status: Option<super::service::Status>,
+    /// This window runs in a Remote Desktop session.
+    remote: bool,
     notice: Option<(String, Instant)>,
     sharing: Option<Arc<AtomicBool>>,
     /// Ends the current shared session (sharing goes on).
@@ -237,6 +242,9 @@ pub fn run(share: bool) -> Res<()> {
                 connecting: None,
                 viewing: None,
                 viewer_on: false,
+                svc: super::service::state(),
+                svc_status: super::service::Status::read(),
+                remote: super::service::in_remote_session(),
                 notice: None,
                 sharing: None,
                 end_session: Arc::new(AtomicBool::new(false)),
@@ -603,6 +611,9 @@ impl GlassApp {
     }
 
     fn toggle_share(&mut self) {
+        if self.svc == super::service::State::Running && self.sharing.is_none() {
+            return; // the Glass service already shares this PC
+        }
         if let Some(stop) = self.sharing.take() {
             stop.store(true, Ordering::Relaxed);
             // Wake the listener so it sees `stop`.
@@ -1126,7 +1137,8 @@ impl GlassApp {
         painter.rect_stroke(rect, 14, Stroke::new(1.0, p.border), StrokeKind::Inside);
         let c = pos2(rect.center().x, rect.top() + 78.0);
         // During a session it's still (no searching animation) and says so.
-        let in_session = self.viewing.is_some() || self.viewer_on;
+        let svc_connected = self.svc_status.as_ref().is_some_and(|s| s.connected);
+        let in_session = self.viewing.is_some() || self.viewer_on || svc_connected;
         let col = if in_session { p.ok } else { p.accent };
         if !in_session {
             let t = ui.input(|i| i.time) as f32;
@@ -1146,6 +1158,14 @@ impl GlassApp {
                 "In a session".to_string(),
                 if self.viewer_on {
                     truncate(&self.share_status, 56)
+                } else if svc_connected {
+                    truncate(
+                        &self
+                            .svc_status
+                            .as_ref()
+                            .map_or(String::new(), |s| s.line.clone()),
+                        56,
+                    )
                 } else {
                     "Viewing another device.".to_string()
                 },
@@ -1186,7 +1206,8 @@ impl GlassApp {
     }
 
     fn share_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Pal) {
-        let on = self.sharing.is_some() || self.demo.as_deref() == Some("share");
+        let svc_on = self.svc == super::service::State::Running;
+        let on = svc_on || self.sharing.is_some() || self.demo.as_deref() == Some("share");
         ui.horizontal(|ui| {
             let (tile, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
             let col = if on { p.ok } else { p.weak };
@@ -1206,7 +1227,13 @@ impl GlassApp {
                     let (dot, _) = ui.allocate_exact_size(vec2(8.0, 14.0), Sense::hover());
                     ui.painter()
                         .circle_filled(dot.center(), 4.0, if on { p.ok } else { p.off });
-                    let text = if on || !self.share_status.is_empty() {
+                    let text = if svc_on {
+                        let line = self
+                            .svc_status
+                            .as_ref()
+                            .map_or("starting \u{2026}".to_string(), |s| s.line.clone());
+                        truncate(&format!("Always on \u{00B7} {line}"), 44)
+                    } else if on || !self.share_status.is_empty() {
                         truncate(&self.share_status, 44)
                     } else {
                         "Off \u{00B7} other devices can\u{2019}t connect".to_string()
@@ -1215,12 +1242,28 @@ impl GlassApp {
                 });
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if toggle(ui, on, p).clicked() && self.demo.is_none() {
+                if svc_on {
+                    // The service shares; Settings > Unattended access removes it.
+                    egui::Frame::new()
+                        .fill(p.ok.gamma_multiply(0.15))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(Margin::symmetric(10, 4))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Service").size(12.5).color(p.ok));
+                        })
+                        .response
+                        .on_hover_text("Unattended access is on: the Glass service shares this PC, including the lock screen and UAC prompts. Settings removes it.");
+                } else if toggle(ui, on, p).clicked() && self.demo.is_none() {
                     self.toggle_share();
                 }
             });
         });
-        if let Some((digits, who)) = &self.pin {
+        let pin = if svc_on {
+            self.svc_status.as_ref().and_then(|s| s.pin.clone())
+        } else {
+            self.pin.clone()
+        };
+        if let Some((digits, who)) = &pin {
             ui.add_space(6.0);
             ui.separator();
             ui.add_space(4.0);
@@ -1262,7 +1305,46 @@ impl GlassApp {
             }
             ui.add_space(2.0);
         }
-        if on && !self.elevated {
+        if self.remote {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    RichText::new(ic('\u{E7BA}', "\u{26A0}"))
+                        .font(icon_font(12.0))
+                        .color(p.warn),
+                );
+                if svc_on {
+                    ui.label(
+                        RichText::new("You\u{2019}re using this PC through Remote Desktop. Viewers see its own screen, which stays locked until you sign in there.")
+                            .size(12.5)
+                            .color(p.weak),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("You\u{2019}re using this PC through Remote Desktop: Glass can\u{2019}t show this session.")
+                            .size(12.5)
+                            .color(p.weak),
+                    );
+                    let link = ui.add(
+                        egui::Label::new(
+                            RichText::new("Move it to the PC\u{2019}s screen")
+                                .size(12.5)
+                                .color(p.accent),
+                        )
+                        .sense(Sense::click()),
+                    );
+                    if link
+                        .on_hover_text("Runs tscon as administrator: Remote Desktop disconnects and this session carries on, unlocked, on the PC\u{2019}s own screen, where Glass can show it.")
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        super::service::move_session_to_console();
+                    }
+                }
+            });
+        }
+        if on && !svc_on && !self.elevated {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -1309,6 +1391,12 @@ impl eframe::App for GlassApp {
         }
         if self.last_scan.elapsed() > Duration::from_millis(1500) {
             self.scan();
+            self.svc = super::service::state();
+            self.svc_status = if self.svc == super::service::State::Running {
+                super::service::Status::read()
+            } else {
+                None
+            };
         }
         ctx.request_repaint_after(Duration::from_millis(1500));
     }
@@ -1658,6 +1746,9 @@ impl GlassApp {
                                 color: Color32::from_black_alpha(70),
                             })
                             .show(ui, |ui| {
+                    // Scrolls when it's taller than the window.
+                    let max_h = (ctx.content_rect().bottom() - at.y - 60.0).max(240.0);
+                    egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).show(ui, |ui| {
                     ui.set_width(380.0);
                     ui.label(RichText::new("Settings").font(semibold(18.0)).color(p.strong));
                     ui.add_space(4.0);
@@ -1694,6 +1785,34 @@ impl GlassApp {
                             .size(12.5)
                             .color(p.weak),
                     );
+                    ui.add_space(10.0);
+
+                    section(ui, "Unattended access", p);
+                    let svc = self.svc;
+                    ui.label(
+                        RichText::new(match svc {
+                            super::service::State::Running => "On: the Glass service shares this PC at all times, including the lock screen, sign-in and UAC prompts, so it can be used from far away.",
+                            super::service::State::Stopped => "Installed, but the Glass service isn\u{2019}t running.",
+                            super::service::State::NotInstalled => "Install the Glass service to use this PC from far away: it shares at all times, including the lock screen, sign-in and UAC prompts. Windows asks for administrator rights.",
+                        })
+                        .size(12.5)
+                        .color(p.weak),
+                    );
+                    ui.horizontal(|ui| {
+                        let (label, verb) = if svc == super::service::State::NotInstalled {
+                            ("Install service \u{2026}", "install")
+                        } else {
+                            ("Remove service \u{2026}", "uninstall")
+                        };
+                        if ui.add(plain_button(label, p)).clicked() {
+                            super::service::run_elevated(verb);
+                        }
+                        if svc != super::service::State::NotInstalled
+                            && ui.add(plain_button("Update to this build \u{2026}", p)).clicked()
+                        {
+                            super::service::run_elevated("install");
+                        }
+                    });
                     ui.add_space(10.0);
 
                     section(ui, "Paired devices", p);
@@ -1735,6 +1854,7 @@ impl GlassApp {
                         .size(12.0)
                         .color(p.weak),
                     );
+                    });
                             });
                     })
                     .response

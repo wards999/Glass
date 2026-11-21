@@ -277,6 +277,10 @@ pub fn cli_main() {
         #[cfg(windows)]
         Some("host") => win::host(&args[1..]),
         #[cfg(windows)]
+        Some("agent") => win::agent(&args[1..]),
+        #[cfg(windows)]
+        Some("service") => win::service::command(&args[1..]),
+        #[cfg(windows)]
         Some("connect") => connect::connect(&args[1..]),
         #[cfg(windows)]
         Some("list") => win::list(),

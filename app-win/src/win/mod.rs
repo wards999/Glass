@@ -9,13 +9,16 @@ mod capture;
 mod cuda;
 mod cursor;
 mod d3d;
+mod dda;
 mod decode;
 mod decode444;
+pub mod desktop;
 pub mod dpapi;
 mod encode;
 mod inject;
 mod mdns;
 mod present;
+pub mod service;
 mod stats_box;
 pub mod viewer;
 
@@ -69,6 +72,9 @@ struct Args {
     ask: bool,
     /// A fixed pairing PIN (tests and local checks only).
     pin: Option<String>,
+    /// The service's agent: Desktop Duplication following the lock screen
+    /// and UAC prompts, input on whichever desktop is showing (M3f).
+    desktops: bool,
     out: String,
 }
 
@@ -83,6 +89,7 @@ fn parse(args: &[String]) -> Res<Args> {
         local: false,
         ask: false,
         pin: None,
+        desktops: false,
         out: String::new(),
     };
     let mut it = args.iter();
@@ -97,6 +104,7 @@ fn parse(args: &[String]) -> Res<Args> {
             "--local" => a.local = true,
             "--ask" => a.ask = true,
             "--pin" => a.pin = Some(val()?.to_string()),
+            "--desktops" => a.desktops = true,
             "--chroma" => {
                 a.chroma444 = match val()?.as_str() {
                     "444" => true,
@@ -163,7 +171,7 @@ pub fn record(args: &[String]) -> Res<()> {
         a.seconds
     );
 
-    let mut cap = capture::Capture::start(&gpu, mon)?;
+    let mut cap = capture::Capture::start(&gpu, mon, false)?;
     let (w, h) = cap.size();
     let mut enc = encode::Encoder::new(
         &gpu.device,
@@ -386,6 +394,59 @@ pub fn host(args: &[String]) -> Res<()> {
     )
 }
 
+/// `glass-cli agent`: what the Glass service runs as SYSTEM in the PC's
+/// console session (M3f). Shares until the service stops it, telling the
+/// Glass window how it's going through `C:\ProgramData\Glass\status.txt`.
+pub fn agent(args: &[String]) -> Res<()> {
+    service::agent_env();
+    let status = Arc::new(std::sync::Mutex::new(service::Status::default()));
+    let (s1, s2, s3) = (status.clone(), status.clone(), status.clone());
+    let update = |s: &Arc<std::sync::Mutex<service::Status>>,
+                  f: &mut dyn FnMut(&mut service::Status)| {
+        let mut g = s.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut g);
+        g.write();
+    };
+    let ui = HostUi {
+        event: Box::new(move |e| {
+            update(&s1, &mut |st| match &e {
+                HostEvent::PairingPin { device, pin, .. } => {
+                    st.pin = Some((pin.clone(), device.clone()))
+                }
+                HostEvent::Paired { .. } | HostEvent::PairingLocked => st.pin = None,
+                _ => {}
+            });
+            crate::print_event(e);
+        }),
+        line: Box::new(move |l| {
+            let l = l.trim();
+            update(&s2, &mut |st| {
+                if l.starts_with("Viewer connected") {
+                    st.connected = true;
+                    st.pin = None;
+                    st.line = l.to_string();
+                } else if l.starts_with("Waiting for a viewer") {
+                    st.connected = false;
+                    st.line = "Waiting for a viewer".to_string();
+                }
+            });
+            println!("{l}");
+        }),
+        report: Box::new(move |_| update(&s3, &mut |st| st.connected = false)),
+        stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        end: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let mut a = args.to_vec();
+    a.push("--desktops".into());
+    // A heartbeat, so the window knows the agent is alive while it waits.
+    let beat = status.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        beat.lock().unwrap_or_else(|e| e.into_inner()).write();
+    });
+    host_with(&a, ui)
+}
+
 /// Where a host's messages go: the console (`glass host`) or the app's window.
 pub struct HostUi {
     /// Pairing PINs, refusals and the like.
@@ -502,7 +563,7 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
 
     let port = listener.port();
     while !stop.load(Ordering::Relaxed) {
-        let mut cap = capture::Capture::start(&gpu, mon)?;
+        let mut cap = capture::Capture::start(&gpu, mon, a.desktops)?;
         let (w, h) = cap.size();
         let info = StreamInfo {
             codec: CODEC_HEVC,
@@ -528,7 +589,14 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
         let blocked = Arc::new(AtomicU64::new(0));
         let blocking = Arc::new(AtomicU8::new(0));
         let (b, bl) = (blocked.clone(), blocking.clone());
+        let follow = a.desktops;
+        let mut follower = desktop::Follower::new();
         let sink = Box::new(move |action| {
+            // The agent: put input on whichever desktop is showing (the lock
+            // screen, a UAC prompt) once the capture thread has moved there.
+            if follow {
+                follower.check();
+            }
             // Without admin rights Windows drops every injected event while an
             // admin window has focus, so a click can't move focus away. Try
             // bringing the clicked window forward instead (best effort).
@@ -693,7 +761,14 @@ fn run_session(
             }
         }
         let now = clock::now_us();
-        if let Some(b) = watch.poll(now, 250_000) {
+        // The agent runs as SYSTEM on whichever desktop is showing: nothing
+        // blocks it (the lock screen and UAC prompts are what it's for).
+        let polled = if a.desktops {
+            None
+        } else {
+            watch.poll(now, 250_000)
+        };
+        if let Some(b) = polled {
             blocking.store(b.code(), Ordering::Relaxed);
             let _ = session.send_notice(b.code());
             if let Some(since) = blocked_since.take() {
@@ -797,6 +872,13 @@ fn run_session(
         fmt_line("capture interval", &run.intervals.intervals.summary())
     );
     let _ = writeln!(r, "{}", size_line(&run.size.summary()));
+    if a.desktops {
+        let _ = writeln!(
+            r,
+            "  desktop switches (lock screen, sign-in, UAC) followed: {}",
+            cap.desktop_switches()
+        );
+    }
     if let Some(since) = blocked_since {
         run.blocked_us += clock::now_us() - since;
     }

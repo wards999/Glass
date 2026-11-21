@@ -7,6 +7,28 @@ import GlassKit
 /// While it is open the host measures sharpness (PSNR) of what it sends.
 final class TestCardController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
+    private var observer: Any?
+
+    /// What the PC is being sent ("fit, more space 2560x1440 4:4:4 ..."),
+    /// shown in a banner so each view can be told apart on the PC.
+    var nowShowing = "the Mac's screen" {
+        didSet {
+            (window?.contentView as? TestCardView)?.nowShowing = nowShowing
+            // A view change resizes the screen: keep the card on it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.fit() }
+        }
+    }
+
+    /// Sizes the card to fit inside the screen it's on (the "larger" view
+    /// is only 720 points tall).
+    private func fit() {
+        guard let w = window, let vf = (w.screen ?? NSScreen.main)?.visibleFrame else { return }
+        let size = NSSize(width: min(1100, vf.width - 40), height: min(720, vf.height - 40))
+        let frame = w.frameRect(forContentRect: NSRect(origin: .zero, size: size))
+        let fitted = NSSize(width: min(frame.width, vf.width), height: min(frame.height, vf.height))
+        w.setFrame(NSRect(x: vf.midX - fitted.width / 2, y: vf.midY - fitted.height / 2,
+                          width: fitted.width, height: fitted.height), display: true)
+    }
 
     func show() {
         if let w = window {
@@ -17,22 +39,30 @@ final class TestCardController: NSObject, NSWindowDelegate {
                          styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         w.title = "Glass Clarity Test Card"
         w.isReleasedWhenClosed = false
-        w.contentView = TestCardView()
+        let view = TestCardView()
+        view.nowShowing = nowShowing
+        w.contentView = view
         w.delegate = self
-        w.center()
-        w.makeKeyAndOrderFront(nil)
         window = w
+        fit()
+        observer = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.fit() }
+        w.makeKeyAndOrderFront(nil)
         HostRunner.measureQuality = true
     }
 
     func windowWillClose(_ notification: Notification) {
         HostRunner.measureQuality = false
+        if let o = observer { NotificationCenter.default.removeObserver(o) }
+        observer = nil
         window = nil
     }
 }
 
 final class TestCardView: NSView {
     override var isFlipped: Bool { true }
+    var nowShowing = "" { didSet { needsDisplay = true } }
 
     override func draw(_ dirty: NSRect) {
         let px = 1 / (window?.backingScaleFactor ?? 2) // one device pixel
@@ -47,7 +77,13 @@ final class TestCardView: NSView {
             (.black, "black"), (.systemRed, "red"), (NSColor(srgbRed: 0, green: 0, blue: 1, alpha: 1), "blue"),
             (NSColor(srgbRed: 0, green: 0.6, blue: 0, alpha: 1), "green"), (.systemPurple, "purple"),
         ]
-        var y: CGFloat = 12
+        // Which view this is, readable on the PC.
+        NSColor.systemYellow.setFill()
+        NSRect(x: 0, y: 0, width: bounds.width, height: 34).fill()
+        let banner: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 18, weight: .semibold),
+                                                     .foregroundColor: NSColor.black]
+        ("Now showing: \(nowShowing)" as NSString).draw(at: NSPoint(x: 12, y: 6), withAttributes: banner)
+        var y: CGFloat = 46
         func text(_ s: String, _ size: CGFloat, _ colour: NSColor, x: CGFloat) {
             let a: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: size), .foregroundColor: colour]
             (s as NSString).draw(at: NSPoint(x: x, y: y), withAttributes: a)

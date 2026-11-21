@@ -134,6 +134,7 @@ final class HostController: NSObject, NSWindowDelegate {
             let r = try HostRunner(device: device, options: .init(), banner: banner)
             r.onEvent = { [weak self] e in self?.event(e) }
             r.onStreamChanged = { [weak self] line in
+                self?.testCard.nowShowing = line
                 self?.streamLabel.stringValue = "Showing: \(line). The PC picks this with Ctrl+Alt+Shift+R."
             }
             r.onConnected = { [weak self] name, addr in

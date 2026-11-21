@@ -1,6 +1,6 @@
 # M3c — Sharp text, view modes, 4:4:4: results
 
-**Status: m3c-test1 done (views work; 4:4:4 not yet). m3c-test2 pending, with the 4:4:4 fix.**
+**Status: DONE** (2026-11-21, after m3c-test4). The user asked to move straight on to the on-screen control bar (M3d). The test5 fix (newest frame wins) gets checked in the first M3d test: dragging must not get laggier over time.
 **Date:** 2026-11-21 · design: ADR 0012 · protocol v5
 
 ## What's in it

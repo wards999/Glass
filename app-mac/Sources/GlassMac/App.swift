@@ -469,7 +469,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         shareRow.alignment = .centerY
         let shareCard = Card(shareRow)
 
-        let stack = NSStackView(views: [header, devicesHeader, scroll, addressLink, addressRow, shareCard])
+        let stack = NSStackView(views: [header, devicesHeader, scroll, addressLink!, addressRow!, shareCard])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
@@ -487,7 +487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             icon.widthAnchor.constraint(equalToConstant: 44),
             icon.heightAnchor.constraint(equalToConstant: 44),
         ]
-        for v in [header, devicesHeader, scroll, addressRow, shareCard] {
+        for v in [header, devicesHeader, scroll, addressRow!, shareCard] as [NSView] {
             cs.append(v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44))
         }
         NSLayoutConstraint.activate(cs)

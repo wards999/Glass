@@ -157,6 +157,8 @@ struct GlassApp {
     show_address: bool,
     /// The address being connected to (its row shows a spinner).
     connecting: Option<String>,
+    /// The address being viewed (its row says Viewing, with Disconnect).
+    viewing: Option<String>,
     notice: Option<(String, Instant)>,
     sharing: Option<Arc<AtomicBool>>,
     share_status: String,
@@ -229,6 +231,7 @@ pub fn run(share: bool) -> Res<()> {
                 address,
                 show_address: false,
                 connecting: None,
+                viewing: None,
                 notice: None,
                 sharing: None,
                 share_status: String::new(),
@@ -580,6 +583,16 @@ impl GlassApp {
             Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
             _ => (text, DEFAULT_PORT),
         };
+        // A machine's name works too (addresses change; names don't): use
+        // the address it has right now.
+        if let Some(m) = self
+            .machines
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(&h))
+        {
+            let (a, port) = (m.address.clone(), m.port);
+            return self.connect(a, port);
+        }
         self.connect(h, p);
     }
 
@@ -645,11 +658,13 @@ impl GlassApp {
             }
             Msg::Failed(e) => {
                 self.connecting = None;
+                self.viewing = None;
                 self.dialog = Dialog::Message("Couldn\u{2019}t connect".into(), e);
                 show(ctx);
             }
             Msg::Report(r) => {
                 self.connecting = None;
+                self.viewing = None;
                 self.notice = Some((
                     "Session ended. Results are saved next to Glass.exe.".into(),
                     Instant::now(),
@@ -658,7 +673,8 @@ impl GlassApp {
                 show(ctx);
             }
             Msg::Status(s) => {
-                self.connecting = None;
+                // Connected: the row being connected now says Viewing.
+                self.viewing = self.connecting.take();
                 self.notice = Some((s, Instant::now()));
             }
             Msg::Host(e) => self.host_event(ctx, e),
@@ -990,7 +1006,11 @@ impl GlassApp {
     /// One device: click anywhere to connect. True if clicked.
     fn machine_row(&self, ui: &mut egui::Ui, m: &Machine, p: &Pal) -> bool {
         let busy_here = self.connecting.as_deref() == Some(m.address.as_str());
-        let enabled = m.version_ok && self.connecting.is_none();
+        let viewing = self.viewing.as_deref() == Some(m.address.as_str());
+        // One session at a time: while viewing, only that row is live (it
+        // disconnects).
+        let enabled =
+            viewing || (m.version_ok && self.connecting.is_none() && self.viewing.is_none());
         let (rect, resp) = ui.allocate_exact_size(
             vec2(ui.available_width(), 70.0),
             if enabled {
@@ -1036,7 +1056,9 @@ impl GlassApp {
             ui.put(r, egui::Spinner::new().size(20.0).color(p.accent));
         } else {
             // Status, crossfading to a Connect pill on hover.
-            let (dot, label) = if !m.version_ok {
+            let (dot, label) = if viewing {
+                (p.ok, "Viewing")
+            } else if !m.version_ok {
                 (p.weak, "Update Glass")
             } else if m.paired {
                 (p.ok, "Ready")
@@ -1055,20 +1077,18 @@ impl GlassApp {
                 painter.circle_filled(pos2(r.left() - 9.0, right.y), 4.0, dot.gamma_multiply(a));
             }
             if h > 0.01 {
-                let g = painter.layout_no_wrap(
-                    format!("Connect  {}", ic('\u{E72A}', "\u{2192}")),
-                    semibold(13.0),
-                    Color32::WHITE,
-                );
+                let action = if viewing { "Disconnect" } else { "Connect" };
+                let g = painter.layout_no_wrap(action.to_string(), semibold(13.0), Color32::WHITE);
                 let pill = Rect::from_min_max(
                     pos2(right.x - g.size().x - 28.0, right.y - 15.0),
                     pos2(right.x, right.y + 15.0),
                 );
-                painter.rect_filled(pill, 15, p.accent.gamma_multiply(h));
+                let fill = if viewing { p.danger } else { p.accent };
+                painter.rect_filled(pill, 15, fill.gamma_multiply(h));
                 painter.text(
                     pill.center(),
                     Align2::CENTER_CENTER,
-                    "Connect",
+                    action,
                     semibold(13.0),
                     Color32::WHITE.gamma_multiply(h),
                 );
@@ -1306,7 +1326,11 @@ impl eframe::App for GlassApp {
                         }
                     });
                 if let Some((h, port)) = go {
-                    self.connect(h, port);
+                    if self.viewing.as_deref() == Some(h.as_str()) {
+                        disconnect_viewer();
+                    } else {
+                        self.connect(h, port);
+                    }
                 }
 
                 // A typed address, tucked away.
@@ -1334,13 +1358,16 @@ impl eframe::App for GlassApp {
                     ui.horizontal(|ui| {
                         let r = ui.add(
                             egui::TextEdit::singleline(&mut self.address)
-                                .hint_text("Address, e.g. 192.168.1.20")
+                                .hint_text("Name or address, e.g. 192.168.1.20")
                                 .margin(Margin::symmetric(10, 8))
                                 .desired_width(ui.available_width() - 106.0),
                         );
                         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if ui
-                            .add_enabled(self.connecting.is_none(), accent_button("Connect", &p))
+                            .add_enabled(
+                                self.connecting.is_none() && self.viewing.is_none(),
+                                accent_button("Connect", &p),
+                            )
                             .clicked()
                             || enter
                         {
@@ -1671,6 +1698,18 @@ impl GlassApp {
         }
         if close {
             self.dialog = Dialog::None;
+        }
+    }
+}
+
+/// Ends the session being viewed: closes the viewer window (as its own
+/// Disconnect does); the worker then reports the results.
+fn disconnect_viewer() {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE};
+    unsafe {
+        if let Ok(h) = FindWindowW(windows::core::w!("GlassViewer"), None) {
+            let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
     }
 }

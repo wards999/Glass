@@ -42,6 +42,37 @@ pub const ID_PIN: usize = 121;
 pub const ID_STATS: usize = 123;
 pub const ID_DISCONNECT: usize = 122;
 
+/// The part of `client` (screen coordinates) that is on `owner`'s monitor:
+/// the handle and the bar stay inside it, so they're never off screen when
+/// the window hangs over an edge.
+fn on_screen(owner: HWND, client: RECT) -> RECT {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    unsafe {
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mon = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return client;
+        }
+        let m = mi.rcMonitor;
+        let r = RECT {
+            left: client.left.max(m.left),
+            top: client.top.max(m.top),
+            right: client.right.min(m.right),
+            bottom: client.bottom.min(m.bottom),
+        };
+        if r.right - r.left < 40 || r.bottom - r.top < 20 {
+            m
+        } else {
+            r
+        }
+    }
+}
+
 /// One clickable thing on the bar.
 struct Item {
     id: usize,
@@ -610,15 +641,17 @@ impl Bar {
     /// on `centre_x` (the handle) and kept inside the client area.
     pub fn show(&mut self, client: RECT, centre_x: i32) {
         unsafe {
+            let owner = GetWindow(self.hwnd, GW_OWNER).unwrap_or_default();
+            let v = on_screen(owner, client);
             let mut r = RECT::default();
             let _ = GetWindowRect(self.hwnd, &mut r);
             let w = r.right - r.left;
-            let x = (centre_x - w / 2).min(client.right - w);
+            let x = (centre_x - w / 2).clamp(v.left, (v.right - w).max(v.left));
             let _ = SetWindowPos(
                 self.hwnd,
                 Some(HWND_TOPMOST),
-                x.max(client.left),
-                client.top,
+                x,
+                v.top,
                 0,
                 0,
                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
@@ -867,10 +900,12 @@ impl Handle {
         let r = self.rect();
         let w = r.right - r.left;
         let k = unsafe { GetDpiForWindow(self.hwnd).max(96) as f64 / 96.0 };
-        let span = (client.right - client.left - w).max(0);
-        let x = client.left + (span as f64 * self.frac).round() as i32;
-        let y = client.top + (6.0 * k).round() as i32;
-        *BOUNDS.lock().unwrap() = (client.left, client.right);
+        let owner = unsafe { GetWindow(self.hwnd, GW_OWNER).unwrap_or_default() };
+        let v = on_screen(owner, client);
+        let span = (v.right - v.left - w).max(0);
+        let x = v.left + (span as f64 * self.frac).round() as i32;
+        let y = v.top + (6.0 * k).round() as i32;
+        *BOUNDS.lock().unwrap() = (v.left, v.right);
         if self.visible && client == self.placed && r.left == x && r.top == y {
             return;
         }
@@ -901,8 +936,10 @@ impl Handle {
     /// After a drag: work out `frac` from where it was left.
     pub fn moved(&mut self, client: RECT) {
         let r = self.rect();
-        let span = (client.right - client.left - (r.right - r.left)).max(1);
-        self.frac = ((r.left - client.left) as f64 / span as f64).clamp(0.0, 1.0);
+        let owner = unsafe { GetWindow(self.hwnd, GW_OWNER).unwrap_or_default() };
+        let v = on_screen(owner, client);
+        let span = (v.right - v.left - (r.right - r.left)).max(1);
+        self.frac = ((r.left - v.left) as f64 / span as f64).clamp(0.0, 1.0);
     }
 
     pub fn rect(&self) -> RECT {

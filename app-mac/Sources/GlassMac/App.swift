@@ -15,6 +15,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var listStack: NSStackView!
     private var countLabel: NSTextField?
     private var connectingHost: String?
+    /// The address of the machine being viewed (its row says Viewing).
+    private var viewingHost: String?
     private var addressRow: NSStackView!
     private var addressLink: NSButton!
     private var shareSwitch: NSSwitch?
@@ -338,15 +340,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             (a.2 ? 0 : 1, a.1 ? 0 : 1, a.0.name.lowercased()) < (b.2 ? 0 : 1, b.1 ? 0 : 1, b.0.name.lowercased())
         }
         for (h, paired, versionOK) in hosts {
-            let (status, colour): (String, NSColor) = !versionOK ? ("Update Glass", .tertiaryLabelColor)
+            let viewing = viewer != nil && viewingHost == h.address
+            let (status, colour): (String, NSColor) = viewing ? ("Viewing", .systemGreen)
+                : !versionOK ? ("Update Glass", .tertiaryLabelColor)
                 : paired ? ("Ready", .systemGreen) : ("Pair", .systemOrange)
             let kind = h.os == "mac" ? "Mac" : h.os == "windows" ? "Windows PC" : "Glass"
+            // One session at a time: while viewing, only that row is live,
+            // and it disconnects.
             let row = DeviceRow(name: h.name, detail: "\(kind) \u{00B7} \(h.address)", mac: h.os == "mac",
                                 status: status, statusColour: colour,
-                                enabled: versionOK && connectingHost == nil,
-                                busy: connectingHost == h.address)
+                                enabled: viewing || (versionOK && connectingHost == nil && viewer == nil),
+                                busy: connectingHost == h.address,
+                                action: viewing ? "Disconnect" : "Connect")
             if !versionOK { row.toolTip = "This device runs a different version of Glass. Install the same build on both." }
-            row.onClick = { [weak self] in self?.connectFound(h) }
+            row.onClick = { [weak self] in
+                if viewing { self?.viewer?.stop("disconnected from the Glass window") } else { self?.connectFound(h) }
+            }
             add(row)
         }
     }
@@ -464,7 +473,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         addressLink.contentTintColor = .controlAccentColor
         addressLink.font = .systemFont(ofSize: 13)
         hostField = NSTextField(string: UserDefaults.standard.string(forKey: "lastHost") ?? "")
-        hostField.placeholderString = "Address, e.g. 192.168.1.20"
+        hostField.placeholderString = "Name or address, e.g. 192.168.1.20"
         hostField.controlSize = .large
         hostField.target = self
         hostField.action = #selector(connect)
@@ -575,7 +584,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc private func connect() {
-        let (host, port) = parseAddress(hostField.stringValue)
+        var (host, port) = parseAddress(hostField.stringValue)
+        // A machine's name works too (addresses change; names don't): use
+        // the address it has right now.
+        if let h = found.first(where: { $0.name.caseInsensitiveCompare(host) == .orderedSame }) {
+            (host, port) = (h.address, h.port)
+        }
         guard !host.isEmpty, connectButton.isEnabled else { return }
         UserDefaults.standard.set(hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "lastHost")
         connectTo(host, port)
@@ -685,12 +699,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             let v = try LiveViewer(client: client)
             v.onFinish = { [weak self] report in
                 self?.viewer = nil
-                showResults(report)
+                self?.viewingHost = nil
                 self?.showConnect()
+                showResults(report)
             }
             viewer = v
-            browser.stop()
-            connectWindow?.orderOut(nil)
+            viewingHost = client.host
+            connectingHost = nil
+            // The Glass window stays (it shows Viewing, with Disconnect);
+            // the viewer opens full screen in its own space. One session at
+            // a time, so typed connects wait too.
+            connectButton.title = "Connect"
+            connectButton.isEnabled = false
+            refreshFound()
             v.open()
         } catch {
             client.close()
@@ -824,7 +845,8 @@ final class DeviceRow: LayerView {
         }
     }
 
-    init(name: String, detail: String, mac: Bool, status: String, statusColour: NSColor, enabled: Bool, busy: Bool) {
+    init(name: String, detail: String, mac: Bool, status: String, statusColour: NSColor, enabled: Bool, busy: Bool,
+         action: String = "Connect") {
         self.enabled = enabled
         let dot = LayerView(fill: statusColour, stroke: nil, radius: 4)
         dot.widthAnchor.constraint(equalToConstant: 8).isActive = true
@@ -859,7 +881,8 @@ final class DeviceRow: LayerView {
             title.alphaValue = 0.5
         }
 
-        let pillLabel = NSTextField(labelWithString: "Connect")
+        let pillLabel = NSTextField(labelWithString: action)
+        if action != "Connect" { pill.fill = .systemRed }
         pillLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         pillLabel.textColor = .white
         pillLabel.translatesAutoresizingMaskIntoConstraints = false

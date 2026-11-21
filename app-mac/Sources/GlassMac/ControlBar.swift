@@ -72,6 +72,9 @@ final class ControlBar: NSVisualEffectView {
         button(disconnect, "Disconnect", #selector(disconnectTapped))
         status.textColor = .secondaryLabelColor
         status.font = .systemFont(ofSize: 12)
+        // The status gives way first so the bar always fits the window.
+        status.lineBreakMode = .byTruncatingTail
+        status.setContentCompressionResistancePriority(.init(1), for: .horizontal)
 
         for c in [views, colour, full, stats, keys, pin, disconnect] as [NSControl] { c.refusesFirstResponder = true }
         let row = NSStackView(views: [views, colour, full, stats, keys, pin, disconnect, status])

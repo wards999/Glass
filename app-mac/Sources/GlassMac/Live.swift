@@ -629,18 +629,41 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         keyMonitor = nil
         link?.invalidate()
         link = nil
+        closingReason = reason
+        // In full screen, leave it first and close once macOS has finished
+        // (windowDidExitFullScreen). Showing the results (a modal alert)
+        // during the exit animation made AppKit throw: m3d-test12 crash when
+        // the host stopped sharing.
+        if window.styleMask.contains(.fullScreen) {
+            window.toggleFullScreen(nil)
+            // In case the notification never comes.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.finishClose() }
+        } else {
+            finishClose()
+        }
+    }
+
+    private var closingReason: String?
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        if finished { finishClose() }
+    }
+
+    /// Closes the window (once) and hands over the report, after the close
+    /// has settled.
+    private func finishClose() {
+        guard let reason = closingReason else { return }
+        closingReason = nil
         window.delegate = nil
-        // Keep the window alive until macOS has finished with it: closing a
-        // full-screen window runs an exit animation after close() returns,
-        // and this viewer (its only owner) goes away in onFinish. That
-        // crashed when the host ended a full-screen session.
+        // Keep the window alive until macOS is done with it.
         let w: NSWindow = window
         LiveViewer.closing.append(w)
         if w.isVisible { w.close() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
             LiveViewer.closing.removeAll { $0 === w }
         }
-        onFinish(report(reason))
+        let text = report(reason)
+        DispatchQueue.main.async { self.onFinish(text) }
     }
 
     /// Windows of finished viewers, kept for a few seconds (see `completed`).

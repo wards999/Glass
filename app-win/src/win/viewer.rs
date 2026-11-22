@@ -121,6 +121,7 @@ const WM_NEXT_MODE: u32 = WM_APP + 4;
 const WM_TOGGLE_444: u32 = WM_APP + 5;
 const TIMER_CURSOR: usize = 1;
 const TIMER_SHOT: usize = 2;
+const TIMER_REHOOK: usize = 3;
 
 thread_local! {
     static DEBUG_SHOT: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
@@ -199,6 +200,8 @@ struct Shared {
     show_stats: AtomicBool,
     stats_text: Mutex<String>,
     stats_gen: AtomicU32,
+    /// Key presses this viewer sent (for the report).
+    keys_sent: AtomicU32,
 }
 
 impl Shared {
@@ -273,6 +276,29 @@ struct Ui {
 
 thread_local! {
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
+    /// The keyboard hook (re-installed every few seconds: Windows silently
+    /// drops a low-level hook whose thread was once too slow to answer).
+    static HOOK: std::cell::Cell<Option<HHOOK>> = const { std::cell::Cell::new(None) };
+}
+
+/// What the keyboard hook saw (for the report): key presses seen, sent,
+/// skipped because another window was in front, skipped because the viewer
+/// was busy.
+static KEYS_SEEN: AtomicU32 = AtomicU32::new(0);
+static KEYS_NOT_FRONT: AtomicU32 = AtomicU32::new(0);
+static KEYS_BUSY: AtomicU32 = AtomicU32::new(0);
+
+/// (Re-)installs the keyboard hook on this (the window's) thread.
+fn install_hook() {
+    unsafe {
+        if let Some(h) = HOOK.with(|c| c.take()) {
+            let _ = UnhookWindowsHookEx(h);
+        }
+        let inst: Option<HINSTANCE> = GetModuleHandleW(None).ok().map(Into::into);
+        if let Ok(h) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), inst, 0) {
+            HOOK.with(|c| c.set(Some(h)));
+        }
+    }
 }
 
 fn with_ui<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
@@ -367,6 +393,7 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         show_stats: AtomicBool::new(load_stats_pref()),
         stats_text: Mutex::new(String::new()),
         stats_gen: AtomicU32::new(0),
+        keys_sent: AtomicU32::new(0),
         rule: opts.rule.unwrap_or(if client_os == HOST_OS_MAC {
             PcModifierRule::PcStyle
         } else {
@@ -401,17 +428,16 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
     };
 
     // Keyboard hook: keys go to the host while our window is in front.
-    let hook = unsafe {
-        let inst: HINSTANCE = GetModuleHandleW(None)?.into();
-        SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), Some(inst), 0)?
-    };
+    install_hook();
     unsafe {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        let _ = UnhookWindowsHookEx(hook);
+        if let Some(h) = HOOK.with(|c| c.take()) {
+            let _ = UnhookWindowsHookEx(h);
+        }
     }
     let _ = render.join();
     let host_cursor = UI
@@ -483,9 +509,13 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
     );
     let _ = writeln!(
         out,
-        "  input: {} events in {} packets | keys {}",
+        "  input: {} events in {} packets | keyboard: {} presses seen, {} sent, {} with another window in front, {} while busy | keys {}",
         st.input_events,
         st.input_packets,
+        KEYS_SEEN.load(Ordering::Relaxed),
+        sh.keys_sent.load(Ordering::Relaxed),
+        KEYS_NOT_FRONT.load(Ordering::Relaxed),
+        KEYS_BUSY.load(Ordering::Relaxed),
         match sh.rule {
             PcModifierRule::PcStyle => "PC-style (Ctrl -> Cmd, Win -> Ctrl)",
             PcModifierRule::MacStyle => "as labelled (Ctrl -> Ctrl, Win -> Cmd)",
@@ -1003,6 +1033,7 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
         DEBUG_SHOT.with(|d| *d.borrow_mut() = Some(path.into()));
     }
     SetTimer(Some(hwnd), TIMER_CURSOR, 15, None);
+    SetTimer(Some(hwnd), TIMER_REHOOK, 3000, None);
     Ok(hwnd)
 }
 
@@ -1493,6 +1524,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 SetCursor(cur);
                 Some(LRESULT(1))
             }
+            WM_TIMER if wparam.0 == TIMER_REHOOK => {
+                install_hook();
+                Some(LRESULT(0))
+            }
             WM_TIMER if wparam.0 == TIMER_SHOT => {
                 let _ = KillTimer(Some(hwnd), TIMER_SHOT);
                 if let Some(p) = DEBUG_SHOT.with(|d| d.borrow_mut().take()) {
@@ -1608,10 +1643,23 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     if code == HC_ACTION as i32 {
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-        let injected = kb.flags.0 & LLKHF_INJECTED.0 != 0;
-        let eaten = !injected
-            && with_ui(|ui| {
+        // GLASS_DEBUG_INJECTED_KEYS=1: take scripted keys too (local checks).
+        static TAKE_INJECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let take =
+            *TAKE_INJECTED.get_or_init(|| std::env::var_os("GLASS_DEBUG_INJECTED_KEYS").is_some());
+        let ours = kb.dwExtraInfo == super::inject::GLASS_MARK;
+        let injected = kb.flags.0 & LLKHF_INJECTED.0 != 0 && (!take || ours);
+        if down && !injected {
+            KEYS_SEEN.fetch_add(1, Ordering::Relaxed);
+        }
+        let handled = if injected {
+            Some(false)
+        } else {
+            with_ui(|ui| {
                 if GetForegroundWindow() != ui.hwnd {
+                    if down {
+                        KEYS_NOT_FRONT.fetch_add(1, Ordering::Relaxed);
+                    }
                     return false;
                 }
                 let vk = kb.vkCode as u16;
@@ -1653,10 +1701,17 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                     ui.sh
                         .client
                         .input_key(pc_key_for_mac(hid, ui.sh.rule), down);
+                    if down {
+                        ui.sh.keys_sent.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 true
             })
-            .unwrap_or(false);
+        };
+        if handled.is_none() && down && !injected {
+            KEYS_BUSY.fetch_add(1, Ordering::Relaxed);
+        }
+        let eaten = handled.unwrap_or(false);
         if eaten {
             return LRESULT(1);
         }

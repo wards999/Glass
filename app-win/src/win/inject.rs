@@ -15,6 +15,10 @@ use glass_core::input::{
     InputAction, BUTTON_BACK, BUTTON_FORWARD, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT,
 };
 use glass_core::keymap::hid_to_win_scan;
+
+/// Marks input Glass injected, so a viewer on the same PC never takes it
+/// back as typing (a loop) when checks run host and viewer together.
+pub const GLASS_MARK: usize = 0x474C_4153; // "GLAS"
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE,
@@ -85,7 +89,7 @@ fn mouse(dx: i32, dy: i32, data: i32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
                 mouseData: data as u32,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: GLASS_MARK,
             },
         },
     }
@@ -100,7 +104,7 @@ fn key(scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
                 wScan: scan,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: GLASS_MARK,
             },
         },
     }

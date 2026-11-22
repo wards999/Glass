@@ -78,21 +78,23 @@ pub fn best(modes: &[Mode], vw: u32, vh: u32, cur: Mode) -> Option<Mode> {
     let want = vw as f64 / vh as f64;
     let shape_ok = |m: &Mode| ((m.width as f64 / m.height as f64) / want - 1.0).abs() <= 0.03;
     let fits = |m: &Mode| m.width <= vw && m.height <= vh;
-    let candidates: Vec<&Mode> = modes.iter().filter(|m| fits(m)).collect();
-    let any_shape = candidates.iter().any(|m| shape_ok(m));
-    let pick = candidates
-        .into_iter()
-        .filter(|m| !any_shape || shape_ok(m))
+    // The most pixels that fit; the viewer's shape wins only among modes of
+    // about the same size (a 10 % bonus), never over clearly more pixels.
+    // (m3f-test2 picked 1280x720 over 1280x1024 for a 16:9 viewer.)
+    let pick = modes
+        .iter()
+        .filter(|m| fits(m))
         .max_by_key(|m| {
             let area = m.width as u64 * m.height as u64;
+            let score = if shape_ok(m) { area * 11 / 10 } else { area };
             // Prefer the current refresh, then the highest below it.
             let hz = if m.hz <= cur.hz { m.hz } else { 0 };
-            (area, hz)
+            (score, hz)
         })
         .copied()?;
-    let better = pick.width as u64 * pick.height as u64 > cur.width as u64 * cur.height as u64
-        || (shape_ok(&pick) && !shape_ok(&cur) && pick != cur);
-    (better && (pick.width, pick.height) != (cur.width, cur.height)).then_some(pick)
+    // Only ever switch to more pixels than now.
+    let more = pick.width as u64 * pick.height as u64 > cur.width as u64 * cur.height as u64;
+    more.then_some(pick)
 }
 
 /// Switches `device` to `m` for now (not saved). True if it worked.
@@ -155,6 +157,7 @@ mod tests {
         let modes = [
             m(800, 600, 60),
             m(1024, 768, 60),
+            m(1280, 720, 60), // the viewer's shape but fewer pixels (m3f-test2)
             m(1280, 1024, 60),
             m(1280, 1024, 75),
         ];

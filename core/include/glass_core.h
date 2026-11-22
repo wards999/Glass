@@ -28,9 +28,29 @@
 #define GLASS_CLIP_PNG 2
 
 /**
+ * A file list (the start of a file transfer).
+ */
+#define GLASS_CLIP_FILES 3
+
+/**
  * The largest item that's sent (16 MB).
  */
 #define GLASS_CLIP_MAX (16 << 20)
+
+/**
+ * The largest copy of files that's sent (200 MB in all).
+ */
+#define GLASS_FILES_MAX (200 << 20)
+
+/**
+ * At most this many files and folders in one copy.
+ */
+#define GLASS_FILES_MAX_ENTRIES 10000
+
+/**
+ * File data goes at most this fast (bytes/s, about 60 Mbps).
+ */
+#define GLASS_FILE_RATE 7500000
 
 #define GLASS_ClockSync_WINDOW 16
 
@@ -764,6 +784,22 @@ typedef struct {
 } GLASS_HostCounters;
 
 /**
+ * Transfer progress and counts, for the apps (bytes; `*_total` 0 = none).
+ */
+typedef struct {
+  uint64_t in_done;
+  uint64_t in_total;
+  uint64_t out_done;
+  uint64_t out_total;
+  /**
+   * Copies of files not sent (too big, too many files or unreadable).
+   */
+  uint32_t not_sent;
+  uint32_t files_sent;
+  uint32_t files_received;
+} GLASS_ClipProgress;
+
+/**
  * NUL-terminated core version string, e.g. "0.0.1". Static; do not free.
  */
 const char *glass_core_version(void);
@@ -1370,6 +1406,70 @@ bool glass_session_send_clipboard(const GLASS_HostSession *s,
  * `s` from `glass_host_accept`.
  */
 GLASS_ClipHandle *glass_session_take_clipboard(const GLASS_HostSession *s);
+
+/**
+ * Sends copies of files and folders to the host in the background, paced
+ * (`paths`: NUL-separated UTF-8). A newer copy replaces them.
+ *
+ * # Safety
+ * `c` from `glass_client_connect`; `paths` points to `len` bytes.
+ */
+void glass_client_send_files(const GLASS_Client *c, const uint8_t *paths, size_t len);
+
+/**
+ * Files from the host once they've all arrived, once; null if none. A
+ * `GLASS_CLIP_FILES` handle whose data is the top-level paths,
+ * NUL-separated.
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+GLASS_ClipHandle *glass_client_take_files(const GLASS_Client *c);
+
+/**
+ * Accept files from the host into `dir` (null or empty: refuse them).
+ *
+ * # Safety
+ * `c` from `glass_client_connect`; `dir` a C string or null.
+ */
+void glass_client_set_file_dir(const GLASS_Client *c, const char *dir);
+
+/**
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+GLASS_ClipProgress glass_client_clip_progress(const GLASS_Client *c);
+
+/**
+ * Sends copies of files and folders to the viewer (see
+ * `glass_client_send_files`).
+ *
+ * # Safety
+ * `s` from `glass_host_accept`; `paths` points to `len` bytes.
+ */
+void glass_session_send_files(const GLASS_HostSession *s, const uint8_t *paths, size_t len);
+
+/**
+ * Files from the viewer once they've all arrived, once; null if none.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+GLASS_ClipHandle *glass_session_take_files(const GLASS_HostSession *s);
+
+/**
+ * Accept files from the viewer into `dir` (null or empty: refuse them).
+ *
+ * # Safety
+ * `s` from `glass_host_accept`; `dir` a C string or null.
+ */
+void glass_session_set_file_dir(const GLASS_HostSession *s, const char *dir);
+
+/**
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+GLASS_ClipProgress glass_session_clip_progress(const GLASS_HostSession *s);
 
 /**
  * # Safety

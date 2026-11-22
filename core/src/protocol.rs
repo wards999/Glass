@@ -587,8 +587,11 @@ impl<'a> CursorShape<'a> {
     }
 }
 
-// Message types in use: 1-7, 8 (pointer shape), 9-10, 11-14 (pairing), 15-16.
+// Message types in use: 1-7, 8 (pointer shape), 9-10, 11-14 (pairing),
+// 15-16, 17-19 (clipboard and files).
 const KIND_CLIP: u8 = 17;
+const KIND_FILE_DATA: u8 = 18;
+const KIND_FILE_CANCEL: u8 = 19;
 /// Bytes of clipboard data per chunk (well inside a 64 KB frame).
 pub const CLIP_CHUNK: usize = 60_000;
 
@@ -638,12 +641,65 @@ impl<'a> ClipChunk<'a> {
     }
 }
 
+/// Either way: part of a copied file (`clipboard.rs`). `id` is the
+/// transfer (its file list came as a `CLIP_FILES` item with that id),
+/// `index` the file in that list, `offset` where `data` goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileData<'a> {
+    pub id: u32,
+    pub index: u32,
+    pub offset: u64,
+    pub data: &'a [u8],
+}
+
+impl<'a> FileData<'a> {
+    const HEADER: usize = 16;
+
+    /// Appends the encoded frame to `out`. False if `data` is too big.
+    pub fn encode(&self, out: &mut Vec<u8>) -> bool {
+        if self.data.len() > CLIP_CHUNK {
+            return false;
+        }
+        let len = 1 + Self::HEADER + self.data.len();
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+        out.push(KIND_FILE_DATA);
+        out.extend_from_slice(&self.id.to_be_bytes());
+        out.extend_from_slice(&self.index.to_be_bytes());
+        out.extend_from_slice(&self.offset.to_be_bytes());
+        out.extend_from_slice(self.data);
+        true
+    }
+
+    fn decode_body(b: &'a [u8]) -> Option<Self> {
+        if b.len() < Self::HEADER {
+            return None;
+        }
+        Some(Self {
+            id: u32::from_be_bytes(b[0..4].try_into().ok()?),
+            index: u32::from_be_bytes(b[4..8].try_into().ok()?),
+            offset: u64::from_be_bytes(b[8..16].try_into().ok()?),
+            data: &b[Self::HEADER..],
+        })
+    }
+}
+
+/// Appends a `FileCancel` frame: the sender gave up on transfer `id` (the
+/// files changed, couldn't be read, or something newer was copied).
+pub fn encode_file_cancel(id: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(&5u16.to_be_bytes());
+    out.push(KIND_FILE_CANCEL);
+    out.extend_from_slice(&id.to_be_bytes());
+}
+
 /// Any control-channel message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Message<'a> {
     Control(Control),
     Cursor(CursorShape<'a>),
     Clip(ClipChunk<'a>),
+    FileData(FileData<'a>),
+    /// The transfer with this id stopped part-way: drop what arrived.
+    FileCancel(u32),
     /// `PAIR_*` kind and its body.
     Pair {
         kind: u8,
@@ -658,6 +714,11 @@ impl<'a> Message<'a> {
             Message::Cursor(CursorShape::decode_body(b).ok_or(ControlError::Malformed)?)
         } else if kind == KIND_CLIP {
             Message::Clip(ClipChunk::decode_body(b).ok_or(ControlError::Malformed)?)
+        } else if kind == KIND_FILE_DATA {
+            Message::FileData(FileData::decode_body(b).ok_or(ControlError::Malformed)?)
+        } else if kind == KIND_FILE_CANCEL {
+            let id = b.try_into().map_err(|_| ControlError::Malformed)?;
+            Message::FileCancel(u32::from_be_bytes(id))
         } else if (PAIR_START..=PAIR_CONFIRM).contains(&kind) {
             if !pair_body_ok(kind, b.len()) {
                 return Err(ControlError::Malformed);

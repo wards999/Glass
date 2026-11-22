@@ -151,6 +151,14 @@ impl Capture {
         }
     }
 
+    /// Desktop Duplication: start again so the next frame is the whole
+    /// screen as it is now (a new viewer's first picture).
+    pub fn refresh(&mut self) {
+        if let Capture::Dda(c) = self {
+            c.refresh();
+        }
+    }
+
     /// Desktop switches seen (lock screen, UAC), for the report.
     pub fn desktop_switches(&self) -> u64 {
         match self {

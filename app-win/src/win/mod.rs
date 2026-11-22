@@ -781,7 +781,15 @@ fn run_session(
     stop: &std::sync::atomic::AtomicBool,
     end: &std::sync::atomic::AtomicBool,
 ) -> Res<(String, Vec<String>, u64)> {
-    while cap.next_frame()?.is_some() {} // drop frames captured while waiting
+    // Keep the newest frame captured while waiting: a still screen sends
+    // nothing new, so it's the viewer's first picture (m3f-test13: nothing
+    // showed until something changed on the host). The service's capture
+    // starts again for a fresh full frame.
+    cap.refresh();
+    let mut first = None;
+    while let Some(f) = cap.next_frame()? {
+        first = Some(f);
+    }
     let make = |chroma444: bool| {
         encode::Encoder::new(
             &gpu.device,
@@ -818,6 +826,15 @@ fn run_session(
     let mut blocked_since = None;
     let t0 = clock::now_us();
     let mut pending_idr = true;
+    if let Some(frame) = first.take().filter(|f| f.size == (w, h)) {
+        // Encoded now and kept as the last frame; the keyframe the viewer
+        // asks for once it's ready resends it (pending_idr stays set).
+        let arrival = clock::now_us();
+        let input_seq = session.input_seq();
+        enc.encode(&frame.texture, arrival as i64, true, |data, key, _| {
+            run.on_packet(session, arrival, input_seq, data, key)
+        })?;
+    }
     while session.connected()
         && run.error.is_none()
         && !stop.load(Ordering::Relaxed)

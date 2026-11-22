@@ -71,6 +71,12 @@ impl Dda {
         self.next_timeout_ms = timeout_ms;
     }
 
+    /// A fresh duplication: its first frame is the whole screen.
+    pub fn refresh(&mut self) {
+        self.dup = None;
+        self.dup = duplicate(&self.device, self.hmon).ok();
+    }
+
     /// Starts duplicating again on the current input desktop (after Windows
     /// switched to or from the lock screen / a UAC prompt).
     fn restart(&mut self) {

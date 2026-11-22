@@ -1944,7 +1944,15 @@ impl GlassApp {
                     ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                     egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).show(ui, |ui| {
                     ui.set_width(380.0);
-                    ui.label(RichText::new("Settings").font(semibold(18.0)).color(p.strong));
+                    // A visible way out (Esc and a click outside work too).
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Settings").font(semibold(18.0)).color(p.strong));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icon_button(ui, &ic('\u{E711}', "\u{2715}"), "Close", p).clicked() {
+                                close = true;
+                            }
+                        });
+                    });
                     ui.add_space(4.0);
 
                     section(ui, "Appearance", p);

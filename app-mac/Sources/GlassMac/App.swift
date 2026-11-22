@@ -348,7 +348,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let note = NSTextField(wrappingLabelWithString: "Fast has the lowest lag. Full colour is exact but adds some lag. Both can be switched while viewing, from the handle at the top of the viewer.")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
-        var views: [NSView] = [heading("Settings", 17), heading("Appearance"), theme,
+        // A visible way out (Esc and a click outside work too).
+        let closeX = NSButton(image: NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Close") ?? NSImage(),
+                              target: self, action: #selector(closeSettingsTapped))
+        closeX.isBordered = false
+        closeX.contentTintColor = .tertiaryLabelColor
+        closeX.symbolConfiguration = .init(pointSize: 16, weight: .regular)
+        let titleRow = NSStackView(views: [heading("Settings", 17), NSView(), closeX])
+        var views: [NSView] = [titleRow, heading("Appearance"), theme,
                                heading("When viewing, start in"), radios,
                                heading("Colour"), colour, note, heading("Paired devices")]
         let peers = GlassDevice.shared?.peers ?? []
@@ -398,6 +405,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         return stack
     }
+
+    @objc private func closeSettingsTapped() { closeSettings() }
 
     @objc private func pickStartView(_ sender: NSButton) {
         UserDefaults.standard.set(sender.tag, forKey: "startView")

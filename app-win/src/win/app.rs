@@ -272,6 +272,17 @@ pub fn run(share: bool) -> Res<()> {
                 app.share_status = "Waiting for a viewer \u{2026}".into();
                 app.pin = Some(("482913".into(), "MacBook Air".into()));
             }
+            if app.demo.as_deref() == Some("service") {
+                // As QUIETPC: the service shares, a viewer is on, through Remote Desktop.
+                app.svc = super::service::State::Running;
+                app.svc_off = false;
+                app.remote = true;
+                app.svc_status = Some(super::service::Status {
+                    line: "Viewer connected: \"QUIETPC22\" from 192.168.4.22 (encrypted)".into(),
+                    pin: None,
+                    connected: true,
+                });
+            }
             if app.demo.as_deref() == Some("session") {
                 app.viewer_on = true;
                 app.share_status =
@@ -1225,19 +1236,7 @@ impl GlassApp {
         let (title, sub) = if in_session {
             (
                 "In a session".to_string(),
-                if self.viewer_on {
-                    truncate(&self.share_status, 56)
-                } else if svc_connected {
-                    truncate(
-                        &self
-                            .svc_status
-                            .as_ref()
-                            .map_or(String::new(), |s| s.line.clone()),
-                        56,
-                    )
-                } else {
-                    "Viewing another device.".to_string()
-                },
+                "Other devices appear here when the session ends.".to_string(),
             )
         } else {
             (
@@ -1364,31 +1363,60 @@ impl GlassApp {
             ui.painter().rect_filled(tile, 11, col.gamma_multiply(0.14));
             device_glyph(ui.painter(), tile.center(), false, col);
             ui.add_space(4.0);
-            ui.vertical(|ui| {
+            // The text gets what's left beside the switch, and is cut off
+            // neatly rather than running under it.
+            let text_w = (ui.available_width() - 62.0).max(80.0);
+            ui.allocate_ui_with_layout(vec2(text_w, 46.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_max_width(text_w);
                 ui.spacing_mut().item_spacing.y = 2.0;
                 ui.add_space(2.0);
-                ui.label(
-                    RichText::new("Share this PC")
-                        .font(semibold(16.0))
-                        .color(p.strong),
-                );
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.label(
+                        RichText::new("Share this PC")
+                            .font(semibold(16.0))
+                            .color(p.strong),
+                    );
+                    if svc_installed {
+                        egui::Frame::new()
+                            .fill((if svc_on { p.ok } else { p.weak }).gamma_multiply(0.15))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::symmetric(7, 1))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("Service")
+                                        .size(11.5)
+                                        .color(if svc_on { p.ok } else { p.weak }),
+                                );
+                            });
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let (dot, _) = ui.allocate_exact_size(vec2(8.0, 14.0), Sense::hover());
                     ui.painter()
                         .circle_filled(dot.center(), 4.0, if on { p.ok } else { p.off });
+                    // "Viewer connected: "NAME" from ..." reads as "NAME is viewing".
+                    let short = |line: &str| -> String {
+                        if line.starts_with("Viewer connected") {
+                            let who = line.split('"').nth(1).unwrap_or("A device");
+                            format!("\u{201C}{who}\u{201D} is viewing")
+                        } else {
+                            line.to_string()
+                        }
+                    };
                     let text = if svc_on {
                         let line = self
                             .svc_status
                             .as_ref()
-                            .map_or("starting \u{2026}".to_string(), |s| s.line.clone());
-                        truncate(&format!("Always on \u{00B7} {line}"), 44)
+                            .map_or("starting \u{2026}".to_string(), |s| short(&s.line));
+                        format!("Always on \u{00B7} {line}")
                     } else if on || !self.share_status.is_empty() {
-                        truncate(&self.share_status, 44)
+                        short(&self.share_status)
                     } else {
                         "Off \u{00B7} other devices can\u{2019}t connect".to_string()
                     };
-                    ui.label(RichText::new(text).size(13.0).color(p.weak));
+                    ui.add(egui::Label::new(RichText::new(text).size(13.0).color(p.weak)).truncate());
                 });
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1400,13 +1428,6 @@ impl GlassApp {
                     {
                         self.toggle_share();
                     }
-                    egui::Frame::new()
-                        .fill(p.ok.gamma_multiply(if svc_on { 0.15 } else { 0.06 }))
-                        .corner_radius(CornerRadius::same(10))
-                        .inner_margin(Margin::symmetric(8, 3))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new("Service").size(12.0).color(if svc_on { p.ok } else { p.weak }));
-                        });
                 } else {
                     let r = toggle(ui, on, p);
                     let blocked = !on && self.viewing.is_some();
@@ -1554,9 +1575,13 @@ impl eframe::App for GlassApp {
         }
         if self.last_scan.elapsed() > Duration::from_millis(1500) {
             self.scan();
-            self.svc = super::service::state();
-            self.svc_off = super::service::sharing_off();
-            self.svc_status = if self.svc == super::service::State::Running {
+            if self.demo.as_deref() != Some("service") {
+                self.svc = super::service::state();
+                self.svc_off = super::service::sharing_off();
+            }
+            self.svc_status = if self.demo.as_deref() == Some("service") {
+                self.svc_status.clone()
+            } else if self.svc == super::service::State::Running {
                 super::service::Status::read()
             } else {
                 None

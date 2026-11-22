@@ -1150,6 +1150,119 @@ pub unsafe extern "C" fn glass_session_close(s: *mut HostSession) {
     }
 }
 
+// ---- Clipboard (M5c) ------------------------------------------------------
+
+/// A clipboard item that arrived from the other side (opaque): read it with
+/// `glass_clip_kind` / `glass_clip_data` / `glass_clip_len`, then
+/// `glass_clip_free`.
+pub struct ClipHandle(crate::clipboard::ClipItem);
+
+unsafe fn clip_from(kind: u8, data: *const u8, len: usize) -> Option<crate::clipboard::ClipItem> {
+    if data.is_null() || len == 0 || len > crate::clipboard::CLIP_MAX {
+        return None;
+    }
+    let data = std::slice::from_raw_parts(data, len).to_vec();
+    Some(crate::clipboard::ClipItem { kind, data })
+}
+
+fn clip_out(item: Option<crate::clipboard::ClipItem>) -> *mut ClipHandle {
+    item.map_or(std::ptr::null_mut(), |i| {
+        Box::into_raw(Box::new(ClipHandle(i)))
+    })
+}
+
+/// Sends a clipboard item (`CLIP_TEXT` UTF-8 or `CLIP_PNG`) to the host in
+/// the background. The bytes are copied. False if empty or too big.
+///
+/// # Safety
+/// `c` from `glass_client_connect`; `data` points to `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_send_clipboard(
+    c: *const Client,
+    kind: u8,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    match clip_from(kind, data, len) {
+        Some(item) => {
+            (*c).send_clipboard(item);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The latest clipboard item from the host, once; null if none.
+///
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_take_clipboard(c: *const Client) -> *mut ClipHandle {
+    clip_out((*c).take_clipboard())
+}
+
+/// Sends a clipboard item to the viewer in the background (see
+/// `glass_client_send_clipboard`).
+///
+/// # Safety
+/// `s` from `glass_host_accept`; `data` points to `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_send_clipboard(
+    s: *const HostSession,
+    kind: u8,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    match clip_from(kind, data, len) {
+        Some(item) => {
+            (*s).send_clipboard(item);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The latest clipboard item from the viewer, once; null if none.
+///
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_take_clipboard(s: *const HostSession) -> *mut ClipHandle {
+    clip_out((*s).take_clipboard())
+}
+
+/// # Safety
+/// `h` from a `_take_clipboard` call, not freed.
+#[no_mangle]
+pub unsafe extern "C" fn glass_clip_kind(h: *const ClipHandle) -> u8 {
+    (*h).0.kind
+}
+
+/// # Safety
+/// `h` from a `_take_clipboard` call, not freed.
+#[no_mangle]
+pub unsafe extern "C" fn glass_clip_len(h: *const ClipHandle) -> usize {
+    (*h).0.data.len()
+}
+
+/// The item's bytes; valid until `glass_clip_free`.
+///
+/// # Safety
+/// `h` from a `_take_clipboard` call, not freed.
+#[no_mangle]
+pub unsafe extern "C" fn glass_clip_data(h: *const ClipHandle) -> *const u8 {
+    (*h).0.data.as_ptr()
+}
+
+/// # Safety
+/// `h` from a `_take_clipboard` call (or null), not used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn glass_clip_free(h: *mut ClipHandle) {
+    if !h.is_null() {
+        drop(Box::from_raw(h));
+    }
+}
+
 /// HID usage -> Mac key code for the host (`keymap::hid_to_mac`); 0xFFFF if
 /// the Mac has no such key.
 #[no_mangle]

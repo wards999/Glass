@@ -17,6 +17,21 @@
 
 #define GLASS_NAL_AUD 35
 
+/**
+ * UTF-8 text.
+ */
+#define GLASS_CLIP_TEXT 1
+
+/**
+ * A PNG image.
+ */
+#define GLASS_CLIP_PNG 2
+
+/**
+ * The largest item that's sent (16 MB).
+ */
+#define GLASS_CLIP_MAX (16 << 20)
+
 #define GLASS_ClockSync_WINDOW 16
 
 /**
@@ -130,7 +145,7 @@
  * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
  * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 7
+#define GLASS_PROTOCOL_VERSION 8
 
 /**
  * Most "seen by" ids a `Hello` carries (no-loop rule).
@@ -294,6 +309,11 @@
  */
 #define GLASS_CURSOR_MAX_DIM 96
 
+/**
+ * Bytes of clipboard data per chunk (well inside a 64 KB frame).
+ */
+#define GLASS_CLIP_CHUNK 60000
+
 #define GLASS_VideoPacketHeader_SIZE 24
 
 #define GLASS_FrameInfo_SIZE 12
@@ -388,6 +408,13 @@ typedef int32_t GLASS_ConnectError;
  * Input methods may be called from any thread.
  */
 typedef struct GLASS_Client GLASS_Client;
+
+/**
+ * A clipboard item that arrived from the other side (opaque): read it with
+ * `glass_clip_kind` / `glass_clip_data` / `glass_clip_len`, then
+ * `glass_clip_free`.
+ */
+typedef struct GLASS_ClipHandle GLASS_ClipHandle;
 
 /**
  * This machine's identity and paired devices (opaque).
@@ -1303,6 +1330,72 @@ GLASS_HostCounters glass_session_counters(const GLASS_HostSession *s);
  * `s` from `glass_host_accept` (or null), not used afterwards.
  */
 void glass_session_close(GLASS_HostSession *s);
+
+/**
+ * Sends a clipboard item (`CLIP_TEXT` UTF-8 or `CLIP_PNG`) to the host in
+ * the background. The bytes are copied. False if empty or too big.
+ *
+ * # Safety
+ * `c` from `glass_client_connect`; `data` points to `len` bytes.
+ */
+bool glass_client_send_clipboard(const GLASS_Client *c,
+                                 uint8_t kind,
+                                 const uint8_t *data,
+                                 size_t len);
+
+/**
+ * The latest clipboard item from the host, once; null if none.
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+GLASS_ClipHandle *glass_client_take_clipboard(const GLASS_Client *c);
+
+/**
+ * Sends a clipboard item to the viewer in the background (see
+ * `glass_client_send_clipboard`).
+ *
+ * # Safety
+ * `s` from `glass_host_accept`; `data` points to `len` bytes.
+ */
+bool glass_session_send_clipboard(const GLASS_HostSession *s,
+                                  uint8_t kind,
+                                  const uint8_t *data,
+                                  size_t len);
+
+/**
+ * The latest clipboard item from the viewer, once; null if none.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+GLASS_ClipHandle *glass_session_take_clipboard(const GLASS_HostSession *s);
+
+/**
+ * # Safety
+ * `h` from a `_take_clipboard` call, not freed.
+ */
+uint8_t glass_clip_kind(const GLASS_ClipHandle *h);
+
+/**
+ * # Safety
+ * `h` from a `_take_clipboard` call, not freed.
+ */
+size_t glass_clip_len(const GLASS_ClipHandle *h);
+
+/**
+ * The item's bytes; valid until `glass_clip_free`.
+ *
+ * # Safety
+ * `h` from a `_take_clipboard` call, not freed.
+ */
+const uint8_t *glass_clip_data(const GLASS_ClipHandle *h);
+
+/**
+ * # Safety
+ * `h` from a `_take_clipboard` call (or null), not used afterwards.
+ */
+void glass_clip_free(GLASS_ClipHandle *h);
 
 /**
  * HID usage -> Mac key code for the host (`keymap::hid_to_mac`); 0xFFFF if

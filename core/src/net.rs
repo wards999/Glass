@@ -79,6 +79,20 @@ fn send_control(w: &TlsWriter, msg: Control) -> io::Result<()> {
     w.write_all(&buf[..n])
 }
 
+/// Writes a clipboard item's chunks from a helper thread, one frame at a
+/// time, so the rest of the control traffic keeps flowing (M5c).
+fn send_clip(w: TlsWriter, id: u32, item: crate::clipboard::ClipItem) {
+    std::thread::spawn(move || {
+        let mut frame = Vec::with_capacity(crate::protocol::CLIP_CHUNK + 32);
+        for c in crate::clipboard::chunks(id, &item) {
+            frame.clear();
+            if !c.encode(&mut frame) || w.write_all(&frame).is_err() {
+                return;
+            }
+        }
+    });
+}
+
 fn send_pair(w: &TlsWriter, kind: u8, body: &[u8]) -> io::Result<()> {
     let mut b = Vec::with_capacity(body.len() + 3);
     if !encode_pair(kind, body, &mut b) {
@@ -189,7 +203,7 @@ impl ControlReader {
                     let got = match m {
                         Message::Control(c) => Some(Incoming::Control(c)),
                         Message::Pair { kind, body } => Some(Incoming::Pair(kind, body.to_vec())),
-                        Message::Cursor(_) => None,
+                        Message::Cursor(_) | Message::Clip(_) => None,
                     };
                     self.buf.copy_within(n..self.len, 0);
                     self.len -= n;
@@ -338,6 +352,9 @@ struct HostShared {
     rejected: AtomicU64,
     /// Pending `SetMode`: `1 << 16 | allow_444 << 8 | mode`, 0 = none.
     mode_req: AtomicU32,
+    /// The latest clipboard item from the viewer, not yet taken.
+    clip_in: Mutex<Option<crate::clipboard::ClipItem>>,
+    clip_ids: AtomicU32,
 }
 
 /// One connected viewer. Dropping it ends the session (and releases any
@@ -532,6 +549,8 @@ impl HostListener {
             input: Mutex::new(InputCounters::default()),
             rejected: AtomicU64::new(0),
             mode_req: AtomicU32::new(0),
+            clip_in: Mutex::new(None),
+            clip_ids: AtomicU32::new(0),
         });
         let mut threads = Vec::new();
 
@@ -562,6 +581,7 @@ impl HostListener {
             // session frees the host for its reconnect (m3f-test11: the
             // host waited forever and the viewer's reconnect timed out).
             let mut heard = clock::now_us();
+            let mut clip = crate::clipboard::Reassembler::default();
             while !sh.stop.load(Ordering::Relaxed) {
                 let mut pong = None;
                 let mut got = false;
@@ -582,6 +602,11 @@ impl HostListener {
                         Message::Control(Control::SetMode { mode, allow_444 }) => {
                             let v = 1 << 16 | (allow_444 as u32) << 8 | mode as u32;
                             sh.mode_req.store(v, Ordering::Relaxed);
+                        }
+                        Message::Clip(c) => {
+                            if let Some(item) = clip.push(&c) {
+                                *lock(&sh.clip_in) = Some(item);
+                            }
                         }
                         Message::Control(Control::Bye) => {
                             return Err(io::ErrorKind::ConnectionAborted.into())
@@ -817,6 +842,18 @@ impl HostSession {
 
     pub fn send_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
         send_control(&self.out, Control::CursorVisible { visible })
+    }
+
+    /// Sends a clipboard item to the viewer in the background (chunks
+    /// interleave with the rest of the control traffic). M5c.
+    pub fn send_clipboard(&self, item: crate::clipboard::ClipItem) {
+        let id = self.shared.clip_ids.fetch_add(1, Ordering::Relaxed);
+        send_clip(self.out.clone(), id, item);
+    }
+
+    /// The latest clipboard item from the viewer, once.
+    pub fn take_clipboard(&self) -> Option<crate::clipboard::ClipItem> {
+        lock(&self.shared.clip_in).take()
     }
 
     pub fn counters(&self) -> HostCounters {
@@ -1132,6 +1169,9 @@ struct ClientShared {
     clock_rtt: AtomicU32,
     last_rtt: AtomicU32,
     host_notice: std::sync::atomic::AtomicU8,
+    /// The latest clipboard item from the host, not yet taken.
+    clip_in: Mutex<Option<crate::clipboard::ClipItem>>,
+    clip_ids: AtomicU32,
     queue: FrameQueue,
     input: Mutex<InputTx>,
     cursor: Mutex<CursorState>,
@@ -1364,6 +1404,8 @@ impl Client {
             stop: AtomicBool::new(false),
             connected: AtomicBool::new(true),
             host_bye: AtomicBool::new(false),
+            clip_in: Mutex::new(None),
+            clip_ids: AtomicU32::new(0),
             want_keyframe: AtomicBool::new(false),
             keyframe_requests: AtomicU32::new(0),
             queue_full: AtomicU64::new(0),
@@ -1419,6 +1461,17 @@ impl Client {
 
     /// The host ended the session on purpose (said Bye), rather than the
     /// connection dropping.
+    /// Sends a clipboard item to the host in the background. M5c.
+    pub fn send_clipboard(&self, item: crate::clipboard::ClipItem) {
+        let id = self.shared.clip_ids.fetch_add(1, Ordering::Relaxed);
+        send_clip(self.ctl.clone(), id, item);
+    }
+
+    /// The latest clipboard item from the host, once.
+    pub fn take_clipboard(&self) -> Option<crate::clipboard::ClipItem> {
+        lock(&self.shared.clip_in).take()
+    }
+
     pub fn host_said_bye(&self) -> bool {
         self.shared.host_bye.load(Ordering::Relaxed)
     }
@@ -1633,6 +1686,7 @@ fn spawn_control(
         let mut seq = 0u32;
         let mut last_ping = 0u64;
         let mut last_kf = 0u64;
+        let mut clip = crate::clipboard::Reassembler::default();
         loop {
             if sh.stop.load(Ordering::Relaxed) {
                 let _ = send_control(&out, Control::Bye);
@@ -1669,6 +1723,11 @@ fn spawn_control(
             }
             let r = reader.read(&mut tls_in, |m| {
                 match m {
+                    Message::Clip(c) => {
+                        if let Some(item) = clip.push(&c) {
+                            *lock(&sh.clip_in) = Some(item);
+                        }
+                    }
                     Message::Control(Control::Pong {
                         client_ts, host_ts, ..
                     }) => {

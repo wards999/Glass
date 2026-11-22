@@ -9,7 +9,7 @@
 /// announces new stream parameters mid-session (`StreamChange`).
 /// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
 /// datagrams. v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 7;
+pub const PROTOCOL_VERSION: u8 = 8;
 
 /// Most "seen by" ids a `Hello` carries (no-loop rule).
 pub const MAX_SEEN_BY: usize = 8;
@@ -587,11 +587,63 @@ impl<'a> CursorShape<'a> {
     }
 }
 
+// Message types in use: 1-7, 8 (pointer shape), 9-10, 11-14 (pairing), 15-16.
+const KIND_CLIP: u8 = 17;
+/// Bytes of clipboard data per chunk (well inside a 64 KB frame).
+pub const CLIP_CHUNK: usize = 60_000;
+
+/// Either way: one chunk of a clipboard item (`clipboard.rs`). `id` names
+/// the item, `total` is its size, `offset` where this chunk's `data` goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipChunk<'a> {
+    pub id: u32,
+    pub kind: u8,
+    pub total: u32,
+    pub offset: u32,
+    pub data: &'a [u8],
+}
+
+impl<'a> ClipChunk<'a> {
+    const HEADER: usize = 13;
+
+    /// Appends the encoded frame to `out`. False (nothing written) if the
+    /// chunk is too big for a frame.
+    pub fn encode(&self, out: &mut Vec<u8>) -> bool {
+        if self.data.len() > CLIP_CHUNK {
+            return false;
+        }
+        let len = 1 + Self::HEADER + self.data.len();
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+        out.push(KIND_CLIP);
+        out.extend_from_slice(&self.id.to_be_bytes());
+        out.push(self.kind);
+        out.extend_from_slice(&self.total.to_be_bytes());
+        out.extend_from_slice(&self.offset.to_be_bytes());
+        out.extend_from_slice(self.data);
+        true
+    }
+
+    fn decode_body(b: &'a [u8]) -> Option<Self> {
+        if b.len() < Self::HEADER {
+            return None;
+        }
+        let u32_at = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        Some(Self {
+            id: u32_at(0),
+            kind: b[4],
+            total: u32_at(5),
+            offset: u32_at(9),
+            data: &b[Self::HEADER..],
+        })
+    }
+}
+
 /// Any control-channel message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Message<'a> {
     Control(Control),
     Cursor(CursorShape<'a>),
+    Clip(ClipChunk<'a>),
     /// `PAIR_*` kind and its body.
     Pair {
         kind: u8,
@@ -604,6 +656,8 @@ impl<'a> Message<'a> {
         let (kind, b, used) = decode_frame(buf)?;
         let m = if kind == KIND_CURSOR_SHAPE {
             Message::Cursor(CursorShape::decode_body(b).ok_or(ControlError::Malformed)?)
+        } else if kind == KIND_CLIP {
+            Message::Clip(ClipChunk::decode_body(b).ok_or(ControlError::Malformed)?)
         } else if (PAIR_START..=PAIR_CONFIRM).contains(&kind) {
             if !pair_body_ok(kind, b.len()) {
                 return Err(ControlError::Malformed);

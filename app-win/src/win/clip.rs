@@ -1,4 +1,4 @@
-//! Clipboard sharing for a session (M5c, step 1): text and images, both
+//! Clipboard sharing for a session (M5c): text, images and files, both
 //! ways. A helper thread watches this PC's clipboard (its sequence number,
 //! every 100 ms), reads and PNG-encodes a new item and leaves it in a slot;
 //! the session loop (host) or the viewer's UI timer takes it from there and
@@ -9,10 +9,14 @@
 //! Text travels as UTF-8 with `\n` line endings; images as PNG (the
 //! registered "PNG" format if the copying app offered it, else the DIB
 //! converted). Both "PNG" and a DIB are put on the clipboard, so every app
-//! can paste.
+//! can paste. Files copied in Explorer (CF_HDROP) travel as a `CLIP_FILES`
+//! item of NUL-separated paths: the session sends the files themselves
+//! (core), and received files go on the clipboard the same way, marked as a
+//! copy so a paste never moves them out of Glass's folder.
 
-use glass_core::clipboard::{ClipItem, CLIP_MAX, CLIP_PNG, CLIP_TEXT};
+use glass_core::clipboard::{ClipItem, CLIP_FILES, CLIP_MAX, CLIP_PNG, CLIP_TEXT};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,6 +32,9 @@ use windows::Win32::System::Memory::{
 
 const CF_DIB: u32 = 8;
 const CF_UNICODETEXT: u32 = 13;
+const CF_HDROP: u32 = 15;
+/// `DROPFILES`: offset of the names, a point, two flags.
+const DROPFILES_SIZE: usize = 20;
 /// The largest image converted from a DIB (pixels).
 const MAX_PIXELS: usize = 8192 * 8192;
 
@@ -69,6 +76,51 @@ impl ClipSync {
     }
 }
 
+/// A `CLIP_FILES` item for these paths.
+pub fn files_item(paths: &[PathBuf]) -> ClipItem {
+    ClipItem {
+        kind: CLIP_FILES,
+        data: paths
+            .iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\0")
+            .into_bytes(),
+    }
+}
+
+/// The paths in a `CLIP_FILES` item.
+pub fn item_files(item: &ClipItem) -> Vec<PathBuf> {
+    String::from_utf8_lossy(&item.data)
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Where this PC keeps files that arrive over the clipboard. The service's
+/// agent (SYSTEM) uses a folder the signed-in user can read.
+pub fn file_dir(agent: bool, role: &str) -> PathBuf {
+    if agent {
+        let pd = std::env::var_os("ProgramData").unwrap_or_else(|| "C:\\ProgramData".into());
+        PathBuf::from(pd).join("Glass-clipboard")
+    } else {
+        std::env::temp_dir()
+            .join("Glass")
+            .join(format!("clipboard-{role}"))
+    }
+}
+
+/// Files that came over a Glass clipboard (on either side of a same-PC
+/// test): never sent back.
+fn from_glass(item: &ClipItem) -> bool {
+    let roots = [file_dir(true, ""), std::env::temp_dir().join("Glass")];
+    item.kind == CLIP_FILES
+        && item_files(item)
+            .iter()
+            .all(|p| roots.iter().any(|r| p.starts_with(r)))
+}
+
 impl Drop for ClipSync {
     fn drop(&mut self) {
         self.0.stop.store(true, Ordering::Relaxed);
@@ -81,8 +133,18 @@ fn hash(item: &ClipItem) -> u64 {
     h.finish()
 }
 
+struct Formats {
+    png: u32,
+    drop_effect: u32,
+}
+
 fn watch(sh: &Shared, send_current: bool) {
-    let png_format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
+    let fm = unsafe {
+        Formats {
+            png: RegisterClipboardFormatW(w!("PNG")),
+            drop_effect: RegisterClipboardFormatW(w!("Preferred DropEffect")),
+        }
+    };
     let mut seen = if send_current {
         0
     } else {
@@ -94,7 +156,7 @@ fn watch(sh: &Shared, send_current: bool) {
     while !sh.stop.load(Ordering::Relaxed) {
         let incoming = sh.inbox.lock().ok().and_then(|mut s| s.take());
         if let Some(item) = incoming {
-            if set(&item, png_format) {
+            if set(&item, &fm) {
                 last = hash(&item);
                 seen = unsafe { GetClipboardSequenceNumber() };
             }
@@ -102,10 +164,10 @@ fn watch(sh: &Shared, send_current: bool) {
         let now = unsafe { GetClipboardSequenceNumber() };
         if now != seen {
             // Another app may hold the clipboard open: try again next time.
-            if let Some(item) = read(png_format) {
+            if let Some(item) = read(fm.png) {
                 seen = now;
                 let h = hash(&item);
-                if h != last {
+                if h != last && !from_glass(&item) {
                     last = h;
                     if let Ok(mut s) = sh.out.lock() {
                         *s = Some(item);
@@ -155,15 +217,57 @@ unsafe fn bytes(h: HANDLE) -> Option<Vec<u8>> {
     Some(v)
 }
 
-/// What's on the clipboard now, if it's something we share: text first
-/// (a spreadsheet's cells also come as a picture), then an image.
+/// The file names in a `DROPFILES` block (wide names only: Explorer's).
+fn drop_files(b: &[u8]) -> Option<Vec<PathBuf>> {
+    let at = u32::from_le_bytes(b.get(0..4)?.try_into().ok()?) as usize;
+    let wide = u32::from_le_bytes(b.get(16..20)?.try_into().ok()?) != 0;
+    if !wide || at > b.len() {
+        return None;
+    }
+    let u: Vec<u16> = b[at..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    let paths: Vec<PathBuf> = u
+        .split(|&c| c == 0)
+        .take_while(|s| !s.is_empty())
+        .map(|s| PathBuf::from(String::from_utf16_lossy(s)))
+        .collect();
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// A `DROPFILES` block for these paths.
+fn dropfiles_for(paths: &[PathBuf]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&(DROPFILES_SIZE as u32).to_le_bytes());
+    b.extend_from_slice(&[0; 12]); // point, non-client flag
+    b.extend_from_slice(&1u32.to_le_bytes()); // wide names
+    for p in paths {
+        let s = p.to_string_lossy();
+        b.extend(s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes));
+    }
+    b.extend_from_slice(&[0, 0]);
+    b
+}
+
+/// What's on the clipboard now, if it's something we share: files first
+/// (Explorer), then text (a spreadsheet's cells also come as a picture),
+/// then an image.
 fn read(png_format: u32) -> Option<ClipItem> {
     if !open() {
         return None;
     }
     let item = unsafe {
         let has = |f: u32| IsClipboardFormatAvailable(f).is_ok();
-        if has(CF_UNICODETEXT) {
+        if has(CF_HDROP) {
+            GetClipboardData(CF_HDROP)
+                .ok()
+                .and_then(|h| bytes(h))
+                .and_then(|b| drop_files(&b))
+                .map(|p| files_item(&p))
+        } else if has(CF_UNICODETEXT) {
             GetClipboardData(CF_UNICODETEXT)
                 .ok()
                 .and_then(|h| bytes(h))
@@ -225,7 +329,8 @@ unsafe fn global(data: &[u8]) -> Option<HGLOBAL> {
 }
 
 /// Puts an item on the clipboard. False if it couldn't.
-fn set(item: &ClipItem, png_format: u32) -> bool {
+fn set(item: &ClipItem, fm: &Formats) -> bool {
+    let png_format = fm.png;
     // Prepared before opening the clipboard (decoding takes a moment).
     let formats: Vec<(u32, Vec<u8>)> = match item.kind {
         CLIP_TEXT => {
@@ -249,6 +354,18 @@ fn set(item: &ClipItem, png_format: u32) -> bool {
                 v.push((png_format, item.data.clone()));
             }
             v
+        }
+        CLIP_FILES => {
+            let paths = item_files(item);
+            if paths.is_empty() {
+                Vec::new()
+            } else {
+                let mut v = vec![(CF_HDROP, dropfiles_for(&paths))];
+                if fm.drop_effect != 0 {
+                    v.push((fm.drop_effect, 1u32.to_le_bytes().to_vec())); // DROPEFFECT_COPY
+                }
+                v
+            }
         }
         _ => Vec::new(),
     };
@@ -381,6 +498,13 @@ fn png_to_dib(data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_lists_survive_dropfiles() {
+        let p = vec![PathBuf::from(r"C:\a b\café.txt"), PathBuf::from(r"D:\x")];
+        assert_eq!(drop_files(&dropfiles_for(&p)), Some(p.clone()));
+        assert_eq!(item_files(&files_item(&p)), p);
+    }
 
     #[test]
     fn images_survive_dib_and_png() {

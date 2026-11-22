@@ -835,6 +835,9 @@ fn run_session(
     // The clipboard, both ways (M5c): the helper thread reads and writes
     // it; this loop only swaps items with the session.
     let clip = a.clipboard.then(|| clip::ClipSync::start(false));
+    if a.clipboard {
+        session.set_file_dir(Some(clip::file_dir(a.desktops, "host")));
+    }
     let (mut clips_in, mut clips_out) = (0u32, 0u32);
     let t0 = clock::now_us();
     let mut pending_idr = true;
@@ -913,9 +916,16 @@ fn run_session(
                 clips_in += 1;
                 c.put_incoming(item);
             }
+            if let Some(files) = session.take_files() {
+                c.put_incoming(clip::files_item(&files));
+            }
             if let Some(item) = c.take_outgoing() {
-                clips_out += 1;
-                session.send_clipboard(item);
+                if item.kind == glass_core::clipboard::CLIP_FILES {
+                    session.send_files(clip::item_files(&item));
+                } else {
+                    clips_out += 1;
+                    session.send_clipboard(item);
+                }
             }
         }
         match pointer.poll() {
@@ -1000,7 +1010,11 @@ fn run_session(
         r,
         "  clipboard: {}",
         if a.clipboard {
-            format!("{clips_out} sent to the viewer, {clips_in} received")
+            let p = session.clip_progress();
+            format!(
+                "{clips_out} items sent to the viewer, {clips_in} received | files: {} copies sent, {} received, {} not sent (over 200 MB, too many or unreadable)",
+                p.files_sent, p.files_received, p.not_sent
+            )
         } else {
             "off".to_string()
         }

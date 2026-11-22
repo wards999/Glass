@@ -303,6 +303,8 @@ struct Ui {
     last_bar_status_us: u64,
     /// The clipboard thread (M5c), if sharing it.
     clip: Option<super::clip::ClipSync>,
+    /// The file-transfer line the box is showing ("" = none).
+    files_shown: String,
 }
 
 thread_local! {
@@ -595,10 +597,14 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         out,
         "  clipboard: {}",
         if sh.clipboard {
+            let p = sh.client.clip_progress();
             format!(
-                "{} sent to the host, {} received",
+                "{} items sent to the host, {} received | files: {} copies sent, {} received, {} not sent (over 200 MB, too many or unreadable)",
                 sh.clips_out.load(Ordering::Relaxed),
-                sh.clips_in.load(Ordering::Relaxed)
+                sh.clips_in.load(Ordering::Relaxed),
+                p.files_sent,
+                p.files_received,
+                p.not_sent
             )
         } else {
             "off".to_string()
@@ -756,6 +762,24 @@ fn overlay_text(
 }
 
 /// What a host notice means, for the viewer's screen.
+/// "Sending files to “QUIETPC” … 45%" while files are on their way.
+fn files_line(p: &glass_core::clipboard::ClipProgress, host: &str) -> Option<String> {
+    let mb = |b: u64| b as f64 / 1e6;
+    let (verb, done, total) = if p.out_total > 0 && p.out_done < p.out_total {
+        ("Sending files to", p.out_done, p.out_total)
+    } else if p.in_total > 0 && p.in_done < p.in_total {
+        ("Receiving files from", p.in_done, p.in_total)
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{verb} \u{201C}{host}\u{201D} \u{2026} {}%  ({:.1} of {:.1} MB)\nThey can be pasted once they're all there.",
+        done * 100 / total,
+        mb(done),
+        mb(total)
+    ))
+}
+
 fn notice_text(code: u8, host: &str) -> String {
     match code {
         glass_core::protocol::NOTICE_INPUT_BLOCKED_ELEVATED => format!(
@@ -1100,7 +1124,12 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
             bar_seen_us: 0,
             last_bar_status_us: 0,
             // Sends what's copied now too: copy, connect, paste.
-            clip: sh.clipboard.then(|| super::clip::ClipSync::start(true)),
+            clip: sh.clipboard.then(|| {
+                sh.client
+                    .set_file_dir(Some(super::clip::file_dir(false, "viewer")));
+                super::clip::ClipSync::start(true)
+            }),
+            files_shown: String::new(),
         })
     });
     with_ui(|ui| ui.layout());
@@ -1222,7 +1251,26 @@ impl Ui {
         // window): shown even with the stats off, as on the Mac.
         let notice = self.sh.client.stats().host_notice;
         let host = self.sh.client.peer().name.clone();
+        let files = files_line(&self.sh.client.clip_progress(), &host);
         let Some(b) = &mut self.stats_box else { return };
+        // Files on their way: shown over the stats while they go.
+        if let Some(line) = files.filter(|_| notice == NOTICE_NONE) {
+            if line != self.files_shown {
+                b.set_text(&line);
+                self.files_shown = line;
+            }
+            b.place(c);
+            return;
+        }
+        if !self.files_shown.is_empty() {
+            self.files_shown.clear();
+            self.notice_shown = NOTICE_NONE;
+            self.stats_seen = self.stats_seen.wrapping_sub(1);
+            if !show && notice == NOTICE_NONE {
+                b.hide();
+                return;
+            }
+        }
         if !show {
             if notice == NOTICE_NONE {
                 self.notice_shown = NOTICE_NONE;
@@ -1693,9 +1741,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         ui.sh.clips_in.fetch_add(1, Ordering::Relaxed);
                         clip.put_incoming(item);
                     }
+                    if let Some(files) = c.take_files() {
+                        clip.put_incoming(super::clip::files_item(&files));
+                    }
                     if let Some(item) = clip.take_outgoing() {
-                        ui.sh.clips_out.fetch_add(1, Ordering::Relaxed);
-                        c.send_clipboard(item);
+                        if item.kind == glass_core::clipboard::CLIP_FILES {
+                            c.send_files(super::clip::item_files(&item));
+                        } else {
+                            ui.sh.clips_out.fetch_add(1, Ordering::Relaxed);
+                            c.send_clipboard(item);
+                        }
                     }
                 }
                 ui.poll_cursor();

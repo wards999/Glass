@@ -395,6 +395,14 @@ fn client_size(hwnd: HWND) -> (u32, u32) {
 /// Shows `client` until it ends; returns the report and the view mode last
 /// asked for (to remember for this host).
 pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(String, u8)> {
+    // The keyboard counters are for this session only.
+    for c in [&KEYS_SEEN, &KEYS_NOT_FRONT, &KEYS_BUSY, &KEYS_WINDOW] {
+        c.store(0, Ordering::Relaxed);
+    }
+    KEYS_WENT_TO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     let Prepared {
         gpu,
         hello,

@@ -949,6 +949,15 @@ GLASS_Client *glass_client_connect(const GLASS_DeviceHandle *d,
 uint8_t glass_client_host_os(const GLASS_Client *c);
 
 /**
+ * The host ended the session on purpose (said Bye), as opposed to the
+ * connection dropping (the viewer may reconnect then).
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+bool glass_client_host_said_bye(const GLASS_Client *c);
+
+/**
  * What the host can do (`HOST_CAP_*`).
  *
  * # Safety

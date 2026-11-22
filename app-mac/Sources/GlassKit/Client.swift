@@ -117,6 +117,10 @@ public final class GlassClient {
 
     public var is444: Bool { info.chroma == UInt8(GLASS_CHROMA_444) }
 
+    /// The host ended the session on purpose (said Bye), rather than the
+    /// connection dropping (then the viewer reconnects).
+    public var hostSaidBye: Bool { with(false) { glass_client_host_said_bye($0) } }
+
     private func with<R>(_ fallback: R, _ body: (OpaquePointer) -> R) -> R {
         lock.lock()
         defer { lock.unlock() }

@@ -44,6 +44,8 @@ enum Msg {
     HostLine(String),
     HostStopped(String),
     TrayOpen,
+    /// The connection dropped; the viewer is trying again.
+    Reconnecting,
     TrayShare,
     TrayQuit,
 }
@@ -703,9 +705,18 @@ impl GlassApp {
                 self.dialog = Dialog::Report(r, false);
                 show(ctx);
             }
+            Msg::Reconnecting => {
+                self.notice = Some((
+                    "The connection dropped: reconnecting \u{2026}".into(),
+                    Instant::now(),
+                ));
+            }
             Msg::Status(s) => {
-                // Connected: the row being connected now says Viewing.
-                self.viewing = self.connecting.take();
+                // Connected: the row being connected now says Viewing (and
+                // still does after a reconnect).
+                if let Some(c) = self.connecting.take() {
+                    self.viewing = Some(c);
+                }
                 self.notice = Some((s, Instant::now()));
             }
             Msg::Host(e) => self.host_event(ctx, e),
@@ -803,24 +814,49 @@ fn connect_worker(
         Err(e) => return wake.send(Msg::Failed(format!("Can\u{2019}t start the viewer: {e}"))),
     };
     match Client::connect_with(&device, &host, port, prep.hello) {
-        Ok(c) => {
-            wake.send(Msg::Status(format!(
-                "Viewing \u{201C}{}\u{201D}",
-                c.peer().name
-            )));
-            let opts = viewer::Options {
-                windowed: false,
-                seconds: None,
-                rule: None,
-                full_colour: s.full_colour,
-            };
-            match viewer::run(c, prep, opts, &crate::banner()) {
-                Ok((report, _)) => {
-                    save_report("results-viewer.txt", &report);
-                    wake.send(Msg::Report(report));
+        Ok(first) => {
+            // When the connection drops without the host ending it (its agent
+            // restarted, a Wi-Fi blip), reconnect quietly for up to 15 s and
+            // carry on in the same view; only a real end shows the results.
+            let (mut next, mut reports) = (Some((first, prep)), String::new());
+            while let Some((c, prep)) = next.take() {
+                wake.send(Msg::Status(format!(
+                    "Viewing \u{201C}{}\u{201D}",
+                    c.peer().name
+                )));
+                let opts = viewer::Options {
+                    windowed: false,
+                    seconds: None,
+                    rule: None,
+                    full_colour: s.full_colour,
+                };
+                let (report, m) = match viewer::run(c, prep, opts, &crate::banner()) {
+                    Ok(r) => r,
+                    Err(e) => return wake.send(Msg::Failed(format!("The viewer stopped: {e}"))),
+                };
+                save_report("results-viewer.txt", &report);
+                reports.push_str(&report);
+                let mode = m;
+                if !report.contains("(ended: the connection to the host dropped)") {
+                    break;
                 }
-                Err(e) => wake.send(Msg::Failed(format!("The viewer stopped: {e}"))),
+                wake.send(Msg::Reconnecting);
+                let until = Instant::now() + Duration::from_secs(15);
+                while next.is_none() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let Ok(prep) = viewer::prepare(mode, s.full_colour) else {
+                        continue;
+                    };
+                    if let Ok(c) = Client::connect_with(&device, &host, port, prep.hello) {
+                        reports.push_str("(reconnected after the connection dropped)\n\n");
+                        next = Some((c, prep));
+                    }
+                }
+                if next.is_none() {
+                    reports.push_str("(couldn\u{2019}t reconnect within 15 s)\n");
+                }
             }
+            wake.send(Msg::Report(reports));
         }
         Err(ConnectError::NotPaired) => match pair_begin(&device, &host, port) {
             Ok(p) => wake.send(Msg::AskPin(p, host, port)),

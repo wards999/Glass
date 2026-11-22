@@ -450,7 +450,9 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                                               decodeEnd: t1, inputSeq: meta.input_seq))
                 }
             }
-            if r == .disconnected { reason = "the PC ended the session" }
+            if r == .disconnected {
+                reason = client.hostSaidBye ? "the host ended the session" : "the connection to the host dropped"
+            }
         }
         let stats = client.stats
         lock.withLock { finalStats = stats }

@@ -459,6 +459,16 @@ pub unsafe extern "C" fn glass_client_host_os(c: *const Client) -> u8 {
     (*c).host_os()
 }
 
+/// The host ended the session on purpose (said Bye), as opposed to the
+/// connection dropping (the viewer may reconnect then).
+///
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_host_said_bye(c: *const Client) -> bool {
+    (*c).host_said_bye()
+}
+
 /// What the host can do (`HOST_CAP_*`).
 ///
 /// # Safety

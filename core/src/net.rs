@@ -1102,6 +1102,10 @@ impl InputTx {
 struct ClientShared {
     stop: AtomicBool,
     connected: AtomicBool,
+    /// The host said Bye: it ended the session on purpose (End session,
+    /// stopped sharing), as opposed to the connection dropping (its agent
+    /// restarted, the network went) — the viewer reconnects only then.
+    host_bye: AtomicBool,
     want_keyframe: AtomicBool,
     keyframe_requests: AtomicU32,
     queue_full: AtomicU64,
@@ -1344,6 +1348,7 @@ impl Client {
         let shared = Arc::new(ClientShared {
             stop: AtomicBool::new(false),
             connected: AtomicBool::new(true),
+            host_bye: AtomicBool::new(false),
             want_keyframe: AtomicBool::new(false),
             keyframe_requests: AtomicU32::new(0),
             queue_full: AtomicU64::new(0),
@@ -1395,6 +1400,12 @@ impl Client {
     /// What the host is (`protocol::HOST_OS_*`).
     pub fn host_os(&self) -> u8 {
         self.host_os
+    }
+
+    /// The host ended the session on purpose (said Bye), rather than the
+    /// connection dropping.
+    pub fn host_said_bye(&self) -> bool {
+        self.shared.host_bye.load(Ordering::Relaxed)
     }
 
     /// What the host can do (`protocol::HOST_CAP_*`).
@@ -1683,7 +1694,8 @@ fn spawn_control(
                         };
                     }
                     Message::Control(Control::Bye) => {
-                        return Err(io::ErrorKind::ConnectionAborted.into())
+                        sh.host_bye.store(true, Ordering::Relaxed);
+                        return Err(io::ErrorKind::ConnectionAborted.into());
                     }
                     _ => {}
                 }

@@ -904,7 +904,11 @@ fn render_loop(
                 }
                 Wait::Timeout => break,
                 Wait::Disconnected => {
-                    sh.end("the host ended the session");
+                    sh.end(if c.host_said_bye() {
+                        "the host ended the session"
+                    } else {
+                        "the connection to the host dropped"
+                    });
                     break;
                 }
             }

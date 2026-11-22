@@ -23,6 +23,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var hostStatus = ""
     /// The name of the machine being viewed (for the session bar).
     private var viewingName = ""
+    private var viewingPort: UInt16 = 0
+    /// Reports of a session that dropped and is being reconnected.
+    private var droppedReports = ""
     private var sessionCard: NSView?
     private var sessionTitle: NSTextField?
     private var sessionButton: NSButton?
@@ -773,6 +776,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         connectTo(host, port)
     }
 
+    /// Tries to connect again every second until `until`, then shows what
+    /// happened.
+    private func reconnect(_ host: String, _ port: UInt16, until: Date) {
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 1) {
+            let saved = UserDefaults.standard.object(forKey: "viewMode-\(host)") as? Int
+                ?? UserDefaults.standard.object(forKey: "startView") as? Int
+            let mode = UInt8(saved ?? Int(GLASS_MODE_FIT))
+            let full = UserDefaults.standard.bool(forKey: "fullColour")
+            let result = try? GlassClient(host: host, port: port, mode: mode, fullColour: full)
+            DispatchQueue.main.async {
+                if let client = result {
+                    self.startViewer(client)
+                } else if Date() < until {
+                    self.reconnect(host, port, until: until)
+                } else {
+                    self.viewingHost = nil
+                    self.showConnect()
+                    showResults(self.droppedReports + "(couldn\u{2019}t reconnect within 15 s)")
+                    self.droppedReports = ""
+                }
+            }
+        }
+    }
+
     private func connectTo(_ host: String, _ port: UInt16) {
         connectingHost = host
         setBusy("Connecting…")
@@ -876,13 +903,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         do {
             let v = try LiveViewer(client: client)
             v.onFinish = { [weak self] report in
-                self?.viewer = nil
-                self?.viewingHost = nil
-                self?.showConnect()
-                showResults(report)
+                guard let self else { return }
+                let host = self.viewingHost
+                self.viewer = nil
+                // Dropped without the host ending it (its agent restarted, a
+                // Wi-Fi blip): reconnect quietly for up to 15 s.
+                if report.contains("(ended: the connection to the host dropped)"), let host {
+                    self.droppedReports += report + "\n(reconnecting after the connection dropped)\n\n"
+                    self.reconnect(host, self.viewingPort, until: Date().addingTimeInterval(15))
+                    return
+                }
+                self.viewingHost = nil
+                self.showConnect()
+                showResults(self.droppedReports + report)
+                self.droppedReports = ""
             }
             viewer = v
             viewingHost = client.host
+            viewingPort = client.port
             connectingHost = nil
             // The Glass window stays (it shows Viewing, with Disconnect);
             // the viewer opens full screen in its own space. One session at

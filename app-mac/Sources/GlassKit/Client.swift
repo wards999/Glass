@@ -136,13 +136,31 @@ public final class GlassClient {
         }
     }
 
-    /// The latest clipboard item from the host (or files, once they've all
-    /// arrived), once.
+    /// Text from the host, once.
     public func takeClipboard() -> ClipboardSync.Item? {
         with(nil) { p in
-            guard let h = glass_client_take_files(p) ?? glass_client_take_clipboard(p) else { return nil }
+            guard let h = glass_client_take_clipboard(p) else { return nil }
             defer { glass_clip_free(h) }
-            return (glass_clip_kind(h), Data(bytes: glass_clip_data(h), count: glass_clip_len(h)))
+            return ClipboardSync.item(h)
+        }
+    }
+
+    /// A new offer (a picture or files) from the host, once.
+    public func takeOffer() -> ClipboardSync.Offer? {
+        with(nil) { p in
+            guard let h = glass_client_take_offer(p) else { return nil }
+            defer { glass_clip_free(h) }
+            return ClipboardSync.offer(h)
+        }
+    }
+
+    /// Pasted here: fetches offer `id` (0 still coming, 1 done, 2 failed).
+    public func fetch(_ id: UInt32) -> (UInt8, ClipboardSync.Item?) {
+        with((UInt8(2), ClipboardSync.Item?.none)) { p in
+            var state: UInt8 = 0
+            guard let h = glass_client_fetch(p, id, &state) else { return (state, nil) }
+            defer { glass_clip_free(h) }
+            return (state, ClipboardSync.item(h))
         }
     }
 

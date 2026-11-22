@@ -32,10 +32,32 @@ between any pair (PC↔Mac, PC↔PC).
 - A Clipboard switch (Shared/Off) in Settings on both apps, on by default.
   The Windows service learns it from `C:\ProgramData\Glass\control\no-clipboard`.
 
-## Files (step 2)
-- Copying files or folders in Explorer or Finder sends **copies of the files
-  themselves** when you copy, not when you paste. They land under a Glass
-  folder on the other machine:
+## Pictures and files go only when pasted (m5c-test3 feedback)
+- The first file build sent everything when copied, which wastes the
+  network on every copy. Now text still goes at once (small), but a picture
+  or files are only **offered**: a few bytes (a size; names and sizes). The
+  other side puts a promise on its clipboard and asks (`FileRequest`) only
+  when an app pastes; the data comes then. This is how Remote Desktop
+  works.
+- Windows: pictures by delayed rendering (`WM_RENDERFORMAT`). Files as
+  **virtual files** (`FileGroupDescriptorW` + `FileContents`, a COM data
+  object), because Explorer reads a plain file list (CF_HDROP) the moment
+  it's on the clipboard, to dim cut files: a promised CF_HDROP was fetched
+  at once. With virtual files Explorer asks for contents only when
+  pasting, and shows its own copy progress.
+- Mac: lazy `NSPasteboardItem`s (a data provider). While a paste waits, the
+  main run loop keeps turning, so the viewer keeps drawing.
+- Promises are marked: a Glass marker so no Glass reads one back (that
+  would fetch it), plus the standard "don't monitor" flags for clipboard
+  history and clipboard managers (`ExcludeClipboardContentFromMonitorProcessing`,
+  `org.nspasteboard.TransientType`).
+- No size limit any more: copying is free. The paste waits for the data
+  (about 2 minutes per GB at the current pacing), with progress in the
+  viewer. LATER(M5c): stream each file's contents as it arrives instead of
+  fetching the whole copy first.
+
+## Files
+- Pasted files land under a Glass folder first:
   - the viewer: `%TEMP%\Glass\clipboard-viewer` or the Mac's temp folder
   - the host: `clipboard-host`
   - the Windows service: `C:\ProgramData\Glass-clipboard`, which the
@@ -46,14 +68,13 @@ between any pair (PC↔Mac, PC↔PC).
 - The file list goes first as a clipboard item (kind 3), then each file's
   bytes as `FileData`. TLS already guarantees integrity, so there's no
   separate hash. Sizes are checked and a broken transfer is dropped whole.
-- One sender thread per session sends only the newest copy. A new copy, of
-  anything, stops the old one (`FileCancel`). File data is paced at about
+- One sender thread per session. A newer copy replaces anything not yet
+  sent; a request for an older offer gets `FileCancel`. File data is paced at about
   60 Mbps so the picture keeps the network. LATER(M5): pace from the rate
   controller.
-- Up to 200 MB a copy, 10 000 entries. Bigger copies aren't sent; the
-  results count them. This keeps a big local copy from being shipped by
-  accident. LATER(M5c): send big copies only when pasted, the way Remote
-  Desktop does (Windows virtual files, macOS file promises).
+- At most 10 000 files and folders a copy. A copy that can't be listed
+  (too many, or a file that can't be read, e.g. a cloud-only file) isn't
+  offered; the results say why.
 - Received paths are made safe: no `..` or absolute paths, and Windows'
   reserved names and characters are replaced. Older received copies are
   deleted when a new one arrives; the latest stays so it can still be pasted.

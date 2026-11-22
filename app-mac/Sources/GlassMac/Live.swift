@@ -379,12 +379,15 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         if clip == nil, ClipboardSync.enabled {
             client.setFileDir(ClipboardSync.fileDir(role: "viewer"))
             // Sends what's copied now too: copy, connect, paste.
-            clip = ClipboardSync(sendCurrent: true) { [client] item in client.sendClipboard(item) }
+            clip = ClipboardSync(sendCurrent: true, endpoint: .init(
+                send: { [client] in client.sendClipboard($0) },
+                takeText: { [client] in client.takeClipboard() },
+                takeOffer: { [client] in client.takeOffer() },
+                fetch: { [client] in client.fetch($0) }))
         }
         guard let clip else { return }
-        if let item = client.takeClipboard() { clip.put(item) }
         clip.poll()
-        let summary = clip.summary + " | " + ClipboardSync.filesSummary(client.clipProgress)
+        let summary = ClipboardSync.summary(client.clipProgress, other: "host")
         lock.withLock { clipSummary = summary }
     }
 

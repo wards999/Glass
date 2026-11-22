@@ -287,21 +287,18 @@ private final class HostSessionRun {
 
         // The clipboard, both ways (M5c): pasteboard work on the main
         // thread, session calls on the session queue.
-        var clip: ClipboardSync?
         var clipTimer: DispatchSourceTimer?
         if runner.options.clipboard {
             let dir = ClipboardSync.fileDir(role: "host")
             q.sync { s.setFileDir(dir) }
-            let sync = ClipboardSync(sendCurrent: false) { [self] item in q.async { [self] in s.sendClipboard(item) } }
-            clip = sync
+            let sync = ClipboardSync(sendCurrent: false, endpoint: .init(
+                send: { [self] item in q.async { [self] in s.sendClipboard(item) } },
+                takeText: { [self] in q.sync { s.takeClipboard() } },
+                takeOffer: { [self] in q.sync { s.takeOffer() } },
+                fetch: { [self] id in q.sync { s.fetch(id) } }))
             let t = DispatchSource.makeTimerSource(queue: .main)
             t.schedule(deadline: .now(), repeating: .milliseconds(150))
-            t.setEventHandler { [self] in
-                sync.poll()
-                q.async { [self] in
-                    if let item = s.takeClipboard() { DispatchQueue.main.async { sync.put(item) } }
-                }
-            }
+            t.setEventHandler { sync.poll() }
             t.resume()
             clipTimer = t
         }
@@ -328,8 +325,7 @@ private final class HostSessionRun {
         }
         cursorTimer.cancel()
         clipTimer?.cancel()
-        clipSummary = DispatchQueue.main.sync { clip.map { $0.summary } } ?? "off"
-        if clip != nil { clipSummary += " | " + ClipboardSync.filesSummary(q.sync { s.clipProgress }) }
+        if clipTimer != nil { clipSummary = ClipboardSync.summary(q.sync { s.clipProgress }, other: "viewer") }
         pipeline?.stop()
         pipeline = nil
         virtual?.destroy()

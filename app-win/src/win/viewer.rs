@@ -761,7 +761,7 @@ fn files_line(p: &glass_core::clipboard::ClipProgress, host: &str) -> Option<Str
         return None;
     };
     Some(format!(
-        "{verb} \u{201C}{host}\u{201D} \u{2026} {}%  ({:.1} of {:.1} MB)\nThey can be pasted once they're all there.",
+        "{verb} \u{201C}{host}\u{201D} \u{2026} {}%  ({:.1} of {:.1} MB)\nThe paste finishes once they're all there.",
         done * 100 / total,
         mb(done),
         mb(total)

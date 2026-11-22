@@ -241,12 +241,27 @@ public final class GlassHostSession {
 
     public var clipProgress: GLASS_ClipProgress { ptr.map { glass_session_clip_progress($0) } ?? GLASS_ClipProgress() }
 
-    /// The latest clipboard item from the viewer (or files, once they've
-    /// all arrived), once.
+    /// Text from the viewer, once.
     public func takeClipboard() -> ClipboardSync.Item? {
-        guard let ptr, let h = glass_session_take_files(ptr) ?? glass_session_take_clipboard(ptr) else { return nil }
+        guard let ptr, let h = glass_session_take_clipboard(ptr) else { return nil }
         defer { glass_clip_free(h) }
-        return (glass_clip_kind(h), Data(bytes: glass_clip_data(h), count: glass_clip_len(h)))
+        return ClipboardSync.item(h)
+    }
+
+    /// A new offer (a picture or files) from the viewer, once.
+    public func takeOffer() -> ClipboardSync.Offer? {
+        guard let ptr, let h = glass_session_take_offer(ptr) else { return nil }
+        defer { glass_clip_free(h) }
+        return ClipboardSync.offer(h)
+    }
+
+    /// Pasted here: fetches offer `id` (0 still coming, 1 done, 2 failed).
+    public func fetch(_ id: UInt32) -> (UInt8, ClipboardSync.Item?) {
+        guard let ptr else { return (2, nil) }
+        var state: UInt8 = 0
+        guard let h = glass_session_fetch(ptr, id, &state) else { return (state, nil) }
+        defer { glass_clip_free(h) }
+        return (state, ClipboardSync.item(h))
     }
 
     /// Ends the session (keys the viewer held are released first).

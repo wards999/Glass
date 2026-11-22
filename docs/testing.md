@@ -10,7 +10,7 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
-## M5c test 3 (clipboard: text, pictures and files, both ways)
+## M5c test 4 (clipboard: text, pictures and files, both ways)
 Update **both** machines first. This is protocol v8, so an old build on either
 side refuses to connect. On the PC with the service, run
 `glass-cli service install` from the new zip as administrator (it updates the
@@ -34,24 +34,27 @@ With a session on (Mac viewing PC, then PC viewing Mac; PC↔PC too if you can):
    clipboard goes across.
 6. **No echo:** after each paste, the clipboard keeps what you pasted. It
    shouldn't change back or flicker.
-7. **Files, viewer → host:** in Explorer / Finder on the viewer, copy two
-   files and a folder with a subfolder (some MB in all). On the host (in the
-   viewer window), paste into a folder there. A progress line ("Sending
-   files to …") shows while they go; paste once it's gone. Check that
+7. **Copying costs nothing:** copy a big file (1 GB or so) on either side
+   and don't paste it. Nothing is sent: no progress line, and the viewer's
+   network figure in the stats doesn't jump.
+8. **Files, viewer → host:** in Explorer / Finder on the viewer, copy two
+   files and a folder with a subfolder. On the host (in the viewer window),
+   paste into a folder there. The files come now: a progress line ("Sending
+   files to …") and, on Windows, Explorer's own copy window. Check that
    everything arrived and opens.
-8. **Files, host → viewer:** copy files on the host, then paste them into a
+9. **Files, host → viewer:** copy files on the host, then paste them into a
    folder on the viewer outside Glass.
-9. **Big copy while moving:** copy about 150 MB (a video) and drag a window
-   around in the viewer while it goes. The picture must stay smooth. Then
-   copy something over 200 MB: it isn't sent (the results count it).
-10. **Copy again part-way:** start a big file copy, then copy some text
-    before it finishes. The text arrives; the half-sent files don't.
-11. **The service (QUIETPC):** files both ways, including at the lock screen
-    if you like (they wait on the clipboard).
-12. **Off:** set Clipboard to **Off** on the viewer and reconnect. Copying on
+10. **Big paste while moving:** paste about 500 MB and drag a window around in
+    the viewer while it comes. The picture must stay smooth.
+11. **Paste twice:** paste the same copy into a second folder. The second one
+    is quick (it's already here).
+12. **The service (QUIETPC):** text, pictures and files both ways. If files
+    copied on QUIETPC still don't show up on the other side, send its results:
+    the `clipboard:` line says why ("not offered").
+13. **Off:** set Clipboard to **Off** on the viewer and reconnect. Copying on
     either side no longer crosses. Set it back to **Shared**.
-13. Send back the viewer and host results (Copy button). Each has a
-    `clipboard:` line counting items and file copies each way.
+14. Send back the viewer and host results (Copy button). Each has a
+    `clipboard:` line counting text, pictures and file copies each way.
 
 ## M3f test 1 (the Windows service: unattended access)
 On the PC to be reached from far away (QUIETPC), from the extracted zip:

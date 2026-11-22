@@ -53,6 +53,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// How the viewer runs.
+#[derive(Clone)]
 pub struct Options {
     pub windowed: bool,
     pub seconds: Option<f64>,
@@ -228,9 +229,6 @@ struct Shared {
     /// Key presses this viewer sent (for the report).
     keys_sent: AtomicU32,
     clipboard: bool,
-    /// Clipboard items sent and received (for the report).
-    clips_out: AtomicU32,
-    clips_in: AtomicU32,
 }
 
 impl Shared {
@@ -302,7 +300,7 @@ struct Ui {
     bar_seen_us: u64,
     last_bar_status_us: u64,
     /// The clipboard thread (M5c), if sharing it.
-    clip: Option<super::clip::ClipSync>,
+    _clip: Option<super::clip::ClipSync>,
     /// The file-transfer line the box is showing ("" = none).
     files_shown: String,
 }
@@ -455,8 +453,6 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         stats_gen: AtomicU32::new(0),
         keys_sent: AtomicU32::new(0),
         clipboard: opts.clipboard,
-        clips_out: AtomicU32::new(0),
-        clips_in: AtomicU32::new(0),
         rule: opts.rule.unwrap_or(if client_os == HOST_OS_MAC {
             PcModifierRule::PcStyle
         } else {
@@ -597,15 +593,7 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         out,
         "  clipboard: {}",
         if sh.clipboard {
-            let p = sh.client.clip_progress();
-            format!(
-                "{} items sent to the host, {} received | files: {} copies sent, {} received, {} not sent (over 200 MB, too many or unreadable)",
-                sh.clips_out.load(Ordering::Relaxed),
-                sh.clips_in.load(Ordering::Relaxed),
-                p.files_sent,
-                p.files_received,
-                p.not_sent
-            )
+            super::clip::summary(&sh.client.clip_progress(), "host")
         } else {
             "off".to_string()
         }
@@ -1124,10 +1112,10 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
             bar_seen_us: 0,
             last_bar_status_us: 0,
             // Sends what's copied now too: copy, connect, paste.
-            clip: sh.clipboard.then(|| {
+            _clip: sh.clipboard.then(|| {
                 sh.client
                     .set_file_dir(Some(super::clip::file_dir(false, "viewer")));
-                super::clip::ClipSync::start(true)
+                super::clip::ClipSync::start(sh.client.clip_link(), true)
             }),
             files_shown: String::new(),
         })
@@ -1736,23 +1724,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 Some(LRESULT(0))
             }
             WM_TIMER if wparam.0 == TIMER_CURSOR => {
-                if let Some(clip) = &ui.clip {
-                    if let Some(item) = c.take_clipboard() {
-                        ui.sh.clips_in.fetch_add(1, Ordering::Relaxed);
-                        clip.put_incoming(item);
-                    }
-                    if let Some(files) = c.take_files() {
-                        clip.put_incoming(super::clip::files_item(&files));
-                    }
-                    if let Some(item) = clip.take_outgoing() {
-                        if item.kind == glass_core::clipboard::CLIP_FILES {
-                            c.send_files(super::clip::item_files(&item));
-                        } else {
-                            ui.sh.clips_out.fetch_add(1, Ordering::Relaxed);
-                            c.send_clipboard(item);
-                        }
-                    }
-                }
                 ui.poll_cursor();
                 ui.tick_bar();
                 ui.tick_stats();

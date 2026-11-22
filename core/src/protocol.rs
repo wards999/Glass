@@ -588,10 +588,11 @@ impl<'a> CursorShape<'a> {
 }
 
 // Message types in use: 1-7, 8 (pointer shape), 9-10, 11-14 (pairing),
-// 15-16, 17-19 (clipboard and files).
+// 15-16, 17-20 (clipboard and files).
 const KIND_CLIP: u8 = 17;
 const KIND_FILE_DATA: u8 = 18;
 const KIND_FILE_CANCEL: u8 = 19;
+const KIND_FILE_REQUEST: u8 = 20;
 /// Bytes of clipboard data per chunk (well inside a 64 KB frame).
 pub const CLIP_CHUNK: usize = 60_000;
 
@@ -691,6 +692,14 @@ pub fn encode_file_cancel(id: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&id.to_be_bytes());
 }
 
+/// Appends a `FileRequest` frame: something was pasted, send what offer
+/// `id` stands for (files or a picture).
+pub fn encode_file_request(id: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(&5u16.to_be_bytes());
+    out.push(KIND_FILE_REQUEST);
+    out.extend_from_slice(&id.to_be_bytes());
+}
+
 /// Any control-channel message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Message<'a> {
@@ -700,6 +709,8 @@ pub enum Message<'a> {
     FileData(FileData<'a>),
     /// The transfer with this id stopped part-way: drop what arrived.
     FileCancel(u32),
+    /// Pasted: send the contents of offer `id`.
+    FileRequest(u32),
     /// `PAIR_*` kind and its body.
     Pair {
         kind: u8,
@@ -716,9 +727,13 @@ impl<'a> Message<'a> {
             Message::Clip(ClipChunk::decode_body(b).ok_or(ControlError::Malformed)?)
         } else if kind == KIND_FILE_DATA {
             Message::FileData(FileData::decode_body(b).ok_or(ControlError::Malformed)?)
-        } else if kind == KIND_FILE_CANCEL {
-            let id = b.try_into().map_err(|_| ControlError::Malformed)?;
-            Message::FileCancel(u32::from_be_bytes(id))
+        } else if kind == KIND_FILE_CANCEL || kind == KIND_FILE_REQUEST {
+            let id = u32::from_be_bytes(b.try_into().map_err(|_| ControlError::Malformed)?);
+            if kind == KIND_FILE_CANCEL {
+                Message::FileCancel(id)
+            } else {
+                Message::FileRequest(id)
+            }
         } else if (PAIR_START..=PAIR_CONFIRM).contains(&kind) {
             if !pair_body_ok(kind, b.len()) {
                 return Err(ControlError::Malformed);

@@ -263,7 +263,42 @@ fn pack(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// The command line (`glass-cli.exe`).
+/// Writes any panic to `crash.txt` next to the program (or in the temp
+/// folder): a panic inside a window callback ends the program at once with
+/// no message, and this is the only trace (m5c-test3: the viewer vanished
+/// after a Wi-Fi drop).
+fn crash_log() {
+    std::panic::set_hook(Box::new(|info| {
+        use std::io::Write;
+        let text = format!(
+            "{}\nthread {:?}: {info}\n{}\n\n",
+            banner(),
+            std::thread::current().name().unwrap_or("?"),
+            std::backtrace::Backtrace::force_capture()
+        );
+        let next_to_exe = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join("crash.txt")));
+        for path in next_to_exe
+            .into_iter()
+            .chain([std::env::temp_dir().join("Glass-crash.txt")])
+        {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                if f.write_all(text.as_bytes()).is_ok() {
+                    break;
+                }
+            }
+        }
+        eprintln!("{text}");
+    }));
+}
+
 pub fn cli_main() {
+    crash_log();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         #[cfg(windows)]
@@ -321,6 +356,7 @@ pub fn win_message(text: &str) {
 /// "Restart as administrator").
 #[cfg(windows)]
 pub fn gui_main() {
+    crash_log();
     let share = std::env::args().any(|a| a == "--share");
     if let Err(e) = win::app::run(share) {
         win_message(&format!("Glass couldn't start: {e}"));

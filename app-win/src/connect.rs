@@ -177,7 +177,32 @@ pub fn connect(args: &[String]) -> Res<()> {
             " Ctrl+Alt+Shift+C: full colour (4:4:4), sharper coloured detail but slower."
         }
     );
-    let (report, last_mode) = viewer::run(client, prep, opts, &crate::banner())?;
+    // Like the Glass window: when the connection drops without the host
+    // ending it, reconnect for up to 15 s and carry on in the same view.
+    let (mut next, mut report, mut last_mode) = (Some((client, prep)), String::new(), mode);
+    while let Some((c, prep)) = next.take() {
+        let (r, m) = viewer::run(c, prep, opts.clone(), &crate::banner())?;
+        report.push_str(&r);
+        last_mode = m;
+        if !r.contains("(ended: the connection to the host dropped)") {
+            break;
+        }
+        println!("The connection dropped: reconnecting for up to 15 s ...");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while next.is_none() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let Ok(prep) = viewer::prepare(m, opts.full_colour) else {
+                continue;
+            };
+            if let Ok(c) = Client::connect_with(&device, &host, port, prep.hello) {
+                report.push_str("(reconnected after the connection dropped)\n\n");
+                next = Some((c, prep));
+            }
+        }
+        if next.is_none() {
+            report.push_str("(couldn't reconnect within 15 s)\n");
+        }
+    }
     save_mode(&modes_file, &addr, last_mode);
     println!("\n{report}");
     if let Some(path) = log {

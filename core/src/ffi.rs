@@ -1153,10 +1153,15 @@ pub unsafe extern "C" fn glass_session_close(s: *mut HostSession) {
 
 // ---- Clipboard (M5c) ------------------------------------------------------
 
-/// A clipboard item that arrived from the other side (opaque): read it with
-/// `glass_clip_kind` / `glass_clip_data` / `glass_clip_len`, then
-/// `glass_clip_free`.
-pub struct ClipHandle(crate::clipboard::ClipItem);
+/// Clipboard data from the other side (opaque): text, an offer, or what a
+/// fetch got. Read it with `glass_clip_kind` / `_data` / `_len` / `_id` /
+/// `_size`, then `glass_clip_free`. Files: `data` is their paths,
+/// NUL-separated.
+pub struct ClipHandle {
+    item: crate::clipboard::ClipItem,
+    id: u32,
+    size: u64,
+}
 
 unsafe fn clip_from(kind: u8, data: *const u8, len: usize) -> Option<crate::clipboard::ClipItem> {
     if data.is_null() || len == 0 || len > crate::clipboard::CLIP_MAX {
@@ -1166,14 +1171,90 @@ unsafe fn clip_from(kind: u8, data: *const u8, len: usize) -> Option<crate::clip
     Some(crate::clipboard::ClipItem { kind, data })
 }
 
-fn clip_out(item: Option<crate::clipboard::ClipItem>) -> *mut ClipHandle {
+fn handle(item: crate::clipboard::ClipItem, id: u32, size: u64) -> *mut ClipHandle {
+    Box::into_raw(Box::new(ClipHandle { item, id, size }))
+}
+
+fn joined(paths: &[std::path::PathBuf]) -> Vec<u8> {
+    paths
+        .iter()
+        .map(|p| p.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\0")
+        .into_bytes()
+}
+
+fn text_out(item: Option<crate::clipboard::ClipItem>) -> *mut ClipHandle {
     item.map_or(std::ptr::null_mut(), |i| {
-        Box::into_raw(Box::new(ClipHandle(i)))
+        let n = i.data.len() as u64;
+        handle(i, 0, n)
     })
 }
 
-/// Sends a clipboard item (`CLIP_TEXT` UTF-8 or `CLIP_PNG`) to the host in
-/// the background. The bytes are copied. False if empty or too big.
+fn offer_out(o: Option<crate::clipboard::Offer>) -> *mut ClipHandle {
+    o.map_or(std::ptr::null_mut(), |o| {
+        let item = crate::clipboard::ClipItem {
+            kind: o.kind,
+            data: joined(&o.files),
+        };
+        handle(item, o.id, o.size)
+    })
+}
+
+fn fetch_out(id: u32, st: crate::clipboard::FetchState, state: *mut u8) -> *mut ClipHandle {
+    use crate::clipboard::{FetchState, Fetched, CLIP_FILES, CLIP_PNG};
+    let (code, out) = match st {
+        FetchState::Pending => (0, std::ptr::null_mut()),
+        FetchState::Failed => (2, std::ptr::null_mut()),
+        FetchState::Done(Fetched::Files(f)) => {
+            let item = crate::clipboard::ClipItem {
+                kind: CLIP_FILES,
+                data: joined(&f),
+            };
+            (1, handle(item, id, 0))
+        }
+        FetchState::Done(Fetched::Png(data)) => {
+            let n = data.len() as u64;
+            (
+                1,
+                handle(
+                    crate::clipboard::ClipItem {
+                        kind: CLIP_PNG,
+                        data,
+                    },
+                    id,
+                    n,
+                ),
+            )
+        }
+    };
+    if !state.is_null() {
+        unsafe { *state = code };
+    }
+    out
+}
+
+/// Paths, NUL-separated UTF-8 (`a\0b`), as the file list of a copy.
+unsafe fn paths_from(data: *const u8, len: usize) -> Vec<std::path::PathBuf> {
+    if data.is_null() || len == 0 {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(std::slice::from_raw_parts(data, len))
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+unsafe fn dir_arg(dir: *const c_char) -> Option<std::path::PathBuf> {
+    str_arg(dir)
+        .filter(|d| !d.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// This Mac copied text (`CLIP_TEXT`, sent now) or a picture (`CLIP_PNG`,
+/// offered: sent only if pasted). The bytes are copied. False if empty or
+/// too big.
 ///
 /// # Safety
 /// `c` from `glass_client_connect`; `data` points to `len` bytes.
@@ -1193,17 +1274,70 @@ pub unsafe extern "C" fn glass_client_send_clipboard(
     }
 }
 
-/// The latest clipboard item from the host, once; null if none.
+/// This Mac copied files and folders (`paths`: NUL-separated UTF-8):
+/// offered, sent only if pasted.
+///
+/// # Safety
+/// `c` from `glass_client_connect`; `paths` points to `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_send_files(c: *const Client, paths: *const u8, len: usize) {
+    let p = paths_from(paths, len);
+    if !p.is_empty() {
+        (*c).send_files(p);
+    }
+}
+
+/// Text from the host, once; null if none.
 ///
 /// # Safety
 /// `c` from `glass_client_connect`.
 #[no_mangle]
 pub unsafe extern "C" fn glass_client_take_clipboard(c: *const Client) -> *mut ClipHandle {
-    clip_out((*c).take_clipboard())
+    text_out((*c).take_clipboard())
 }
 
-/// Sends a clipboard item to the viewer in the background (see
-/// `glass_client_send_clipboard`).
+/// A new offer from the host, once; null if none. `kind` `CLIP_PNG` or
+/// `CLIP_FILES` (data: where the top-level files will be), `id` for
+/// `glass_client_fetch`, `size` in bytes.
+///
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_take_offer(c: *const Client) -> *mut ClipHandle {
+    offer_out((*c).take_offer())
+}
+
+/// Something was pasted: fetches offer `id`. `state`: 0 still coming (call
+/// again), 1 done (the handle has the picture or the file paths), 2 failed.
+///
+/// # Safety
+/// `c` from `glass_client_connect`; `state` writable or null.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_fetch(
+    c: *const Client,
+    id: u32,
+    state: *mut u8,
+) -> *mut ClipHandle {
+    fetch_out(id, (*c).fetch(id), state)
+}
+
+/// Accept files from the host into `dir` (null or empty: refuse them).
+///
+/// # Safety
+/// `c` from `glass_client_connect`; `dir` a C string or null.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_set_file_dir(c: *const Client, dir: *const c_char) {
+    (*c).set_file_dir(dir_arg(dir));
+}
+
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_clip_progress(c: *const Client) -> ClipProgress {
+    (*c).clip_progress()
+}
+
+/// See `glass_client_send_clipboard`.
 ///
 /// # Safety
 /// `s` from `glass_host_accept`; `data` points to `len` bytes.
@@ -1223,90 +1357,7 @@ pub unsafe extern "C" fn glass_session_send_clipboard(
     }
 }
 
-/// The latest clipboard item from the viewer, once; null if none.
-///
-/// # Safety
-/// `s` from `glass_host_accept`.
-#[no_mangle]
-pub unsafe extern "C" fn glass_session_take_clipboard(s: *const HostSession) -> *mut ClipHandle {
-    clip_out((*s).take_clipboard())
-}
-
-/// Paths, NUL-separated UTF-8 (`a\0b`), as the file list of a copy.
-unsafe fn paths_from(data: *const u8, len: usize) -> Vec<std::path::PathBuf> {
-    if data.is_null() || len == 0 {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(std::slice::from_raw_parts(data, len))
-        .split('\0')
-        .filter(|p| !p.is_empty())
-        .map(std::path::PathBuf::from)
-        .collect()
-}
-
-/// Received files as a `CLIP_FILES` handle: paths NUL-separated.
-fn files_out(files: Option<Vec<std::path::PathBuf>>) -> *mut ClipHandle {
-    clip_out(files.map(|f| {
-        crate::clipboard::ClipItem {
-            kind: crate::clipboard::CLIP_FILES,
-            data: f
-                .iter()
-                .map(|p| p.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("\0")
-                .into_bytes(),
-        }
-    }))
-}
-
-unsafe fn dir_arg(dir: *const c_char) -> Option<std::path::PathBuf> {
-    str_arg(dir)
-        .filter(|d| !d.is_empty())
-        .map(std::path::PathBuf::from)
-}
-
-/// Sends copies of files and folders to the host in the background, paced
-/// (`paths`: NUL-separated UTF-8). A newer copy replaces them.
-///
-/// # Safety
-/// `c` from `glass_client_connect`; `paths` points to `len` bytes.
-#[no_mangle]
-pub unsafe extern "C" fn glass_client_send_files(c: *const Client, paths: *const u8, len: usize) {
-    let p = paths_from(paths, len);
-    if !p.is_empty() {
-        (*c).send_files(p);
-    }
-}
-
-/// Files from the host once they've all arrived, once; null if none. A
-/// `GLASS_CLIP_FILES` handle whose data is the top-level paths,
-/// NUL-separated.
-///
-/// # Safety
-/// `c` from `glass_client_connect`.
-#[no_mangle]
-pub unsafe extern "C" fn glass_client_take_files(c: *const Client) -> *mut ClipHandle {
-    files_out((*c).take_files())
-}
-
-/// Accept files from the host into `dir` (null or empty: refuse them).
-///
-/// # Safety
-/// `c` from `glass_client_connect`; `dir` a C string or null.
-#[no_mangle]
-pub unsafe extern "C" fn glass_client_set_file_dir(c: *const Client, dir: *const c_char) {
-    (*c).set_file_dir(dir_arg(dir));
-}
-
-/// # Safety
-/// `c` from `glass_client_connect`.
-#[no_mangle]
-pub unsafe extern "C" fn glass_client_clip_progress(c: *const Client) -> ClipProgress {
-    (*c).clip_progress()
-}
-
-/// Sends copies of files and folders to the viewer (see
-/// `glass_client_send_files`).
+/// See `glass_client_send_files`.
 ///
 /// # Safety
 /// `s` from `glass_host_accept`; `paths` points to `len` bytes.
@@ -1322,13 +1373,35 @@ pub unsafe extern "C" fn glass_session_send_files(
     }
 }
 
-/// Files from the viewer once they've all arrived, once; null if none.
+/// Text from the viewer, once; null if none.
 ///
 /// # Safety
 /// `s` from `glass_host_accept`.
 #[no_mangle]
-pub unsafe extern "C" fn glass_session_take_files(s: *const HostSession) -> *mut ClipHandle {
-    files_out((*s).take_files())
+pub unsafe extern "C" fn glass_session_take_clipboard(s: *const HostSession) -> *mut ClipHandle {
+    text_out((*s).take_clipboard())
+}
+
+/// See `glass_client_take_offer`.
+///
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_take_offer(s: *const HostSession) -> *mut ClipHandle {
+    offer_out((*s).take_offer())
+}
+
+/// See `glass_client_fetch`.
+///
+/// # Safety
+/// `s` from `glass_host_accept`; `state` writable or null.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_fetch(
+    s: *const HostSession,
+    id: u32,
+    state: *mut u8,
+) -> *mut ClipHandle {
+    fetch_out(id, (*s).fetch(id), state)
 }
 
 /// Accept files from the viewer into `dir` (null or empty: refuse them).
@@ -1348,30 +1421,48 @@ pub unsafe extern "C" fn glass_session_clip_progress(s: *const HostSession) -> C
 }
 
 /// # Safety
-/// `h` from a `_take_clipboard` call, not freed.
+/// `h` from a clipboard call, not freed.
 #[no_mangle]
 pub unsafe extern "C" fn glass_clip_kind(h: *const ClipHandle) -> u8 {
-    (*h).0.kind
+    (*h).item.kind
 }
 
 /// # Safety
-/// `h` from a `_take_clipboard` call, not freed.
+/// `h` from a clipboard call, not freed.
 #[no_mangle]
 pub unsafe extern "C" fn glass_clip_len(h: *const ClipHandle) -> usize {
-    (*h).0.data.len()
+    (*h).item.data.len()
 }
 
-/// The item's bytes; valid until `glass_clip_free`.
+/// The bytes; valid until `glass_clip_free`.
 ///
 /// # Safety
-/// `h` from a `_take_clipboard` call, not freed.
+/// `h` from a clipboard call, not freed.
 #[no_mangle]
 pub unsafe extern "C" fn glass_clip_data(h: *const ClipHandle) -> *const u8 {
-    (*h).0.data.as_ptr()
+    (*h).item.data.as_ptr()
+}
+
+/// An offer's id (for `_fetch`).
+///
+/// # Safety
+/// `h` from a clipboard call, not freed.
+#[no_mangle]
+pub unsafe extern "C" fn glass_clip_id(h: *const ClipHandle) -> u32 {
+    (*h).id
+}
+
+/// An offer's size in bytes.
+///
+/// # Safety
+/// `h` from a clipboard call, not freed.
+#[no_mangle]
+pub unsafe extern "C" fn glass_clip_size(h: *const ClipHandle) -> u64 {
+    (*h).size
 }
 
 /// # Safety
-/// `h` from a `_take_clipboard` call (or null), not used afterwards.
+/// `h` from a clipboard call (or null), not used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn glass_clip_free(h: *mut ClipHandle) {
     if !h.is_null() {

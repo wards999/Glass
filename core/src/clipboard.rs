@@ -1,44 +1,49 @@
-//! Clipboard sharing (M5c): text, images and files, both directions, over
+//! Clipboard sharing (M5c): text, pictures and files, both directions, over
 //! the session's encrypted control connection.
 //!
-//! Each side watches its own clipboard; when it changes, the new contents go
-//! to the other side: one *item* (UTF-8 text or a PNG image), or a set of
-//! *files*. Items are put on that machine's clipboard. Files are written into
-//! a Glass folder there, and once they've all arrived the clipboard holds
-//! them as real files, so an ordinary paste works in Explorer or Finder.
+//! Each side watches its own clipboard. When it changes:
+//! - **text** goes to the other side at once (it's small) and is put on its
+//!   clipboard;
+//! - **pictures and files** are only *offered*: a few bytes saying what was
+//!   copied (a picture's size; the files' names and sizes). The other side
+//!   puts a promise of them on its clipboard (Windows delayed rendering, Mac
+//!   lazy pasteboard items). Only when something there is pasted does it
+//!   ask (`FileRequest`), and the picture or the files come then, as Remote
+//!   Desktop does. Copying something else first sends nothing more.
 //!
-//! A control frame holds at most 64 KB, so everything travels as chunks.
-//! One sender thread per session writes them a frame at a time, so pings,
-//! pointer shapes and the rest of the control traffic keep flowing in
-//! between. Only the newest copy is sent: copying again stops what was
-//! being sent. File data is paced ([`FILE_RATE`]) so the picture keeps the
-//! network. LATER(M5): pace from the rate controller instead.
-//!
-//! Files: the list (a [`CLIP_FILES`] item: names, sizes, folders) comes
-//! first, then each file's bytes in order as `FileData`. A copy over
-//! [`FILES_MAX`] isn't sent. LATER(M5c): send big copies only when pasted.
+//! Files land in a Glass folder on the receiving side, and the paste gets
+//! them as real files. A control frame holds at most 64 KB, so everything
+//! travels as chunks, written a frame at a time by one sender thread per
+//! session: pings, pointer shapes and the rest keep flowing in between.
+//! File data is paced ([`FILE_RATE`]) so the picture keeps the network.
+//! LATER(M5): pace from the rate controller instead. LATER(M5c): Windows
+//! virtual files / Mac file promises, so a huge paste streams with the
+//! system's own progress instead of the paste waiting.
 //!
 //! Echo: each app remembers what it last put on its clipboard and doesn't
 //! send that back.
 
-use crate::protocol::{encode_file_cancel, ClipChunk, FileData, Message, CLIP_CHUNK};
+use crate::protocol::{
+    encode_file_cancel, encode_file_request, ClipChunk, FileData, Message, CLIP_CHUNK,
+};
 use crate::tls::TlsWriter;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// UTF-8 text.
 pub const CLIP_TEXT: u8 = 1;
-/// A PNG image.
+/// A PNG image (sent when the offer of it is pasted).
 pub const CLIP_PNG: u8 = 2;
-/// A file list (the start of a file transfer).
+/// A file list: an offer of files.
 pub const CLIP_FILES: u8 = 3;
-/// The largest item that's sent (16 MB).
+/// An offer of a picture: its PNG size (`u64`).
+pub const CLIP_PNG_OFFER: u8 = 4;
+/// The largest item that's sent (16 MB; a picture's PNG).
 pub const CLIP_MAX: usize = 16 << 20;
-/// The largest copy of files that's sent (200 MB in all).
-pub const FILES_MAX: u64 = 200 << 20;
 /// At most this many files and folders in one copy.
 pub const FILES_MAX_ENTRIES: usize = 10_000;
 /// File data goes at most this fast (bytes/s, about 60 Mbps).
@@ -171,12 +176,13 @@ pub fn decode_list(b: &[u8]) -> Option<Vec<Entry>> {
     (i == b.len()).then_some(out)
 }
 
-/// Why a copy of files wasn't sent.
-#[derive(Debug, PartialEq, Eq)]
+/// Why a copy of files wasn't offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotSent {
-    TooBig(u64),
-    TooMany,
-    Unreadable,
+    /// Over [`FILES_MAX_ENTRIES`] files and folders.
+    TooMany = 1,
+    /// A file or folder couldn't be read (permissions, a cloud-only file).
+    Unreadable = 2,
 }
 
 /// The file list for a copy of these paths (folders included, with all
@@ -187,7 +193,6 @@ pub fn collect(paths: &[PathBuf]) -> Result<(Vec<Entry>, Vec<PathBuf>), NotSent>
         rel: String,
         entries: &mut Vec<Entry>,
         sources: &mut Vec<PathBuf>,
-        total: &mut u64,
     ) -> Result<(), NotSent> {
         if entries.len() >= FILES_MAX_ENTRIES {
             return Err(NotSent::TooMany);
@@ -207,13 +212,9 @@ pub fn collect(paths: &[PathBuf]) -> Result<(Vec<Entry>, Vec<PathBuf>), NotSent>
             kids.sort_by_key(|e| e.file_name());
             for k in kids {
                 let name = k.file_name().to_string_lossy().into_owned();
-                walk(&k.path(), format!("{rel}/{name}"), entries, sources, total)?;
+                walk(&k.path(), format!("{rel}/{name}"), entries, sources)?;
             }
         } else if md.is_file() {
-            *total += md.len();
-            if *total > FILES_MAX {
-                return Err(NotSent::TooBig(*total));
-            }
             entries.push(Entry {
                 path: rel,
                 dir: false,
@@ -223,12 +224,12 @@ pub fn collect(paths: &[PathBuf]) -> Result<(Vec<Entry>, Vec<PathBuf>), NotSent>
         } // links and other special files are skipped
         Ok(())
     }
-    let (mut entries, mut sources, mut total) = (Vec::new(), Vec::new(), 0);
+    let (mut entries, mut sources) = (Vec::new(), Vec::new());
     for p in paths {
         let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             continue;
         };
-        walk(p, name, &mut entries, &mut sources, &mut total)?;
+        walk(p, name, &mut entries, &mut sources)?;
     }
     if entries.is_empty() {
         return Err(NotSent::Unreadable);
@@ -255,6 +256,7 @@ pub fn safe_path(rel: &str) -> Option<PathBuf> {
                 }
             })
             .collect();
+        // Also turns "." and ".." into "": refused.
         while c.ends_with('.') || c.ends_with(' ') {
             c.pop();
         }
@@ -270,11 +272,41 @@ pub fn safe_path(rel: &str) -> Option<PathBuf> {
     Some(out)
 }
 
+/// How long a paste waits for `size` bytes: generous, as the data comes at
+/// [`FILE_RATE`] with the picture going too.
+pub fn fetch_timeout(size: u64) -> Duration {
+    Duration::from_secs(30 + size / (FILE_RATE / 2))
+}
+
 // ---- The link: one per session --------------------------------------------
 
-enum Job {
-    Item(ClipItem),
+/// Something the other side copied and offers: put a promise of it on the
+/// clipboard, and `fetch` it when pasted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    pub id: u32,
+    /// `CLIP_FILES` or `CLIP_PNG`.
+    pub kind: u8,
+    /// Bytes in all.
+    pub size: u64,
+    /// Files: where the top-level files and folders will be once fetched.
+    pub files: Vec<PathBuf>,
+    /// Files: every file and folder, in order (relative, `/`-separated).
+    pub entries: Vec<Entry>,
+}
+
+/// What a paste got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fetched {
     Files(Vec<PathBuf>),
+    Png(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchState {
+    Pending,
+    Done(Fetched),
+    Failed,
 }
 
 /// Transfer progress and counts, for the apps (bytes; `*_total` 0 = none).
@@ -285,17 +317,53 @@ pub struct ClipProgress {
     pub in_total: u64,
     pub out_done: u64,
     pub out_total: u64,
-    /// Copies of files not sent (too big, too many files or unreadable).
-    pub not_sent: u32,
+    /// Text sent and received, pictures pasted either way.
+    pub items_sent: u32,
+    pub items_received: u32,
+    /// Copies of files offered, and pasted either way.
+    pub files_offered: u32,
     pub files_sent: u32,
     pub files_received: u32,
+    /// Copies of files not offered, and why the last one wasn't
+    /// (`NotSent`: 1 too many files, 2 unreadable).
+    pub not_sent: u32,
+    pub not_sent_why: u8,
 }
 
-/// A file transfer being received.
+enum Job {
+    Text(u32, ClipItem),
+    Png(u32, Vec<u8>),
+    Files(u32, Vec<PathBuf>),
+    Deliver(u32),
+}
+
+enum Offered {
+    Png(Arc<Vec<u8>>),
+    Files {
+        entries: Arc<Vec<Entry>>,
+        sources: Arc<Vec<PathBuf>>,
+    },
+}
+
+/// The offer this side made (what a `FileRequest` asks for).
+struct OfferOut {
+    id: u32,
+    what: Offered,
+}
+
+/// The offer the other side made, as received.
+struct OfferIn {
+    offer: Offer,
+    entries: Vec<Entry>,
+    base: Option<PathBuf>,
+    state: Option<FetchState>,
+}
+
+/// Files being received.
 struct Inbound {
     id: u32,
     base: PathBuf,
-    /// Every list entry, in order: where it goes and its size (0 for
+    /// Every list entry in order: where it goes and its size (0 for
     /// folders). `FileData` refers to entries by index.
     files: Vec<(PathBuf, u64)>,
     tops: Vec<PathBuf>,
@@ -307,93 +375,168 @@ struct Inbound {
 #[derive(Default)]
 struct Rx {
     clip: Reassembler,
+    offer: Option<OfferIn>,
     inbound: Option<Inbound>,
-    /// The last complete transfer's folder: kept, its files are on the
-    /// clipboard.
+    /// The last fetched folder: kept, its files are on the clipboard.
     keep: Option<PathBuf>,
 }
 
-/// Clipboard state for one session, both ways.
-pub struct ClipLink {
-    job: Mutex<Option<Job>>,
-    wake: Condvar,
-    /// Bumped on every new copy: the sender stops on a change.
-    gen: AtomicU32,
-    sender: Mutex<bool>,
-    rx: Mutex<Rx>,
-    item_in: Mutex<Option<ClipItem>>,
-    files_in: Mutex<Option<Vec<PathBuf>>>,
-    /// Where received files go; `None`: files aren't accepted.
-    file_dir: Mutex<Option<PathBuf>>,
+#[derive(Default)]
+struct Counts {
     in_done: AtomicU64,
     in_total: AtomicU64,
     out_done: AtomicU64,
     out_total: AtomicU64,
-    not_sent: AtomicU32,
+    items_sent: AtomicU32,
+    items_received: AtomicU32,
+    files_offered: AtomicU32,
     files_sent: AtomicU32,
     files_received: AtomicU32,
+    not_sent: AtomicU32,
+    not_sent_why: AtomicU32,
+}
+
+/// Clipboard state for one session, both ways.
+pub struct ClipLink {
+    w: Option<TlsWriter>,
+    jobs: Mutex<VecDeque<Job>>,
+    wake: Condvar,
+    /// Bumped on every new copy: text still being sent stops.
+    gen: AtomicU32,
+    sender: Mutex<bool>,
+    offer_out: Mutex<Option<OfferOut>>,
+    rx: Mutex<Rx>,
+    text_in: Mutex<Option<ClipItem>>,
+    offer_new: Mutex<Option<Offer>>,
+    /// Where received files go; `None`: files aren't accepted.
+    file_dir: Mutex<Option<PathBuf>>,
+    n: Counts,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-impl Default for ClipLink {
-    fn default() -> Self {
+impl ClipLink {
+    /// `w`: the session's control connection (`None` in tests).
+    pub(crate) fn new(w: Option<TlsWriter>) -> Self {
         Self {
-            job: Mutex::new(None),
+            w,
+            jobs: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
             gen: AtomicU32::new(0),
             sender: Mutex::new(false),
+            offer_out: Mutex::new(None),
             rx: Mutex::new(Rx::default()),
-            item_in: Mutex::new(None),
-            files_in: Mutex::new(None),
+            text_in: Mutex::new(None),
+            offer_new: Mutex::new(None),
             file_dir: Mutex::new(None),
-            in_done: AtomicU64::new(0),
-            in_total: AtomicU64::new(0),
-            out_done: AtomicU64::new(0),
-            out_total: AtomicU64::new(0),
-            not_sent: AtomicU32::new(0),
-            files_sent: AtomicU32::new(0),
-            files_received: AtomicU32::new(0),
+            n: Counts::default(),
         }
     }
-}
 
-impl ClipLink {
-    fn queue(self: &Arc<Self>, w: &TlsWriter, job: Job) {
-        self.gen.fetch_add(1, Ordering::SeqCst);
-        *lock(&self.job) = Some(job);
+    fn write(&self, frame: &[u8]) -> bool {
+        self.w.as_ref().is_none_or(|w| w.write_all(frame).is_ok())
+    }
+
+    fn push(self: &Arc<Self>, job: Job) {
+        {
+            let mut q = lock(&self.jobs);
+            if !matches!(job, Job::Deliver(_)) {
+                // A newer copy replaces copies not yet handled.
+                q.retain(|j| matches!(j, Job::Deliver(_)));
+            }
+            q.push_back(job);
+        }
         self.wake.notify_one();
         let mut started = lock(&self.sender);
-        if !*started {
+        if !*started && self.w.is_some() {
             *started = true;
-            let (me, w) = (self.clone(), w.clone());
+            let me = self.clone();
             let _ = std::thread::Builder::new()
                 .name("glass-clip-send".into())
-                .spawn(move || me.send_loop(w));
+                .spawn(move || me.send_loop());
         }
     }
 
-    /// Sends an item (replacing anything still being sent).
-    pub(crate) fn send_item(self: &Arc<Self>, w: &TlsWriter, item: ClipItem) {
-        self.queue(w, Job::Item(item));
+    /// This side copied text (sent now) or a picture (`CLIP_PNG`: offered).
+    pub fn send_item(self: &Arc<Self>, item: ClipItem) {
+        if item.data.is_empty() || item.data.len() > CLIP_MAX {
+            return;
+        }
+        let id = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
+        match item.kind {
+            CLIP_PNG => self.push(Job::Png(id, item.data)),
+            _ => self.push(Job::Text(id, item)),
+        }
     }
 
-    /// Sends copies of these files and folders (replacing anything still
-    /// being sent). The list is made and checked on the sender thread.
-    pub(crate) fn send_files(self: &Arc<Self>, w: &TlsWriter, paths: Vec<PathBuf>) {
-        self.queue(w, Job::Files(paths));
+    /// This side copied files and folders: offered (their list is made on
+    /// the sender thread).
+    pub fn send_files(self: &Arc<Self>, paths: Vec<PathBuf>) {
+        let id = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
+        self.push(Job::Files(id, paths));
     }
 
+    /// Text from the other side, once.
     pub fn take_item(&self) -> Option<ClipItem> {
-        lock(&self.item_in).take()
+        lock(&self.text_in).take()
     }
 
-    /// Received files, once all of them are there: the top-level files and
-    /// folders, for the clipboard.
-    pub fn take_files(&self) -> Option<Vec<PathBuf>> {
-        lock(&self.files_in).take()
+    /// A new offer from the other side, once: put a promise of it on the
+    /// clipboard.
+    pub fn take_offer(&self) -> Option<Offer> {
+        lock(&self.offer_new).take()
+    }
+
+    /// Something was pasted: fetches offer `id`. Call again (cheap) until it
+    /// isn't `Pending`. Not from the session's control reader.
+    pub fn fetch(&self, id: u32) -> FetchState {
+        let mut rx = lock(&self.rx);
+        let (kind, size, entries, base) = match rx.offer.as_mut().filter(|o| o.offer.id == id) {
+            None => return FetchState::Failed,
+            Some(o) => {
+                if let Some(s) = &o.state {
+                    return s.clone();
+                }
+                o.state = Some(FetchState::Pending);
+                (
+                    o.offer.kind,
+                    o.offer.size,
+                    o.entries.clone(),
+                    o.base.clone(),
+                )
+            }
+        };
+        let mut frame = Vec::with_capacity(8);
+        encode_file_request(id, &mut frame);
+        if !self.write(&frame) {
+            Self::fail(&mut rx);
+            return FetchState::Failed;
+        }
+        if kind == CLIP_FILES {
+            self.start_inbound(&mut rx, id, &entries, base);
+        } else {
+            self.n.in_done.store(0, Ordering::Relaxed);
+            self.n.in_total.store(size, Ordering::Relaxed);
+        }
+        rx.offer
+            .as_ref()
+            .and_then(|o| o.state.clone())
+            .unwrap_or(FetchState::Failed)
+    }
+
+    /// `fetch`, waiting up to `timeout`.
+    pub fn fetch_wait(&self, id: u32, timeout: Duration) -> Option<Fetched> {
+        let until = Instant::now() + timeout;
+        loop {
+            match self.fetch(id) {
+                FetchState::Done(f) => return Some(f),
+                FetchState::Failed => return None,
+                FetchState::Pending if Instant::now() >= until => return None,
+                FetchState::Pending => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
     }
 
     /// Accept files into `dir` (`None`: refuse them).
@@ -402,43 +545,65 @@ impl ClipLink {
     }
 
     pub fn progress(&self) -> ClipProgress {
+        let n = &self.n;
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let c = |a: &AtomicU32| a.load(Ordering::Relaxed);
         ClipProgress {
-            in_done: self.in_done.load(Ordering::Relaxed),
-            in_total: self.in_total.load(Ordering::Relaxed),
-            out_done: self.out_done.load(Ordering::Relaxed),
-            out_total: self.out_total.load(Ordering::Relaxed),
-            not_sent: self.not_sent.load(Ordering::Relaxed),
-            files_sent: self.files_sent.load(Ordering::Relaxed),
-            files_received: self.files_received.load(Ordering::Relaxed),
+            in_done: l(&n.in_done),
+            in_total: l(&n.in_total),
+            out_done: l(&n.out_done),
+            out_total: l(&n.out_total),
+            items_sent: c(&n.items_sent),
+            items_received: c(&n.items_received),
+            files_offered: c(&n.files_offered),
+            files_sent: c(&n.files_sent),
+            files_received: c(&n.files_received),
+            not_sent: c(&n.not_sent),
+            not_sent_why: c(&n.not_sent_why) as u8,
         }
     }
 
     // -- sending (its own thread) --
 
-    fn send_loop(self: Arc<Self>, w: TlsWriter) {
+    fn send_loop(self: Arc<Self>) {
         let mut frame = Vec::with_capacity(CLIP_CHUNK + 32);
         loop {
             let job = {
-                let mut j = lock(&self.job);
+                let mut q = lock(&self.jobs);
                 loop {
-                    if let Some(job) = j.take() {
+                    if let Some(job) = q.pop_front() {
                         break job;
                     }
                     // Nobody else holds the link: the session is over.
                     if Arc::strong_count(&self) == 1 {
                         return;
                     }
-                    j = self
+                    q = self
                         .wake
-                        .wait_timeout(j, Duration::from_millis(500))
+                        .wait_timeout(q, Duration::from_millis(500))
                         .unwrap_or_else(|e| e.into_inner())
                         .0;
                 }
             };
-            let id = self.gen.load(Ordering::SeqCst);
             let ok = match job {
-                Job::Item(item) => self.send_chunks(&w, id, &item, &mut frame),
-                Job::Files(paths) => self.send_copy(&w, id, &paths, &mut frame),
+                Job::Text(id, item) => {
+                    let ok = self.send_chunks(id, &item, &mut frame, true);
+                    self.n.items_sent.fetch_add(1, Ordering::Relaxed);
+                    ok
+                }
+                Job::Png(id, data) => {
+                    *lock(&self.offer_out) = Some(OfferOut {
+                        id,
+                        what: Offered::Png(Arc::new(data.clone())),
+                    });
+                    let offer = ClipItem {
+                        kind: CLIP_PNG_OFFER,
+                        data: (data.len() as u64).to_be_bytes().to_vec(),
+                    };
+                    self.send_chunks(id, &offer, &mut frame, false)
+                }
+                Job::Files(id, paths) => self.offer_files(id, &paths, &mut frame),
+                Job::Deliver(id) => self.deliver(id, &mut frame),
             };
             if !ok {
                 return; // the connection is gone
@@ -446,107 +611,136 @@ impl ClipLink {
         }
     }
 
-    fn stale(&self, id: u32) -> bool {
-        self.gen.load(Ordering::SeqCst) != id
-    }
-
-    /// Writes an item's chunks; true unless writing failed.
-    fn send_chunks(&self, w: &TlsWriter, id: u32, item: &ClipItem, frame: &mut Vec<u8>) -> bool {
+    /// Writes an item's chunks; true unless writing failed. `stoppable`:
+    /// give up if something newer was copied meanwhile.
+    fn send_chunks(&self, id: u32, item: &ClipItem, frame: &mut Vec<u8>, stoppable: bool) -> bool {
         for c in chunks(id, item) {
-            if self.stale(id) {
+            if stoppable && self.gen.load(Ordering::SeqCst) != id {
                 return true; // the next item's first chunk drops this one
             }
             frame.clear();
-            if c.encode(frame) && w.write_all(frame).is_err() {
+            if c.encode(frame) && !self.write(frame) {
                 return false;
             }
         }
         true
     }
 
-    fn send_copy(&self, w: &TlsWriter, id: u32, paths: &[PathBuf], frame: &mut Vec<u8>) -> bool {
-        let Ok((entries, sources)) = collect(paths) else {
-            self.not_sent.fetch_add(1, Ordering::Relaxed);
-            return true;
+    fn offer_files(&self, id: u32, paths: &[PathBuf], frame: &mut Vec<u8>) -> bool {
+        let (entries, sources) = match collect(paths) {
+            Ok(v) => v,
+            Err(why) => {
+                self.n.not_sent.fetch_add(1, Ordering::Relaxed);
+                self.n.not_sent_why.store(why as u32, Ordering::Relaxed);
+                return true;
+            }
         };
-        let list = encode_list(&entries);
-        if list.len() > CLIP_MAX {
-            self.not_sent.fetch_add(1, Ordering::Relaxed);
-            return true;
-        }
-        let total: u64 = entries.iter().map(|e| e.size).sum();
-        self.out_done.store(0, Ordering::Relaxed);
-        self.out_total.store(total, Ordering::Relaxed);
         let list = ClipItem {
             kind: CLIP_FILES,
-            data: list,
+            data: encode_list(&entries),
         };
-        if !self.send_chunks(w, id, &list, frame) {
-            return false;
+        if list.data.len() > CLIP_MAX {
+            self.n.not_sent.fetch_add(1, Ordering::Relaxed);
+            self.n
+                .not_sent_why
+                .store(NotSent::TooMany as u32, Ordering::Relaxed);
+            return true;
         }
-        let start = std::time::Instant::now();
-        let mut sent = 0u64;
-        let mut buf = vec![0u8; CLIP_CHUNK];
+        *lock(&self.offer_out) = Some(OfferOut {
+            id,
+            what: Offered::Files {
+                entries: Arc::new(entries),
+                sources: Arc::new(sources),
+            },
+        });
+        self.n.files_offered.fetch_add(1, Ordering::Relaxed);
+        self.send_chunks(id, &list, frame, false)
+    }
+
+    /// The other side pasted offer `id`: send what it stands for.
+    fn deliver(&self, id: u32, frame: &mut Vec<u8>) -> bool {
+        let what = lock(&self.offer_out)
+            .as_ref()
+            .filter(|o| o.id == id)
+            .map(|o| match &o.what {
+                Offered::Png(d) => Offered::Png(d.clone()),
+                Offered::Files { entries, sources } => Offered::Files {
+                    entries: entries.clone(),
+                    sources: sources.clone(),
+                },
+            });
         let cancel = |frame: &mut Vec<u8>| {
-            self.out_total.store(0, Ordering::Relaxed);
+            self.n.out_total.store(0, Ordering::Relaxed);
             frame.clear();
             encode_file_cancel(id, frame);
-            w.write_all(frame).is_ok()
+            self.write(frame)
         };
-        for (index, (e, src)) in entries.iter().zip(&sources).enumerate() {
-            if e.dir || e.size == 0 {
-                continue;
-            }
-            let Ok(mut f) = std::fs::File::open(src) else {
-                return cancel(frame);
-            };
-            let mut offset = 0u64;
-            while offset < e.size {
-                if self.stale(id) {
-                    return cancel(frame);
-                }
-                let want = ((e.size - offset) as usize).min(CLIP_CHUNK);
-                if f.read_exact(&mut buf[..want]).is_err() {
-                    return cancel(frame); // shorter than listed: it changed
-                }
-                frame.clear();
-                let d = FileData {
-                    id,
-                    index: index as u32,
-                    offset,
-                    data: &buf[..want],
+        match what {
+            None => cancel(frame), // something newer was copied since
+            Some(Offered::Png(data)) => {
+                let item = ClipItem {
+                    kind: CLIP_PNG,
+                    data: data.to_vec(),
                 };
-                if d.encode(frame) && w.write_all(frame).is_err() {
-                    return false;
+                self.n.items_sent.fetch_add(1, Ordering::Relaxed);
+                self.send_chunks(id, &item, frame, false)
+            }
+            Some(Offered::Files { entries, sources }) => {
+                let total: u64 = entries.iter().map(|e| e.size).sum();
+                self.n.out_done.store(0, Ordering::Relaxed);
+                self.n.out_total.store(total, Ordering::Relaxed);
+                let start = Instant::now();
+                let mut sent = 0u64;
+                let mut buf = vec![0u8; CLIP_CHUNK];
+                for (index, (e, src)) in entries.iter().zip(sources.iter()).enumerate() {
+                    if e.dir || e.size == 0 {
+                        continue;
+                    }
+                    let Ok(mut f) = std::fs::File::open(src) else {
+                        return cancel(frame);
+                    };
+                    let mut offset = 0u64;
+                    while offset < e.size {
+                        let want = ((e.size - offset) as usize).min(CLIP_CHUNK);
+                        if f.read_exact(&mut buf[..want]).is_err() {
+                            return cancel(frame); // shorter than listed: it changed
+                        }
+                        frame.clear();
+                        let d = FileData {
+                            id,
+                            index: index as u32,
+                            offset,
+                            data: &buf[..want],
+                        };
+                        if d.encode(frame) && !self.write(frame) {
+                            return false;
+                        }
+                        offset += want as u64;
+                        sent += want as u64;
+                        self.n.out_done.store(sent, Ordering::Relaxed);
+                        // Paced: never ahead of FILE_RATE.
+                        let due = Duration::from_micros(sent * 1_000_000 / FILE_RATE);
+                        if let Some(wait) = due.checked_sub(start.elapsed()) {
+                            std::thread::sleep(wait);
+                        }
+                    }
                 }
-                offset += want as u64;
-                sent += want as u64;
-                self.out_done.store(sent, Ordering::Relaxed);
-                // Paced: never ahead of FILE_RATE.
-                let due = Duration::from_micros(sent * 1_000_000 / FILE_RATE);
-                if let Some(wait) = due.checked_sub(start.elapsed()) {
-                    std::thread::sleep(wait);
-                }
+                self.n.files_sent.fetch_add(1, Ordering::Relaxed);
+                true
             }
         }
-        self.files_sent.fetch_add(1, Ordering::Relaxed);
-        true
     }
 
     // -- receiving (the session's control reader) --
 
     /// Handles clipboard messages; false for anything else.
-    pub fn on_message(&self, m: &Message) -> bool {
+    pub fn on_message(self: &Arc<Self>, m: &Message) -> bool {
         match m {
             Message::Clip(c) => {
                 let mut rx = lock(&self.rx);
                 if let Some(item) = rx.clip.push(c) {
-                    if item.kind == CLIP_FILES {
-                        let id = rx.clip.id();
-                        self.start_inbound(&mut rx, id, &item.data);
-                    } else {
-                        *lock(&self.item_in) = Some(item);
-                    }
+                    let id = rx.clip.id();
+                    self.on_item(&mut rx, id, item);
                 }
                 true
             }
@@ -562,47 +756,138 @@ impl ClipLink {
                 if rx.inbound.as_ref().is_some_and(|i| i.id == *id) {
                     self.drop_inbound(&mut rx);
                 }
+                if let Some(o) = rx.offer.as_mut().filter(|o| o.offer.id == *id) {
+                    o.state = Some(FetchState::Failed);
+                }
+                true
+            }
+            Message::FileRequest(id) => {
+                let ours = lock(&self.offer_out).as_ref().is_some_and(|o| o.id == *id);
+                if ours {
+                    self.push(Job::Deliver(*id));
+                } else {
+                    let mut frame = Vec::with_capacity(8);
+                    encode_file_cancel(*id, &mut frame);
+                    self.write(&frame);
+                }
                 true
             }
             _ => false,
         }
     }
 
+    fn on_item(&self, rx: &mut Rx, id: u32, item: ClipItem) {
+        match item.kind {
+            CLIP_FILES => {
+                let Some(dir) = lock(&self.file_dir).clone() else {
+                    return; // files refused here
+                };
+                let Some(entries) = decode_list(&item.data) else {
+                    return;
+                };
+                let mut files = Vec::new();
+                let base = dir.join(format!("{}-{id}", crate::clock::now_us()));
+                for e in &entries {
+                    let Some(rel) = safe_path(&e.path) else {
+                        return;
+                    };
+                    if rel.components().count() == 1 {
+                        files.push(base.join(rel));
+                    }
+                }
+                let size = entries.iter().filter(|e| !e.dir).map(|e| e.size).sum();
+                self.new_offer(
+                    rx,
+                    Offer {
+                        id,
+                        kind: CLIP_FILES,
+                        size,
+                        files,
+                        entries: entries.clone(),
+                    },
+                    entries,
+                    Some(base),
+                );
+            }
+            CLIP_PNG_OFFER => {
+                let Some(size) = item.data.get(..8).and_then(|b| b.try_into().ok()) else {
+                    return;
+                };
+                let offer = Offer {
+                    id,
+                    kind: CLIP_PNG,
+                    size: u64::from_be_bytes(size),
+                    files: Vec::new(),
+                    entries: Vec::new(),
+                };
+                self.new_offer(rx, offer, Vec::new(), None);
+            }
+            CLIP_PNG => {
+                // The picture a paste here asked for.
+                if let Some(o) = rx.offer.as_mut().filter(|o| {
+                    o.offer.id == id
+                        && o.offer.kind == CLIP_PNG
+                        && o.state == Some(FetchState::Pending)
+                }) {
+                    o.state = Some(FetchState::Done(Fetched::Png(item.data)));
+                    self.n.in_done.store(o.offer.size, Ordering::Relaxed);
+                    self.n.items_received.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            _ => {
+                self.n.items_received.fetch_add(1, Ordering::Relaxed);
+                *lock(&self.text_in) = Some(item);
+            }
+        }
+    }
+
+    fn new_offer(&self, rx: &mut Rx, offer: Offer, entries: Vec<Entry>, base: Option<PathBuf>) {
+        self.drop_inbound(rx);
+        rx.offer = Some(OfferIn {
+            offer: offer.clone(),
+            entries,
+            base,
+            state: None,
+        });
+        *lock(&self.offer_new) = Some(offer);
+    }
+
     fn drop_inbound(&self, rx: &mut Rx) {
         if let Some(i) = rx.inbound.take() {
             drop(i.open);
             let _ = std::fs::remove_dir_all(&i.base);
+            if let Some(o) = rx.offer.as_mut().filter(|o| o.offer.id == i.id) {
+                o.state = Some(FetchState::Failed);
+            }
         }
-        self.in_total.store(0, Ordering::Relaxed);
+        self.n.in_total.store(0, Ordering::Relaxed);
     }
 
-    fn start_inbound(&self, rx: &mut Rx, id: u32, list: &[u8]) {
-        self.drop_inbound(rx);
-        let Some(dir) = lock(&self.file_dir).clone() else {
-            return;
-        };
-        let Some(entries) = decode_list(list) else {
-            return;
-        };
-        let total: u64 = entries.iter().filter(|e| !e.dir).map(|e| e.size).sum();
-        if total > FILES_MAX {
-            return;
+    fn fail(rx: &mut Rx) {
+        if let Some(o) = rx.offer.as_mut() {
+            o.state = Some(FetchState::Failed);
         }
-        // Older copies go; the last one stays (its files may be pasted).
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                if Some(e.path()) != rx.keep {
-                    let _ = std::fs::remove_dir_all(e.path());
+    }
+
+    fn start_inbound(&self, rx: &mut Rx, id: u32, entries: &[Entry], base: Option<PathBuf>) {
+        let Some(base) = base else {
+            return Self::fail(rx);
+        };
+        // Older fetched copies go; the last stays (it may be pasted again).
+        if let Some(dir) = base.parent() {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    if Some(e.path()) != rx.keep {
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
                 }
             }
         }
-        let base = dir.join(format!("{}-{id}", crate::clock::now_us()));
         let mut files = Vec::with_capacity(entries.len());
         let mut tops = Vec::new();
-        for e in &entries {
+        for e in entries {
             let Some(rel) = safe_path(&e.path) else {
-                let _ = std::fs::remove_dir_all(&base);
-                return;
+                return Self::fail(rx);
             };
             let at = base.join(&rel);
             if rel.components().count() == 1 {
@@ -617,12 +902,13 @@ impl ClipLink {
             };
             if made.is_err() {
                 let _ = std::fs::remove_dir_all(&base);
-                return;
+                return Self::fail(rx);
             }
             files.push((at, if e.dir { 0 } else { e.size }));
         }
-        self.in_done.store(0, Ordering::Relaxed);
-        self.in_total.store(total, Ordering::Relaxed);
+        let total = files.iter().map(|f| f.1).sum();
+        self.n.in_done.store(0, Ordering::Relaxed);
+        self.n.in_total.store(total, Ordering::Relaxed);
         rx.inbound = Some(Inbound {
             id,
             base,
@@ -639,7 +925,7 @@ impl ClipLink {
     /// dropped).
     fn file_data(&self, rx: &mut Rx, d: &FileData) -> bool {
         let Some(i) = rx.inbound.as_mut() else {
-            return true; // not receiving (refused, or already dropped)
+            return true; // not receiving
         };
         if d.id != i.id {
             return true; // a stale transfer's tail
@@ -664,13 +950,14 @@ impl ClipLink {
             return false;
         }
         i.written += d.data.len() as u64;
-        self.in_done
+        self.n
+            .in_done
             .fetch_add(d.data.len() as u64, Ordering::Relaxed);
         self.finish_if_done(rx);
         true
     }
 
-    /// Moves past finished files; when all are there, hands them over.
+    /// Moves past finished files; when all are there, the fetch is done.
     fn finish_if_done(&self, rx: &mut Rx) {
         let Some(i) = rx.inbound.as_mut() else { return };
         while i.next < i.files.len() && i.written >= i.files[i.next].1 {
@@ -681,8 +968,10 @@ impl ClipLink {
         if i.next == i.files.len() {
             if let Some(i) = rx.inbound.take() {
                 rx.keep = Some(i.base);
-                self.files_received.fetch_add(1, Ordering::Relaxed);
-                *lock(&self.files_in) = Some(i.tops);
+                self.n.files_received.fetch_add(1, Ordering::Relaxed);
+                if let Some(o) = rx.offer.as_mut().filter(|o| o.offer.id == i.id) {
+                    o.state = Some(FetchState::Done(Fetched::Files(i.tops)));
+                }
             }
         }
     }
@@ -781,10 +1070,13 @@ mod tests {
         let mut wire = Vec::new();
         assert!(d.encode(&mut wire));
         encode_file_cancel(5, &mut wire);
+        encode_file_request(6, &mut wire);
         let (m, n) = Message::decode(&wire).unwrap();
         assert_eq!(m, Message::FileData(d));
-        let (m, _) = Message::decode(&wire[n..]).unwrap();
+        let (m, n2) = Message::decode(&wire[n..]).unwrap();
         assert_eq!(m, Message::FileCancel(5));
+        let (m, _) = Message::decode(&wire[n + n2..]).unwrap();
+        assert_eq!(m, Message::FileRequest(6));
     }
 
     #[test]
@@ -818,10 +1110,16 @@ mod tests {
         assert_eq!(decode_list(&[1, 0, 0, 0, 1]), None); // truncated
     }
 
-    /// A folder and a loose file go across and land as the same tree; a
-    /// broken transfer afterwards is dropped and the good copy stays.
+    fn feed(rx: &Arc<ClipLink>, id: u32, item: &ClipItem) {
+        for c in chunks(id, item) {
+            assert!(rx.on_message(&Message::Clip(c)));
+        }
+    }
+
+    /// Files are only offered; a paste fetches them, and they land as the
+    /// same tree. A broken transfer afterwards fails and leaves nothing.
     #[test]
-    fn files_arrive_whole() {
+    fn files_are_fetched_on_paste_and_arrive_whole() {
         let tmp = std::env::temp_dir().join(format!("glass-clip-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let src = tmp.join("src");
@@ -832,21 +1130,26 @@ mod tests {
         std::fs::write(src.join("Folder/Inner/big.bin"), &big).unwrap();
         std::fs::write(src.join("Folder/empty.txt"), b"").unwrap();
         std::fs::write(src.join("note.txt"), b"hello").unwrap();
-
         let (entries, sources) = collect(&[src.join("Folder"), src.join("note.txt")]).unwrap();
         assert_eq!(entries.len(), 5);
 
-        // Play the sender by hand: the list, then each file's pieces.
-        let rx = ClipLink::default();
+        let rx = Arc::new(ClipLink::new(None));
         rx.set_file_dir(Some(tmp.join("in")));
         let list = ClipItem {
             kind: CLIP_FILES,
             data: encode_list(&entries),
         };
-        for c in chunks(9, &list) {
-            assert!(rx.on_message(&Message::Clip(c)));
-        }
-        assert!(rx.take_files().is_none());
+        feed(&rx, 9, &list);
+        // An offer: nothing written yet.
+        let offer = rx.take_offer().expect("offer");
+        assert_eq!(
+            (offer.id, offer.kind, offer.files.len()),
+            (9, CLIP_FILES, 2)
+        );
+        assert_eq!(offer.size, big.len() as u64 + 5);
+        assert!(!tmp.join("in").exists());
+        // Pasted: the request goes, then the sender's pieces arrive.
+        assert_eq!(rx.fetch(9), FetchState::Pending);
         for (index, (e, s)) in entries.iter().zip(&sources).enumerate() {
             if e.dir {
                 continue;
@@ -861,8 +1164,10 @@ mod tests {
                 }));
             }
         }
-        let tops = rx.take_files().expect("complete");
-        assert_eq!(tops.len(), 2);
+        let FetchState::Done(Fetched::Files(tops)) = rx.fetch(9) else {
+            panic!("not fetched")
+        };
+        assert_eq!(tops, offer.files);
         let folder = tops.iter().find(|p| p.ends_with("Folder")).unwrap();
         assert_eq!(std::fs::read(folder.join("Inner/big.bin")).unwrap(), big);
         assert_eq!(std::fs::read(folder.join("empty.txt")).unwrap(), b"");
@@ -871,7 +1176,7 @@ mod tests {
         let p = rx.progress();
         assert_eq!((p.in_done, p.files_received), (p.in_total, 1));
 
-        // A piece out of order drops a transfer and its folder.
+        // A piece out of order fails the next fetch and removes its folder.
         let one = vec![Entry {
             path: "x.bin".into(),
             dir: false,
@@ -881,18 +1186,53 @@ mod tests {
             kind: CLIP_FILES,
             data: encode_list(&one),
         };
-        for c in chunks(10, &list) {
-            rx.on_message(&Message::Clip(c));
-        }
+        feed(&rx, 10, &list);
+        assert_eq!(rx.fetch(10), FetchState::Pending);
         rx.on_message(&Message::FileData(FileData {
             id: 10,
             index: 0,
             offset: 4,
             data: b"late",
         }));
-        assert!(rx.take_files().is_none());
+        assert_eq!(rx.fetch(10), FetchState::Failed);
         // Only the completed copy's folder is left.
         assert_eq!(std::fs::read_dir(tmp.join("in")).unwrap().count(), 1);
+        // An old offer can't be fetched any more.
+        assert_eq!(rx.fetch(9), FetchState::Failed);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn pictures_are_fetched_on_paste() {
+        let rx = Arc::new(ClipLink::new(None));
+        let png = vec![7u8; CLIP_CHUNK + 5];
+        let offer = ClipItem {
+            kind: CLIP_PNG_OFFER,
+            data: (png.len() as u64).to_be_bytes().to_vec(),
+        };
+        feed(&rx, 3, &offer);
+        let o = rx.take_offer().unwrap();
+        assert_eq!((o.kind, o.size), (CLIP_PNG, png.len() as u64));
+        // Not asked for yet: a picture arriving now isn't taken as the paste.
+        assert_eq!(rx.fetch(3), FetchState::Pending);
+        feed(
+            &rx,
+            3,
+            &ClipItem {
+                kind: CLIP_PNG,
+                data: png.clone(),
+            },
+        );
+        assert_eq!(rx.fetch(3), FetchState::Done(Fetched::Png(png)));
+        // Text still comes straight away.
+        feed(
+            &rx,
+            4,
+            &ClipItem {
+                kind: CLIP_TEXT,
+                data: b"hi".to_vec(),
+            },
+        );
+        assert_eq!(rx.take_item().unwrap().data, b"hi");
     }
 }

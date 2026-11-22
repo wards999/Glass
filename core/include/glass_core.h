@@ -23,24 +23,24 @@
 #define GLASS_CLIP_TEXT 1
 
 /**
- * A PNG image.
+ * A PNG image (sent when the offer of it is pasted).
  */
 #define GLASS_CLIP_PNG 2
 
 /**
- * A file list (the start of a file transfer).
+ * A file list: an offer of files.
  */
 #define GLASS_CLIP_FILES 3
 
 /**
- * The largest item that's sent (16 MB).
+ * An offer of a picture: its PNG size (`u64`).
  */
-#define GLASS_CLIP_MAX (16 << 20)
+#define GLASS_CLIP_PNG_OFFER 4
 
 /**
- * The largest copy of files that's sent (200 MB in all).
+ * The largest item that's sent (16 MB; a picture's PNG).
  */
-#define GLASS_FILES_MAX (200 << 20)
+#define GLASS_CLIP_MAX (16 << 20)
 
 /**
  * At most this many files and folders in one copy.
@@ -430,9 +430,10 @@ typedef int32_t GLASS_ConnectError;
 typedef struct GLASS_Client GLASS_Client;
 
 /**
- * A clipboard item that arrived from the other side (opaque): read it with
- * `glass_clip_kind` / `glass_clip_data` / `glass_clip_len`, then
- * `glass_clip_free`.
+ * Clipboard data from the other side (opaque): text, an offer, or what a
+ * fetch got. Read it with `glass_clip_kind` / `_data` / `_len` / `_id` /
+ * `_size`, then `glass_clip_free`. Files: `data` is their paths,
+ * NUL-separated.
  */
 typedef struct GLASS_ClipHandle GLASS_ClipHandle;
 
@@ -792,11 +793,22 @@ typedef struct {
   uint64_t out_done;
   uint64_t out_total;
   /**
-   * Copies of files not sent (too big, too many files or unreadable).
+   * Text sent and received, pictures pasted either way.
    */
-  uint32_t not_sent;
+  uint32_t items_sent;
+  uint32_t items_received;
+  /**
+   * Copies of files offered, and pasted either way.
+   */
+  uint32_t files_offered;
   uint32_t files_sent;
   uint32_t files_received;
+  /**
+   * Copies of files not offered, and why the last one wasn't
+   * (`NotSent`: 1 too many files, 2 unreadable).
+   */
+  uint32_t not_sent;
+  uint8_t not_sent_why;
 } GLASS_ClipProgress;
 
 /**
@@ -1368,8 +1380,9 @@ GLASS_HostCounters glass_session_counters(const GLASS_HostSession *s);
 void glass_session_close(GLASS_HostSession *s);
 
 /**
- * Sends a clipboard item (`CLIP_TEXT` UTF-8 or `CLIP_PNG`) to the host in
- * the background. The bytes are copied. False if empty or too big.
+ * This Mac copied text (`CLIP_TEXT`, sent now) or a picture (`CLIP_PNG`,
+ * offered: sent only if pasted). The bytes are copied. False if empty or
+ * too big.
  *
  * # Safety
  * `c` from `glass_client_connect`; `data` points to `len` bytes.
@@ -1380,36 +1393,8 @@ bool glass_client_send_clipboard(const GLASS_Client *c,
                                  size_t len);
 
 /**
- * The latest clipboard item from the host, once; null if none.
- *
- * # Safety
- * `c` from `glass_client_connect`.
- */
-GLASS_ClipHandle *glass_client_take_clipboard(const GLASS_Client *c);
-
-/**
- * Sends a clipboard item to the viewer in the background (see
- * `glass_client_send_clipboard`).
- *
- * # Safety
- * `s` from `glass_host_accept`; `data` points to `len` bytes.
- */
-bool glass_session_send_clipboard(const GLASS_HostSession *s,
-                                  uint8_t kind,
-                                  const uint8_t *data,
-                                  size_t len);
-
-/**
- * The latest clipboard item from the viewer, once; null if none.
- *
- * # Safety
- * `s` from `glass_host_accept`.
- */
-GLASS_ClipHandle *glass_session_take_clipboard(const GLASS_HostSession *s);
-
-/**
- * Sends copies of files and folders to the host in the background, paced
- * (`paths`: NUL-separated UTF-8). A newer copy replaces them.
+ * This Mac copied files and folders (`paths`: NUL-separated UTF-8):
+ * offered, sent only if pasted.
  *
  * # Safety
  * `c` from `glass_client_connect`; `paths` points to `len` bytes.
@@ -1417,14 +1402,31 @@ GLASS_ClipHandle *glass_session_take_clipboard(const GLASS_HostSession *s);
 void glass_client_send_files(const GLASS_Client *c, const uint8_t *paths, size_t len);
 
 /**
- * Files from the host once they've all arrived, once; null if none. A
- * `GLASS_CLIP_FILES` handle whose data is the top-level paths,
- * NUL-separated.
+ * Text from the host, once; null if none.
  *
  * # Safety
  * `c` from `glass_client_connect`.
  */
-GLASS_ClipHandle *glass_client_take_files(const GLASS_Client *c);
+GLASS_ClipHandle *glass_client_take_clipboard(const GLASS_Client *c);
+
+/**
+ * A new offer from the host, once; null if none. `kind` `CLIP_PNG` or
+ * `CLIP_FILES` (data: where the top-level files will be), `id` for
+ * `glass_client_fetch`, `size` in bytes.
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+GLASS_ClipHandle *glass_client_take_offer(const GLASS_Client *c);
+
+/**
+ * Something was pasted: fetches offer `id`. `state`: 0 still coming (call
+ * again), 1 done (the handle has the picture or the file paths), 2 failed.
+ *
+ * # Safety
+ * `c` from `glass_client_connect`; `state` writable or null.
+ */
+GLASS_ClipHandle *glass_client_fetch(const GLASS_Client *c, uint32_t id, uint8_t *state);
 
 /**
  * Accept files from the host into `dir` (null or empty: refuse them).
@@ -1441,8 +1443,18 @@ void glass_client_set_file_dir(const GLASS_Client *c, const char *dir);
 GLASS_ClipProgress glass_client_clip_progress(const GLASS_Client *c);
 
 /**
- * Sends copies of files and folders to the viewer (see
- * `glass_client_send_files`).
+ * See `glass_client_send_clipboard`.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`; `data` points to `len` bytes.
+ */
+bool glass_session_send_clipboard(const GLASS_HostSession *s,
+                                  uint8_t kind,
+                                  const uint8_t *data,
+                                  size_t len);
+
+/**
+ * See `glass_client_send_files`.
  *
  * # Safety
  * `s` from `glass_host_accept`; `paths` points to `len` bytes.
@@ -1450,12 +1462,28 @@ GLASS_ClipProgress glass_client_clip_progress(const GLASS_Client *c);
 void glass_session_send_files(const GLASS_HostSession *s, const uint8_t *paths, size_t len);
 
 /**
- * Files from the viewer once they've all arrived, once; null if none.
+ * Text from the viewer, once; null if none.
  *
  * # Safety
  * `s` from `glass_host_accept`.
  */
-GLASS_ClipHandle *glass_session_take_files(const GLASS_HostSession *s);
+GLASS_ClipHandle *glass_session_take_clipboard(const GLASS_HostSession *s);
+
+/**
+ * See `glass_client_take_offer`.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+GLASS_ClipHandle *glass_session_take_offer(const GLASS_HostSession *s);
+
+/**
+ * See `glass_client_fetch`.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`; `state` writable or null.
+ */
+GLASS_ClipHandle *glass_session_fetch(const GLASS_HostSession *s, uint32_t id, uint8_t *state);
 
 /**
  * Accept files from the viewer into `dir` (null or empty: refuse them).
@@ -1473,27 +1501,43 @@ GLASS_ClipProgress glass_session_clip_progress(const GLASS_HostSession *s);
 
 /**
  * # Safety
- * `h` from a `_take_clipboard` call, not freed.
+ * `h` from a clipboard call, not freed.
  */
 uint8_t glass_clip_kind(const GLASS_ClipHandle *h);
 
 /**
  * # Safety
- * `h` from a `_take_clipboard` call, not freed.
+ * `h` from a clipboard call, not freed.
  */
 size_t glass_clip_len(const GLASS_ClipHandle *h);
 
 /**
- * The item's bytes; valid until `glass_clip_free`.
+ * The bytes; valid until `glass_clip_free`.
  *
  * # Safety
- * `h` from a `_take_clipboard` call, not freed.
+ * `h` from a clipboard call, not freed.
  */
 const uint8_t *glass_clip_data(const GLASS_ClipHandle *h);
 
 /**
+ * An offer's id (for `_fetch`).
+ *
  * # Safety
- * `h` from a `_take_clipboard` call (or null), not used afterwards.
+ * `h` from a clipboard call, not freed.
+ */
+uint32_t glass_clip_id(const GLASS_ClipHandle *h);
+
+/**
+ * An offer's size in bytes.
+ *
+ * # Safety
+ * `h` from a clipboard call, not freed.
+ */
+uint64_t glass_clip_size(const GLASS_ClipHandle *h);
+
+/**
+ * # Safety
+ * `h` from a clipboard call (or null), not used afterwards.
  */
 void glass_clip_free(GLASS_ClipHandle *h);
 

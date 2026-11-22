@@ -22,6 +22,7 @@ mod mdns;
 mod present;
 pub mod service;
 mod stats_box;
+mod vfiles;
 pub mod viewer;
 
 use glass_core::clock;
@@ -832,13 +833,14 @@ fn run_session(
     let mut pointer = cursor::CursorWatch::new();
     let mut watch = blocker::BlockerWatch::new();
     let mut blocked_since = None;
-    // The clipboard, both ways (M5c): the helper thread reads and writes
-    // it; this loop only swaps items with the session.
-    let clip = a.clipboard.then(|| clip::ClipSync::start(false));
+    // The clipboard, both ways (M5c): a thread of its own, talking to the
+    // session's clipboard link; nothing of it runs in this loop.
     if a.clipboard {
         session.set_file_dir(Some(clip::file_dir(a.desktops, "host")));
     }
-    let (mut clips_in, mut clips_out) = (0u32, 0u32);
+    let _clip = a
+        .clipboard
+        .then(|| clip::ClipSync::start(session.clip_link(), false));
     let t0 = clock::now_us();
     let mut pending_idr = true;
     if let Some(frame) = first.take().filter(|f| f.size == (w, h)) {
@@ -909,23 +911,6 @@ fn run_session(
             }
             if b != blocker::Blocker::None {
                 blocked_since = Some(now);
-            }
-        }
-        if let Some(c) = &clip {
-            if let Some(item) = session.take_clipboard() {
-                clips_in += 1;
-                c.put_incoming(item);
-            }
-            if let Some(files) = session.take_files() {
-                c.put_incoming(clip::files_item(&files));
-            }
-            if let Some(item) = c.take_outgoing() {
-                if item.kind == glass_core::clipboard::CLIP_FILES {
-                    session.send_files(clip::item_files(&item));
-                } else {
-                    clips_out += 1;
-                    session.send_clipboard(item);
-                }
             }
         }
         match pointer.poll() {
@@ -1010,11 +995,7 @@ fn run_session(
         r,
         "  clipboard: {}",
         if a.clipboard {
-            let p = session.clip_progress();
-            format!(
-                "{clips_out} items sent to the viewer, {clips_in} received | files: {} copies sent, {} received, {} not sent (over 200 MB, too many or unreadable)",
-                p.files_sent, p.files_received, p.not_sent
-            )
+            clip::summary(&session.clip_progress(), "viewer")
         } else {
             "off".to_string()
         }

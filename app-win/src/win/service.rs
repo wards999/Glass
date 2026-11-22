@@ -837,8 +837,9 @@ pub fn command(args: &[String]) -> Res<()> {
     if let Err(e) = &r {
         println!("error: {e}");
     }
-    if pause {
-        // Started from the Glass window: keep the result on screen.
+    if pause && r.is_err() {
+        // Started from the Glass window: keep an error on screen. It closes
+        // by itself when all went well (the window shows the new state).
         println!("\nPress Enter to close.");
         let mut s = String::new();
         let _ = std::io::stdin().read_line(&mut s);

@@ -192,7 +192,8 @@ impl ControlReader {
                         Message::Cursor(_)
                         | Message::Clip(_)
                         | Message::FileData(_)
-                        | Message::FileCancel(_) => None,
+                        | Message::FileCancel(_)
+                        | Message::FileRequest(_) => None,
                     };
                     self.buf.copy_within(n..self.len, 0);
                     self.len -= n;
@@ -537,7 +538,7 @@ impl HostListener {
             input: Mutex::new(InputCounters::default()),
             rejected: AtomicU64::new(0),
             mode_req: AtomicU32::new(0),
-            clip: Arc::default(),
+            clip: Arc::new(crate::clipboard::ClipLink::new(Some(ch.writer.clone()))),
         });
         let mut threads = Vec::new();
 
@@ -589,7 +590,10 @@ impl HostListener {
                             let v = 1 << 16 | (allow_444 as u32) << 8 | mode as u32;
                             sh.mode_req.store(v, Ordering::Relaxed);
                         }
-                        Message::Clip(_) | Message::FileData(_) | Message::FileCancel(_) => {
+                        Message::Clip(_)
+                        | Message::FileData(_)
+                        | Message::FileCancel(_)
+                        | Message::FileRequest(_) => {
                             sh.clip.on_message(&m);
                         }
                         Message::Control(Control::Bye) => {
@@ -828,27 +832,35 @@ impl HostSession {
         send_control(&self.out, Control::CursorVisible { visible })
     }
 
-    /// Sends a clipboard item in the background (chunks interleave with the
-    /// rest of the control traffic; a newer copy replaces it). M5c.
+    /// Sends text now, or offers a picture (`CLIP_PNG`); a newer copy
+    /// replaces what's still waiting. M5c.
     pub fn send_clipboard(&self, item: crate::clipboard::ClipItem) {
-        self.shared.clip.send_item(&self.out, item);
+        self.shared.clip.send_item(item);
     }
 
-    /// Sends copies of these files and folders in the background, paced
-    /// (a newer copy replaces them). M5c.
+    /// Offers copies of these files and folders (sent if pasted). M5c.
     pub fn send_files(&self, paths: Vec<std::path::PathBuf>) {
-        self.shared.clip.send_files(&self.out, paths);
+        self.shared.clip.send_files(paths);
     }
 
-    /// The latest clipboard item from the other side, once.
+    /// Text from the other side, once.
     pub fn take_clipboard(&self) -> Option<crate::clipboard::ClipItem> {
         self.shared.clip.take_item()
     }
 
-    /// Files from the other side once they've all arrived (the top-level
-    /// files and folders, for the clipboard), once.
-    pub fn take_files(&self) -> Option<Vec<std::path::PathBuf>> {
-        self.shared.clip.take_files()
+    /// A new offer (a picture or files) from the other side, once.
+    pub fn take_offer(&self) -> Option<crate::clipboard::Offer> {
+        self.shared.clip.take_offer()
+    }
+
+    /// Pasted: fetches offer `id` (call until it isn't `Pending`).
+    pub fn fetch(&self, id: u32) -> crate::clipboard::FetchState {
+        self.shared.clip.fetch(id)
+    }
+
+    /// The clipboard link itself, for a clipboard thread of the app's own.
+    pub fn clip_link(&self) -> Arc<crate::clipboard::ClipLink> {
+        self.shared.clip.clone()
     }
 
     /// Accept files from the other side into `dir` (`None`, the default:
@@ -1408,7 +1420,7 @@ impl Client {
             stop: AtomicBool::new(false),
             connected: AtomicBool::new(true),
             host_bye: AtomicBool::new(false),
-            clip: Arc::default(),
+            clip: Arc::new(crate::clipboard::ClipLink::new(Some(ch.writer.clone()))),
             want_keyframe: AtomicBool::new(false),
             keyframe_requests: AtomicU32::new(0),
             queue_full: AtomicU64::new(0),
@@ -1462,27 +1474,35 @@ impl Client {
         self.host_os
     }
 
-    /// Sends a clipboard item in the background (chunks interleave with the
-    /// rest of the control traffic; a newer copy replaces it). M5c.
+    /// Sends text now, or offers a picture (`CLIP_PNG`); a newer copy
+    /// replaces what's still waiting. M5c.
     pub fn send_clipboard(&self, item: crate::clipboard::ClipItem) {
-        self.shared.clip.send_item(&self.ctl, item);
+        self.shared.clip.send_item(item);
     }
 
-    /// Sends copies of these files and folders in the background, paced
-    /// (a newer copy replaces them). M5c.
+    /// Offers copies of these files and folders (sent if pasted). M5c.
     pub fn send_files(&self, paths: Vec<std::path::PathBuf>) {
-        self.shared.clip.send_files(&self.ctl, paths);
+        self.shared.clip.send_files(paths);
     }
 
-    /// The latest clipboard item from the other side, once.
+    /// Text from the other side, once.
     pub fn take_clipboard(&self) -> Option<crate::clipboard::ClipItem> {
         self.shared.clip.take_item()
     }
 
-    /// Files from the other side once they've all arrived (the top-level
-    /// files and folders, for the clipboard), once.
-    pub fn take_files(&self) -> Option<Vec<std::path::PathBuf>> {
-        self.shared.clip.take_files()
+    /// A new offer (a picture or files) from the other side, once.
+    pub fn take_offer(&self) -> Option<crate::clipboard::Offer> {
+        self.shared.clip.take_offer()
+    }
+
+    /// Pasted: fetches offer `id` (call until it isn't `Pending`).
+    pub fn fetch(&self, id: u32) -> crate::clipboard::FetchState {
+        self.shared.clip.fetch(id)
+    }
+
+    /// The clipboard link itself, for a clipboard thread of the app's own.
+    pub fn clip_link(&self) -> Arc<crate::clipboard::ClipLink> {
+        self.shared.clip.clone()
     }
 
     /// Accept files from the other side into `dir` (`None`, the default:
@@ -1747,7 +1767,10 @@ fn spawn_control(
             }
             let r = reader.read(&mut tls_in, |m| {
                 match m {
-                    Message::Clip(_) | Message::FileData(_) | Message::FileCancel(_) => {
+                    Message::Clip(_)
+                    | Message::FileData(_)
+                    | Message::FileCancel(_)
+                    | Message::FileRequest(_) => {
                         sh.clip.on_message(&m);
                     }
                     Message::Control(Control::Pong {

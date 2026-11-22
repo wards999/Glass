@@ -212,6 +212,34 @@ fn save_mode(file: &std::path::Path, addr: &str, mode: u8) {
     let _ = std::fs::write(file, lines.join("\n") + "\n");
 }
 
+/// `glass-cli debug-keys ADDR[:PORT]`: connects without a window and sends a
+/// few harmless F15 presses and pointer moves, to check a host's input path
+/// (the device must already be paired). For local checks only.
+pub fn debug_keys(args: &[String]) -> Res<()> {
+    let target = args
+        .first()
+        .ok_or("usage: glass-cli debug-keys ADDR[:PORT]")?;
+    let (host, port) = match target.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse()?),
+        _ => (target.clone(), DEFAULT_PORT),
+    };
+    let device = crate::device()?;
+    let prep = viewer::prepare(glass_core::protocol::MODE_FIT, false)?;
+    let c = Client::connect_with(&device, &host, port, prep.hello)?;
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    for i in 0..5u16 {
+        c.input_move(30000 + i * 100, 30000);
+        c.input_key(0x6A, true); // F15
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        c.input_key(0x6A, false);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    println!("sent 5 F15 presses");
+    drop(c);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_address, save_mode, saved_mode};
@@ -241,32 +269,4 @@ mod tests {
         );
         assert!(parse_address("host:notaport").is_err());
     }
-}
-
-/// `glass-cli debug-keys ADDR[:PORT]`: connects without a window and sends a
-/// few harmless F15 presses and pointer moves, to check a host's input path
-/// (the device must already be paired). For local checks only.
-pub fn debug_keys(args: &[String]) -> Res<()> {
-    let target = args
-        .first()
-        .ok_or("usage: glass-cli debug-keys ADDR[:PORT]")?;
-    let (host, port) = match target.rsplit_once(':') {
-        Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse()?),
-        _ => (target.clone(), DEFAULT_PORT),
-    };
-    let device = crate::device()?;
-    let prep = viewer::prepare(glass_core::protocol::MODE_FIT, false)?;
-    let c = Client::connect_with(&device, &host, port, prep.hello)?;
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    for i in 0..5u16 {
-        c.input_move(30000 + i * 100, 30000);
-        c.input_key(0x6A, true); // F15
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        c.input_key(0x6A, false);
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    println!("sent 5 F15 presses");
-    drop(c);
-    Ok(())
 }

@@ -99,6 +99,14 @@ pub fn watch_end(end: std::sync::Arc<AtomicBool>) {
             let _ = std::fs::remove_file(&f);
             end.store(true, Ordering::Relaxed);
         }
+        if sharing_off() {
+            // Switched off: end any session properly (the viewer is told,
+            // so it doesn't reconnect), then stop.
+            end.store(true, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            let _ = std::fs::remove_file(status_path());
+            std::process::exit(0);
+        }
         std::thread::sleep(std::time::Duration::from_millis(300));
     });
 }
@@ -271,6 +279,9 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         // Switched off in the window: no agent until it's switched on.
         if sharing_off() {
             if let Some(a) = agent.take() {
+                // The agent ends the session and stops by itself; wait a
+                // moment before making sure.
+                let _ = WaitForSingleObject(a.process, 3000);
                 a.kill();
                 let _ = std::fs::remove_file(status_path());
                 log("sharing switched off");

@@ -1265,13 +1265,15 @@ impl GlassApp {
 
     /// Ends the session this window is in: the one being viewed here, or the
     /// one viewing this PC (sharing stays on).
+    /// The session bar's button. Viewing: Disconnect (leave). Being
+    /// viewed: Stop sharing, the same as switching Allow connections off
+    /// (one idea per side; reconnecting a paired device right after an
+    /// "end only this visit" made the difference meaningless).
     fn end_session(&mut self) {
         if self.viewing.is_some() {
             disconnect_viewer();
-        } else if self.viewer_on {
-            self.end_session.store(true, Ordering::Relaxed);
-        } else if self.svc_status.as_ref().is_some_and(|s| s.connected) {
-            super::service::request_end();
+        } else if self.sharing.is_some() || self.svc == super::service::State::Running {
+            self.toggle_share();
         }
     }
 
@@ -1291,13 +1293,13 @@ impl GlassApp {
                     "\u{201C}{}\u{201D} is viewing this PC",
                     who(&self.share_status)
                 ),
-                "End session",
+                "Stop sharing",
             ))
         } else {
             let s = self.svc_status.as_ref().filter(|s| s.connected)?;
             Some((
                 format!("\u{201C}{}\u{201D} is viewing this PC", who(&s.line)),
-                "End session",
+                "Stop sharing",
             ))
         }
     }
@@ -1373,7 +1375,7 @@ impl GlassApp {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     ui.label(
-                        RichText::new("Share this PC")
+                        RichText::new("Allow connections")
                             .font(semibold(16.0))
                             .color(p.strong),
                     );
@@ -1405,16 +1407,20 @@ impl GlassApp {
                             line.to_string()
                         }
                     };
-                    let text = if svc_on {
-                        let line = self
-                            .svc_status
-                            .as_ref()
-                            .map_or("starting \u{2026}".to_string(), |s| short(&s.line));
-                        format!("Always on \u{00B7} {line}")
-                    } else if on || !self.share_status.is_empty() {
+                    // Whether others may connect (the door), not who is
+                    // connected: that's the session bar at the top. Only
+                    // warnings about sharing show here.
+                    let warning = ["Input blocked", "Wrong code", "Too many", "Refused", "Did not allow", "Sharing stopped"]
+                        .iter()
+                        .any(|w| self.share_status.starts_with(w));
+                    let text = if warning {
                         short(&self.share_status)
+                    } else if svc_on {
+                        "Open at all times, even when locked".to_string()
+                    } else if on {
+                        "Open to your paired devices".to_string()
                     } else {
-                        "Off \u{00B7} other devices can\u{2019}t connect".to_string()
+                        "Closed \u{00B7} nobody can connect".to_string()
                     };
                     ui.add(egui::Label::new(RichText::new(text).size(13.0).color(p.weak)).truncate());
                 });
@@ -1423,7 +1429,7 @@ impl GlassApp {
                 if svc_installed {
                     // The switch turns the service's sharing on and off.
                     if toggle(ui, svc_on, p)
-                        .on_hover_text("The Glass service: on, it shares this PC at all times, including the lock screen and UAC prompts; off, nobody can connect (it stays off after a restart).")
+                        .on_hover_text("Open: your paired devices can connect at any time, including the lock screen and UAC prompts (the Glass service). Closed: nobody can (it stays closed after a restart).")
                         .clicked()
                     {
                         self.toggle_share();
@@ -1620,7 +1626,11 @@ impl eframe::App for GlassApp {
 
                 // Devices.
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("DEVICES").font(semibold(12.0)).color(p.weak));
+                    ui.label(
+                        RichText::new("CONNECT TO")
+                            .font(semibold(12.0))
+                            .color(p.weak),
+                    );
                     if !self.machines.is_empty() {
                         ui.label(
                             RichText::new(self.machines.len().to_string())

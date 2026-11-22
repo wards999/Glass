@@ -94,7 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         pairedMenu.delegate = self
         submenu("Connection", [
             item("Connect…", #selector(showConnectAction), "n", target: self),
-            item("Share This Mac…", #selector(shareThisMac), "", target: self),
+            item("Allow Connections", #selector(shareThisMac), "", target: self),
             paired,
             item("Open Recording…", #selector(openRecording), "o", target: self),
             item("Disconnect", #selector(NSWindow.performClose(_:)), "w", chord),
@@ -126,7 +126,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let h = HostController()
         h.onStatus = { [weak self] s in
             guard let self else { return }
-            self.shareNote?.stringValue = s
+            self.shareNote?.stringValue = s.hasPrefix("Pairing") || s.hasPrefix("Couldn")
+                ? s : "Open to your paired devices"
             self.hostStatus = s
             let viewed = s.hasPrefix("Connected")
             if viewed != self.beingViewed {
@@ -155,7 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         shareSwitch?.state = .off
         shareIcon?.contentTintColor = .secondaryLabelColor
         shareTile?.fill = Look.track
-        shareNote?.stringValue = "Off \u{00B7} other devices can\u{2019}t connect"
+        shareNote?.stringValue = "Closed \u{00B7} nobody can connect"
     }
 
     // MARK: paired devices
@@ -436,7 +437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             // "Connected to “NAME”" -> NAME
             let name = hostStatus.split(separator: "\u{201C}").dropFirst().first?
                 .split(separator: "\u{201D}").first.map(String.init) ?? "A device"
-            return ("\u{201C}\(name)\u{201D} is viewing this Mac", "End Session")
+            return ("\u{201C}\(name)\u{201D} is viewing this Mac", "Stop Sharing")
         }
         return nil
     }
@@ -509,8 +510,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func endSession() {
         if let v = viewer {
             v.stop("ended from the Glass window")
-        } else if beingViewed {
-            hostController?.endSession()
+        } else if hostController != nil {
+            stopSharing()
         }
     }
 
@@ -589,7 +590,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         sTexts.orientation = .vertical
         sTexts.alignment = .leading
         sTexts.spacing = 1
-        let sButton = NSButton(title: "End Session", target: self, action: #selector(endSessionTapped))
+        let sButton = NSButton(title: "Stop Sharing", target: self, action: #selector(endSessionTapped))
         sButton.bezelColor = .systemRed
         sButton.controlSize = .large
         let sRow = NSStackView(views: [dot, sTexts, NSView(), sButton])
@@ -606,7 +607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         header.alignment = .centerY
 
         // Devices.
-        let devices = NSTextField(labelWithString: "DEVICES")
+        let devices = NSTextField(labelWithString: "CONNECT TO")
         devices.font = .systemFont(ofSize: 11, weight: .semibold)
         devices.textColor = .secondaryLabelColor
         let count = NSTextField(labelWithString: "")
@@ -672,9 +673,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         shareIcon.contentTintColor = .secondaryLabelColor
         center(shareIcon, in: shareTile, size: 44)
         self.shareIcon = shareIcon
-        let shareTitle = NSTextField(labelWithString: "Share this Mac")
+        let shareTitle = NSTextField(labelWithString: "Allow Connections")
         shareTitle.font = .systemFont(ofSize: 15, weight: .semibold)
-        let shareNote = NSTextField(labelWithString: "Off \u{00B7} other devices can\u{2019}t connect")
+        let shareNote = NSTextField(labelWithString: "Closed \u{00B7} nobody can connect")
         shareNote.font = .systemFont(ofSize: 12)
         shareNote.textColor = .secondaryLabelColor
         shareNote.lineBreakMode = .byTruncatingTail

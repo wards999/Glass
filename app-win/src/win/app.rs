@@ -168,6 +168,8 @@ struct GlassApp {
     /// The Glass service (unattended access, M3f) and its agent's status.
     svc: super::service::State,
     svc_status: Option<super::service::Status>,
+    /// The service's sharing is switched off (Share switch).
+    svc_off: bool,
     /// This window runs in a Remote Desktop session.
     remote: bool,
     notice: Option<(String, Instant)>,
@@ -249,6 +251,7 @@ pub fn run(share: bool) -> Res<()> {
                 viewer_on: false,
                 svc: super::service::state(),
                 svc_status: super::service::Status::read(),
+                svc_off: super::service::sharing_off(),
                 remote: super::service::in_remote_session(),
                 notice: None,
                 sharing: None,
@@ -626,8 +629,21 @@ impl GlassApp {
     }
 
     fn toggle_share(&mut self) {
-        if self.svc == super::service::State::Running && self.sharing.is_none() {
-            return; // the Glass service already shares this PC
+        if self.svc != super::service::State::NotInstalled && self.sharing.is_none() {
+            // With the service installed, the switch turns the service's
+            // sharing on and off instead (no admin prompt; kept across
+            // restarts). A fully stopped service needs starting (admin).
+            let on = self.svc == super::service::State::Running && !self.svc_off;
+            if on {
+                super::service::set_sharing(false);
+                self.svc_off = true;
+            } else if self.svc == super::service::State::Running {
+                super::service::set_sharing(true);
+                self.svc_off = false;
+            } else {
+                super::service::run_elevated("on");
+            }
+            return;
         }
         if let Some(stop) = self.sharing.take() {
             stop.store(true, Ordering::Relaxed);
@@ -1339,7 +1355,8 @@ impl GlassApp {
     }
 
     fn share_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, p: &Pal) {
-        let svc_on = self.svc == super::service::State::Running;
+        let svc_installed = self.svc != super::service::State::NotInstalled;
+        let svc_on = self.svc == super::service::State::Running && !self.svc_off;
         let on = svc_on || self.sharing.is_some() || self.demo.as_deref() == Some("share");
         ui.horizontal(|ui| {
             let (tile, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
@@ -1375,17 +1392,21 @@ impl GlassApp {
                 });
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if svc_on {
-                    // The service shares; Settings > Unattended access removes it.
+                if svc_installed {
+                    // The switch turns the service's sharing on and off.
+                    if toggle(ui, svc_on, p)
+                        .on_hover_text("The Glass service: on, it shares this PC at all times, including the lock screen and UAC prompts; off, nobody can connect (it stays off after a restart).")
+                        .clicked()
+                    {
+                        self.toggle_share();
+                    }
                     egui::Frame::new()
-                        .fill(p.ok.gamma_multiply(0.15))
+                        .fill(p.ok.gamma_multiply(if svc_on { 0.15 } else { 0.06 }))
                         .corner_radius(CornerRadius::same(10))
-                        .inner_margin(Margin::symmetric(10, 4))
+                        .inner_margin(Margin::symmetric(8, 3))
                         .show(ui, |ui| {
-                            ui.label(RichText::new("Service").size(12.5).color(p.ok));
-                        })
-                        .response
-                        .on_hover_text("Unattended access is on: the Glass service shares this PC, including the lock screen and UAC prompts. Settings removes it.");
+                            ui.label(RichText::new("Service").size(12.0).color(if svc_on { p.ok } else { p.weak }));
+                        });
                 } else {
                     let r = toggle(ui, on, p);
                     let blocked = !on && self.viewing.is_some();
@@ -1534,6 +1555,7 @@ impl eframe::App for GlassApp {
         if self.last_scan.elapsed() > Duration::from_millis(1500) {
             self.scan();
             self.svc = super::service::state();
+            self.svc_off = super::service::sharing_off();
             self.svc_status = if self.svc == super::service::State::Running {
                 super::service::Status::read()
             } else {
@@ -1928,26 +1950,28 @@ impl GlassApp {
                     let svc = self.svc;
                     ui.label(
                         RichText::new(match svc {
-                            super::service::State::Running => "On: the Glass service shares this PC at all times, including the lock screen, sign-in and UAC prompts, so it can be used from far away.",
-                            super::service::State::Stopped => "Installed, but the Glass service isn\u{2019}t running.",
+                            super::service::State::Running if !self.svc_off => "Installed and on: the Glass service shares this PC at all times, including the lock screen, sign-in and UAC prompts. The Share this PC switch turns it off and on.",
+                            super::service::State::Running | super::service::State::Stopped => "Installed, sharing off: nobody can connect until the Share this PC switch turns it on again.",
                             super::service::State::NotInstalled => "Install the Glass service to use this PC from far away: it shares at all times, including the lock screen, sign-in and UAC prompts. Windows asks for administrator rights.",
                         })
                         .size(12.5)
                         .color(p.weak),
                     );
                     ui.horizontal(|ui| {
-                        let (label, verb) = if svc == super::service::State::NotInstalled {
-                            ("Install service \u{2026}", "install")
-                        } else {
-                            ("Remove service \u{2026}", "uninstall")
-                        };
-                        if ui.add(plain_button(label, p)).clicked() {
-                            super::service::run_elevated(verb);
-                        }
-                        if svc != super::service::State::NotInstalled
-                            && ui.add(plain_button("Update to this build \u{2026}", p)).clicked()
-                        {
-                            super::service::run_elevated("install");
+                        match svc {
+                            super::service::State::NotInstalled => {
+                                if ui.add(accent_button("Install service \u{2026}", p)).clicked() {
+                                    super::service::run_elevated("install");
+                                }
+                            }
+                            _ => {
+                                if ui.add(plain_button("Update to this build \u{2026}", p)).clicked() {
+                                    super::service::run_elevated("install");
+                                }
+                                if ui.add(plain_button("Remove service \u{2026}", p)).clicked() {
+                                    super::service::run_elevated("uninstall");
+                                }
+                            }
                         }
                     });
                     ui.add_space(10.0);

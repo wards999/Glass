@@ -81,7 +81,10 @@ Unattended access (the Glass service, M3f):
   It copies this build to C:\Program Files\Glass, keeps this PC's pairings,
   allows it through Windows Firewall on private networks and starts it.
   Installing again from a newer build updates it.
-  Remove it:  Settings > Remove service, or  glass-cli service uninstall
+  The Share this PC switch turns its sharing off (it stays off after restarts)
+  and on again, no admin rights needed. As administrator you can also stop it
+  completely:  glass-cli service off | on
+  Remove it:  Settings > Remove, or  glass-cli service uninstall
   Log: C:\ProgramData\Glass\service.log
 
 Sharper pictures from a PC (resolution matching):

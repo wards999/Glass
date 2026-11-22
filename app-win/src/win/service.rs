@@ -70,6 +70,22 @@ fn control_dir() -> PathBuf {
     data_dir().join("control")
 }
 
+/// Sharing is switched off (the Glass window's Share switch): the service
+/// stays installed and running but runs no agent, across restarts too.
+pub fn sharing_off() -> bool {
+    control_dir().join("sharing-off").exists()
+}
+
+/// The Share switch, when the service is installed.
+pub fn set_sharing(on: bool) -> bool {
+    let f = control_dir().join("sharing-off");
+    if on {
+        std::fs::remove_file(&f).is_ok() || !f.exists()
+    } else {
+        std::fs::write(&f, b"1").is_ok()
+    }
+}
+
 /// The window's End session for a session the service hosts.
 pub fn request_end() -> bool {
     std::fs::write(control_dir().join("end-session"), b"1").is_ok()
@@ -251,6 +267,16 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         );
         if waited == WAIT_OBJECT_0 {
             break;
+        }
+        // Switched off in the window: no agent until it's switched on.
+        if sharing_off() {
+            if let Some(a) = agent.take() {
+                a.kill();
+                let _ = std::fs::remove_file(status_path());
+                log("sharing switched off");
+            }
+            failures = 0;
+            continue;
         }
         let session = WTSGetActiveConsoleSessionId();
         if session == u32::MAX {
@@ -580,10 +606,12 @@ fn install() -> Res<()> {
     let cli = dst.join("glass-cli.exe");
     let bin = format!("\"{}\" service run", cli.display());
     let svc_exists = sh("sc.exe", &["query", NAME]);
+    let was_off = svc_exists && is_off();
     let ok = if svc_exists {
+        let start = if was_off { "demand" } else { "auto" };
         sh(
             "sc.exe",
-            &["config", NAME, "binPath=", &bin, "start=", "auto"],
+            &["config", NAME, "binPath=", &bin, "start=", start],
         )
     } else {
         sh(
@@ -649,6 +677,11 @@ fn install() -> Res<()> {
             "enable=yes",
         ],
     );
+    if was_off {
+        println!("Updated. The service stays off (turn it on in Glass's Settings).");
+        log("updated (off)");
+        return Ok(());
+    }
     if !sh("sc.exe", &["start", NAME]) {
         return Err(
             "installed, but the service didn't start (see C:\\ProgramData\\Glass\\service.log)"
@@ -660,6 +693,50 @@ fn install() -> Res<()> {
         "including the lock screen and UAC prompts. Remove it with: glass-cli service uninstall"
     );
     log("installed");
+    Ok(())
+}
+
+/// Turned off: installed, but set not to start with Windows (`sc config
+/// start= demand`).
+fn is_off() -> bool {
+    std::process::Command::new("sc.exe")
+        .args(["qc", NAME])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("DEMAND_START"))
+}
+
+/// `glass-cli service off`: stops it and keeps it off after a restart;
+/// everything stays installed.
+fn turn_off() -> Res<()> {
+    if !super::blocker::self_elevated() {
+        return Err("run as administrator".into());
+    }
+    stop_service(15);
+    if !sh("sc.exe", &["config", NAME, "start=", "demand"]) {
+        return Err("couldn't change the service (is it installed?)".into());
+    }
+    let _ = std::fs::remove_file(status_path());
+    println!(
+        "The Glass service is off: this PC can't be reached from far away until you turn it on."
+    );
+    log("turned off");
+    Ok(())
+}
+
+/// `glass-cli service on`: starts with Windows again, and now.
+fn turn_on() -> Res<()> {
+    if !super::blocker::self_elevated() {
+        return Err("run as administrator".into());
+    }
+    if !sh("sc.exe", &["config", NAME, "start=", "auto"]) {
+        return Err("couldn't change the service (is it installed?)".into());
+    }
+    set_sharing(true);
+    if !sh("sc.exe", &["start", NAME]) && state() != State::Running {
+        return Err("the service didn't start (see C:\\ProgramData\\Glass\\service.log)".into());
+    }
+    println!("The Glass service is on: paired devices can reach this PC at any time.");
+    log("turned on");
     Ok(())
 }
 
@@ -714,6 +791,8 @@ pub fn command(args: &[String]) -> Res<()> {
         Some("run") => return run(),
         Some("install") => install(),
         Some("uninstall") => uninstall(args.iter().any(|a| a == "--purge")),
+        Some("on") => turn_on(),
+        Some("off") => turn_off(),
         Some("status") => {
             println!("service: {:?}", state());
             if let Some(s) = Status::read() {
@@ -725,7 +804,9 @@ pub fn command(args: &[String]) -> Res<()> {
             }
             Ok(())
         }
-        _ => Err("usage: glass-cli service install | uninstall [--purge] | status".into()),
+        _ => {
+            Err("usage: glass-cli service install | on | off | uninstall [--purge] | status".into())
+        }
     };
     if let Err(e) = &r {
         println!("error: {e}");

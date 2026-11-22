@@ -123,6 +123,28 @@ const WM_TOGGLE_444: u32 = WM_APP + 5;
 const TIMER_CURSOR: usize = 1;
 const TIMER_SHOT: usize = 2;
 const TIMER_REHOOK: usize = 3;
+const TIMER_FRONT: usize = 4;
+
+/// Brings the viewer to the front. Windows refuses SetForegroundWindow from
+/// a thread that doesn't have the input (the viewer starts on a worker
+/// thread of the Glass window), so borrow the front window's input briefly.
+/// (m3f-test12: the viewer opened behind the Glass window.)
+unsafe fn to_front(hwnd: HWND) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    let fg = GetForegroundWindow();
+    if fg == hwnd {
+        return;
+    }
+    let theirs = GetWindowThreadProcessId(fg, None);
+    let mine = GetCurrentThreadId();
+    let attached = theirs != 0 && theirs != mine && AttachThreadInput(mine, theirs, true).as_bool();
+    let _ = BringWindowToTop(hwnd);
+    let _ = SetForegroundWindow(hwnd);
+    let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
+    if attached {
+        let _ = AttachThreadInput(mine, theirs, false);
+    }
+}
 
 thread_local! {
     static DEBUG_SHOT: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
@@ -1057,7 +1079,9 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
     });
     with_ui(|ui| ui.layout());
     let _ = ShowWindow(hwnd, SW_SHOW);
-    let _ = SetForegroundWindow(hwnd);
+    to_front(hwnd);
+    // Once more shortly after, in case the Glass window took the focus back.
+    SetTimer(Some(hwnd), TIMER_FRONT, 300, None);
     // GLASS_SHOW_BAR=1: start with the bar shown and pinned (checks, demos).
     if std::env::var_os("GLASS_SHOW_BAR").is_some() {
         with_ui(|ui| {
@@ -1620,6 +1644,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 };
                 SetCursor(cur);
                 Some(LRESULT(1))
+            }
+            WM_TIMER if wparam.0 == TIMER_FRONT => {
+                let _ = KillTimer(Some(hwnd), TIMER_FRONT);
+                to_front(hwnd);
+                Some(LRESULT(0))
             }
             WM_TIMER if wparam.0 == TIMER_REHOOK => {
                 install_hook();

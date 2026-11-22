@@ -53,6 +53,8 @@ use std::time::Duration;
 /// rides out short scheduling hiccups at 80-150 Mbps.
 const SOCKET_BUFFER: usize = 4 << 20;
 const PING_INTERVAL_US: u64 = 500_000;
+/// A viewer silent this long (no pings, 10 missed) has gone.
+const VIEWER_SILENCE_US: u64 = 5_000_000;
 /// Faster pings right after connecting so the clock offset settles quickly.
 const FAST_PINGS: u32 = 8;
 const KEYFRAME_RETRY_US: u64 = 250_000;
@@ -555,9 +557,16 @@ impl HostListener {
         threads.push(std::thread::spawn(move || {
             let mut reader = reader;
             let mut refreshed = clock::now_us();
+            // The viewer pings twice a second; silence means it has gone
+            // (its Wi-Fi dropped, it slept) without a Bye. Ending the
+            // session frees the host for its reconnect (m3f-test11: the
+            // host waited forever and the viewer's reconnect timed out).
+            let mut heard = clock::now_us();
             while !sh.stop.load(Ordering::Relaxed) {
                 let mut pong = None;
+                let mut got = false;
                 let r = reader.read(&mut tls_in, |m| {
+                    got = true;
                     match m {
                         Message::Control(Control::Ping { seq, client_ts }) => {
                             pong = Some(Control::Pong {
@@ -582,6 +591,12 @@ impl HostListener {
                     Ok(())
                 });
                 if !matches!(r, Ok(true)) {
+                    break;
+                }
+                let now = clock::now_us();
+                if got {
+                    heard = now;
+                } else if now.saturating_sub(heard) > VIEWER_SILENCE_US {
                     break;
                 }
                 if let Some(p) = pong {

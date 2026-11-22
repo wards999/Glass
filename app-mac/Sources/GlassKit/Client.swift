@@ -121,23 +121,39 @@ public final class GlassClient {
     /// connection dropping (then the viewer reconnects).
     public var hostSaidBye: Bool { with(false) { glass_client_host_said_bye($0) } }
 
-    /// Sends a clipboard item (`GLASS_CLIP_*`) to the host in the background (M5c).
+    /// Sends a clipboard item (`GLASS_CLIP_*`) to the host in the background
+    /// (M5c); a files item sends the files themselves.
     public func sendClipboard(_ item: ClipboardSync.Item) {
         with(()) { p in
             item.data.withUnsafeBytes { b in
-                _ = glass_client_send_clipboard(p, item.kind, b.bindMemory(to: UInt8.self).baseAddress, b.count)
+                let base = b.bindMemory(to: UInt8.self).baseAddress
+                if item.kind == UInt8(GLASS_CLIP_FILES) {
+                    glass_client_send_files(p, base, b.count)
+                } else {
+                    _ = glass_client_send_clipboard(p, item.kind, base, b.count)
+                }
             }
         }
     }
 
-    /// The latest clipboard item from the host, once.
+    /// The latest clipboard item from the host (or files, once they've all
+    /// arrived), once.
     public func takeClipboard() -> ClipboardSync.Item? {
         with(nil) { p in
-            guard let h = glass_client_take_clipboard(p) else { return nil }
+            guard let h = glass_client_take_files(p) ?? glass_client_take_clipboard(p) else { return nil }
             defer { glass_clip_free(h) }
             return (glass_clip_kind(h), Data(bytes: glass_clip_data(h), count: glass_clip_len(h)))
         }
     }
+
+    /// Accept files from the host into `dir` (nil: refuse them).
+    public func setFileDir(_ dir: URL?) {
+        with(()) { p in
+            if let path = dir?.path { glass_client_set_file_dir(p, path) } else { glass_client_set_file_dir(p, nil) }
+        }
+    }
+
+    public var clipProgress: GLASS_ClipProgress { with(GLASS_ClipProgress()) { glass_client_clip_progress($0) } }
 
     private func with<R>(_ fallback: R, _ body: (OpaquePointer) -> R) -> R {
         lock.lock()

@@ -290,6 +290,8 @@ private final class HostSessionRun {
         var clip: ClipboardSync?
         var clipTimer: DispatchSourceTimer?
         if runner.options.clipboard {
+            let dir = ClipboardSync.fileDir(role: "host")
+            q.sync { s.setFileDir(dir) }
             let sync = ClipboardSync(sendCurrent: false) { [self] item in q.async { [self] in s.sendClipboard(item) } }
             clip = sync
             let t = DispatchSource.makeTimerSource(queue: .main)
@@ -327,6 +329,7 @@ private final class HostSessionRun {
         cursorTimer.cancel()
         clipTimer?.cancel()
         clipSummary = DispatchQueue.main.sync { clip.map { $0.summary } } ?? "off"
+        if clip != nil { clipSummary += " | " + ClipboardSync.filesSummary(q.sync { s.clipProgress }) }
         pipeline?.stop()
         pipeline = nil
         virtual?.destroy()

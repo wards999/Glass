@@ -219,17 +219,32 @@ public final class GlassHostSession {
         _ = glass_session_send_notice(ptr, code)
     }
 
-    /// Sends a clipboard item to the viewer in the background (M5c).
+    /// Sends a clipboard item to the viewer in the background (M5c); a
+    /// files item sends the files themselves.
     public func sendClipboard(_ item: ClipboardSync.Item) {
         guard let ptr else { return }
         item.data.withUnsafeBytes { b in
-            _ = glass_session_send_clipboard(ptr, item.kind, b.bindMemory(to: UInt8.self).baseAddress, b.count)
+            let base = b.bindMemory(to: UInt8.self).baseAddress
+            if item.kind == UInt8(GLASS_CLIP_FILES) {
+                glass_session_send_files(ptr, base, b.count)
+            } else {
+                _ = glass_session_send_clipboard(ptr, item.kind, base, b.count)
+            }
         }
     }
 
-    /// The latest clipboard item from the viewer, once.
+    /// Accept files from the viewer into `dir` (nil: refuse them).
+    public func setFileDir(_ dir: URL?) {
+        guard let ptr else { return }
+        if let path = dir?.path { glass_session_set_file_dir(ptr, path) } else { glass_session_set_file_dir(ptr, nil) }
+    }
+
+    public var clipProgress: GLASS_ClipProgress { ptr.map { glass_session_clip_progress($0) } ?? GLASS_ClipProgress() }
+
+    /// The latest clipboard item from the viewer (or files, once they've
+    /// all arrived), once.
     public func takeClipboard() -> ClipboardSync.Item? {
-        guard let ptr, let h = glass_session_take_clipboard(ptr) else { return nil }
+        guard let ptr, let h = glass_session_take_files(ptr) ?? glass_session_take_clipboard(ptr) else { return nil }
         defer { glass_clip_free(h) }
         return (glass_clip_kind(h), Data(bytes: glass_clip_data(h), count: glass_clip_len(h)))
     }

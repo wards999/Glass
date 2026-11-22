@@ -1,4 +1,4 @@
-# 0016 — Clipboard sharing (M5c, step 1)
+# 0016 — Clipboard sharing: text, pictures and files (M5c)
 
 **Status:** accepted · **Date:** 2026-11-22
 
@@ -32,10 +32,40 @@ between any pair (PC↔Mac, PC↔PC).
 - A Clipboard switch (Shared/Off) in Settings on both apps, on by default.
   The Windows service learns it from `C:\ProgramData\Glass\control\no-clipboard`.
 
+## Files (step 2)
+- Copying files or folders in Explorer or Finder sends **copies of the files
+  themselves** when you copy, not when you paste. They land under a Glass
+  folder on the other machine:
+  - the viewer: `%TEMP%\Glass\clipboard-viewer` or the Mac's temp folder
+  - the host: `clipboard-host`
+  - the Windows service: `C:\ProgramData\Glass-clipboard`, which the
+    signed-in user can read
+  Once every byte is there, the clipboard holds them as files, so a normal
+  paste copies them out. Windows marks them as a copy, so a paste never
+  moves them.
+- The file list goes first as a clipboard item (kind 3), then each file's
+  bytes as `FileData`. TLS already guarantees integrity, so there's no
+  separate hash. Sizes are checked and a broken transfer is dropped whole.
+- One sender thread per session sends only the newest copy. A new copy, of
+  anything, stops the old one (`FileCancel`). File data is paced at about
+  60 Mbps so the picture keeps the network. LATER(M5): pace from the rate
+  controller.
+- Up to 200 MB a copy, 10 000 entries. Bigger copies aren't sent; the
+  results count them. This keeps a big local copy from being shipped by
+  accident. LATER(M5c): send big copies only when pasted, the way Remote
+  Desktop does (Windows virtual files, macOS file promises).
+- Received paths are made safe: no `..` or absolute paths, and Windows'
+  reserved names and characters are replaced. Older received copies are
+  deleted when a new one arrives; the latest stays so it can still be pasted.
+- Files that are already inside a Glass clipboard folder are never sent
+  back. This avoids ping-pong, including in same-PC tests.
+- The viewer shows progress ("Sending files to … 45%") in its notice box,
+  even with the stats off.
+- LATER: drag and drop onto the viewer.
+
 ## Consequences
 - Both ends must update together (v8), as usual.
 - Text is preferred when an app offers both text and a picture
-  (spreadsheet cells). A copied file currently sends its name as text;
-  real files are step 2.
-- LATER(M5c step 2): files, drag and drop, progress and pacing under M5's
-  rate control.
+  (spreadsheet cells).
+- A receiver with the clipboard switched off still gets sent files it then
+  ignores. LATER: tell the other side.

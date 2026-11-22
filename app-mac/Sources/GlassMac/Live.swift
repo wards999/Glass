@@ -377,13 +377,14 @@ final class LiveViewer: NSObject, NSWindowDelegate {
 
     private func pollClipboard() {
         if clip == nil, ClipboardSync.enabled {
+            client.setFileDir(ClipboardSync.fileDir(role: "viewer"))
             // Sends what's copied now too: copy, connect, paste.
             clip = ClipboardSync(sendCurrent: true) { [client] item in client.sendClipboard(item) }
         }
         guard let clip else { return }
         if let item = client.takeClipboard() { clip.put(item) }
         clip.poll()
-        let summary = clip.summary
+        let summary = clip.summary + " | " + ClipboardSync.filesSummary(client.clipProgress)
         lock.withLock { clipSummary = summary }
     }
 
@@ -612,6 +613,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
 
     private func updateOverlay(_ now: UInt64) {
         let st = client.stats
+        let files = clip == nil ? nil : ClipboardSync.progressLine(client.clipProgress, peer: client.hostName)
         let text: String = lock.withLock {
             let secs = max(Double(now - windowStart) / 1e6, 0.001)
             let r = recent
@@ -634,6 +636,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 "⌃⌥⌘F full screen · ⌃⌥⌘S hide stats · ⌃⌥⌘W disconnect · ⌃⌥⌘Q quit",
             ]
             if let n = noticeText(st.host_notice) { lines.insert(n, at: 0) }
+            if let f = files { lines.insert(f, at: 0) }
             if now - windowStart >= 2_000_000 {
                 recent.reset()
                 windowStart = now
@@ -642,12 +645,12 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         }
         overlay.stringValue = text
         // A blocking notice shows even when the stats are hidden.
-        let notice = noticeText(st.host_notice)
+        let notice = noticeText(st.host_notice) ?? files
         if statsHidden {
             overlay.isHidden = notice == nil
             if let notice { overlay.stringValue = notice }
         }
-        if notice != nil { noticesSeen.insert(st.host_notice) }
+        if noticeText(st.host_notice) != nil { noticesSeen.insert(st.host_notice) }
     }
 
     private var noticesSeen = Set<UInt8>()

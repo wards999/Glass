@@ -2010,7 +2010,7 @@ impl GlassApp {
                         p,
                     );
                     ui.label(
-                        RichText::new("Shared: text and pictures copied on one computer can be pasted on the other, both ways, while a session is on. Changes apply from the next session.")
+                        RichText::new("Shared: text, pictures and files copied on one computer can be pasted on the other, both ways, while a session is on (files up to 200 MB a copy). Changes apply from the next session.")
                             .size(12.5)
                             .color(p.weak),
                     );

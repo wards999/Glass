@@ -352,7 +352,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                                            target: self, action: #selector(pickClipboard(_:)))
         clipboard.selectedSegment = ClipboardSync.enabled ? 0 : 1
         clipboard.segmentDistribution = .fillEqually
-        let clipNote = NSTextField(wrappingLabelWithString: "Shared: text and pictures copied on one computer can be pasted on the other, both ways, while a session is on. Changes apply from the next session.")
+        let clipNote = NSTextField(wrappingLabelWithString: "Shared: text, pictures and files copied on one computer can be pasted on the other, both ways, while a session is on (files up to 200 MB a copy). Changes apply from the next session.")
         clipNote.font = .systemFont(ofSize: 11)
         clipNote.textColor = .secondaryLabelColor
         // A visible way out (Esc and a click outside work too).

@@ -287,6 +287,23 @@ thread_local! {
 static KEYS_SEEN: AtomicU32 = AtomicU32::new(0);
 static KEYS_NOT_FRONT: AtomicU32 = AtomicU32::new(0);
 static KEYS_BUSY: AtomicU32 = AtomicU32::new(0);
+/// The window that had the keys instead (class and title), for the report.
+static KEYS_WENT_TO: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// "class \"title\"" of a window, for the report.
+fn describe_window(h: HWND) -> String {
+    let mut class = [0u16; 64];
+    let mut title = [0u16; 64];
+    unsafe {
+        let n = GetClassNameW(h, &mut class) as usize;
+        let t = GetWindowTextW(h, &mut title) as usize;
+        format!(
+            "{} \"{}\"",
+            String::from_utf16_lossy(&class[..n]),
+            String::from_utf16_lossy(&title[..t])
+        )
+    }
+}
 
 /// (Re-)installs the keyboard hook on this (the window's) thread.
 fn install_hook() {
@@ -509,12 +526,20 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
     );
     let _ = writeln!(
         out,
-        "  input: {} events in {} packets | keyboard: {} presses seen, {} sent, {} with another window in front, {} while busy | keys {}",
+        "  input: {} events in {} packets | keyboard: {} presses seen, {} sent, {} with another window in front{}, {} while busy | keys {}",
         st.input_events,
         st.input_packets,
         KEYS_SEEN.load(Ordering::Relaxed),
         sh.keys_sent.load(Ordering::Relaxed),
         KEYS_NOT_FRONT.load(Ordering::Relaxed),
+        {
+            let w = KEYS_WENT_TO.lock().unwrap_or_else(|e| e.into_inner());
+            if w.is_empty() {
+                String::new()
+            } else {
+                format!(" ({w})")
+            }
+        },
         KEYS_BUSY.load(Ordering::Relaxed),
         match sh.rule {
             PcModifierRule::PcStyle => "PC-style (Ctrl -> Cmd, Win -> Ctrl)",
@@ -1380,6 +1405,16 @@ impl Ui {
     }
 
     fn button(&mut self, b: u8, down: bool, lparam: LPARAM) {
+        // A click on the picture brings the viewer to the front, so keys
+        // follow (m3f-test3: keys went to another window after clicking).
+        if down {
+            unsafe {
+                if GetForegroundWindow() != self.hwnd {
+                    let _ = SetForegroundWindow(self.hwnd);
+                }
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(self.hwnd));
+            }
+        }
         let (x, y) = xy(lparam);
         let (nx, ny) = self.to_host(x, y);
         self.sh.client.input_button(b, down, nx, ny);
@@ -1656,9 +1691,18 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
             Some(false)
         } else {
             with_ui(|ui| {
-                if GetForegroundWindow() != ui.hwnd {
+                // Ours if the viewer or one of its own pop-ups (bar, handle,
+                // stats) is in front.
+                let front = GetForegroundWindow();
+                let mine = front == ui.hwnd || GetAncestor(front, GA_ROOTOWNER) == ui.hwnd;
+                if !mine {
                     if down {
                         KEYS_NOT_FRONT.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut w) = KEYS_WENT_TO.try_lock() {
+                            if w.is_empty() {
+                                *w = describe_window(front);
+                            }
+                        }
                     }
                     return false;
                 }

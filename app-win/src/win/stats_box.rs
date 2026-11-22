@@ -9,10 +9,11 @@ use std::cell::RefCell;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DT_CALCRECT, DT_LEFT, DT_NOPREFIX, FF_MODERN,
-    FIXED_PITCH, FW_NORMAL, HFONT, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush,
+    DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, InvalidateRect, ReleaseDC,
+    SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DT_CALCRECT, DT_LEFT, DT_NOPREFIX, FF_MODERN, FIXED_PITCH, FW_NORMAL, HFONT,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -33,11 +34,18 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
     match msg {
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_NCHITTEST => LRESULT(-1), // HTTRANSPARENT: clicks go to the viewer
+        // Painted whole (below): no erase first, which showed as a flicker
+        // every time the numbers changed (m5c-test3).
+        WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
-            let dc = BeginPaint(hwnd, &mut ps);
+            let screen = BeginPaint(hwnd, &mut ps);
             let mut r = RECT::default();
             let _ = GetClientRect(hwnd, &mut r);
+            // Drawn off-screen, then copied in one go.
+            let dc = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, r.right, r.bottom);
+            let old_bmp = SelectObject(dc, bmp.into());
             let bg = CreateSolidBrush(COLORREF(0));
             FillRect(dc, &r, bg);
             let _ = DeleteObject(bg.into());
@@ -60,6 +68,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             if let Some(o) = old {
                 SelectObject(dc, o);
             }
+            let _ = BitBlt(screen, 0, 0, r.right, r.bottom, Some(dc), 0, 0, SRCCOPY);
+            SelectObject(dc, old_bmp);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(dc);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -131,7 +143,11 @@ impl StatsBox {
 
     /// New text: resizes the box to fit and repaints it.
     pub fn set_text(&self, text: &str) {
-        TEXT.with(|t| *t.borrow_mut() = text.encode_utf16().collect());
+        let new: Vec<u16> = text.encode_utf16().collect();
+        if TEXT.with(|t| *t.borrow() == new) {
+            return;
+        }
+        TEXT.with(|t| *t.borrow_mut() = new);
         unsafe {
             let dc = GetDC(Some(self.hwnd));
             let old = FONT.with(|f| f.borrow().map(|f| SelectObject(dc, f.into())));
@@ -145,16 +161,21 @@ impl StatsBox {
             }
             ReleaseDC(Some(self.hwnd), dc);
             let p = pad(self.hwnd);
-            let _ = SetWindowPos(
-                self.hwnd,
-                None,
-                0,
-                0,
-                r.right + 2 * p,
-                r.bottom + 2 * p,
-                SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
-            );
-            let _ = InvalidateRect(Some(self.hwnd), None, true);
+            let (w, h) = (r.right + 2 * p, r.bottom + 2 * p);
+            let mut now = RECT::default();
+            let _ = GetWindowRect(self.hwnd, &mut now);
+            if (now.right - now.left, now.bottom - now.top) != (w, h) {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    0,
+                    0,
+                    w,
+                    h,
+                    SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOREDRAW,
+                );
+            }
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
     }
 

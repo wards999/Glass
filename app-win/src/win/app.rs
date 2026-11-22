@@ -1276,11 +1276,9 @@ impl GlassApp {
                                 .color(p.strong),
                         );
                         ui.label(
-                            RichText::new(
-                                "Encrypted \u{00B7} one session at a time",
-                            )
-                            .size(12.5)
-                            .color(p.weak),
+                            RichText::new("Encrypted \u{00B7} one session at a time")
+                                .size(12.5)
+                                .color(p.weak),
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

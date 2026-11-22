@@ -47,7 +47,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, VK_C, VK_F, VK_Q, VK_R, VK_S, VK_W,
+    GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_C, VK_CONTROL, VK_F, VK_MENU, VK_Q,
+    VK_R, VK_S, VK_SHIFT, VK_W,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -287,6 +288,8 @@ thread_local! {
 static KEYS_SEEN: AtomicU32 = AtomicU32::new(0);
 static KEYS_NOT_FRONT: AtomicU32 = AtomicU32::new(0);
 static KEYS_BUSY: AtomicU32 = AtomicU32::new(0);
+/// Key presses that came as window messages (the hook didn't take them).
+static KEYS_WINDOW: AtomicU32 = AtomicU32::new(0);
 /// The window that had the keys instead (class and title), for the report.
 static KEYS_WENT_TO: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
@@ -526,9 +529,10 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
     );
     let _ = writeln!(
         out,
-        "  input: {} events in {} packets | keyboard: {} presses seen, {} sent, {} with another window in front{}, {} while busy | keys {}",
+        "  input: {} events in {} packets | keyboard: {} presses via the window, {} seen by the hook, {} sent, {} with another window in front{}, {} while busy | keys {}",
         st.input_events,
         st.input_packets,
+        KEYS_WINDOW.load(Ordering::Relaxed),
         KEYS_SEEN.load(Ordering::Relaxed),
         sh.keys_sent.load(Ordering::Relaxed),
         KEYS_NOT_FRONT.load(Ordering::Relaxed),
@@ -1516,6 +1520,52 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             bar::WM_BAR_COMMAND => {
                 ui.bar_command(wparam.0);
+                Some(LRESULT(0))
+            }
+            // Typing: when the keyboard hook takes a key it never gets here;
+            // when Windows has dropped the hook (m3f-test5: 0 presses seen
+            // by it) the focused viewer still gets every key as a message.
+            WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP => {
+                let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+                let vk = wparam.0 as u16;
+                let held = |k: VIRTUAL_KEY| GetKeyState(k.0 as i32) < 0;
+                if down && held(VK_CONTROL) && held(VK_MENU) && held(VK_SHIFT) {
+                    let chord = if vk == VK_F.0 {
+                        Some(WM_TOGGLE_FULLSCREEN)
+                    } else if vk == VK_C.0 {
+                        Some(WM_TOGGLE_444)
+                    } else if vk == VK_R.0 {
+                        Some(WM_NEXT_MODE)
+                    } else if vk == VK_Q.0 || vk == VK_W.0 {
+                        Some(WM_CLOSE)
+                    } else {
+                        None
+                    };
+                    if let Some(m) = chord {
+                        c.input_release_all();
+                        let _ = PostMessageW(Some(hwnd), m, WPARAM(0), LPARAM(0));
+                        return Some(LRESULT(0));
+                    }
+                    if vk == VK_S.0 {
+                        let _ = PostMessageW(
+                            Some(hwnd),
+                            bar::WM_BAR_COMMAND,
+                            WPARAM(bar::ID_STATS),
+                            LPARAM(0),
+                        );
+                        return Some(LRESULT(0));
+                    }
+                }
+                let scan = ((lparam.0 >> 16) & 0xFF) as u16;
+                let ext = (lparam.0 >> 24) & 1 == 1;
+                let hid = win_scan_to_hid(scan, ext);
+                if hid != 0 {
+                    c.input_key(pc_key_for_mac(hid, sh.rule), down);
+                    if down {
+                        KEYS_WINDOW.fetch_add(1, Ordering::Relaxed);
+                        sh.keys_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN | WM_LBUTTONUP => {

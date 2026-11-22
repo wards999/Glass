@@ -445,6 +445,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         sessionTitle?.stringValue = s?.0 ?? ""
         sessionButton?.title = s?.1 ?? ""
         connectButton?.isEnabled = s == nil && connectingHost == nil
+        // Connect by address is off during a session, and its box closes.
+        addressLink?.isEnabled = s == nil
+        hostField?.isEnabled = s == nil
+        if s != nil, addressRow?.isHidden == false { toggleAddress() }
         // Sharing can't start while viewing (one session at a time).
         shareSwitch?.isEnabled = !(viewer != nil && hostController == nil)
     }

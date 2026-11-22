@@ -405,6 +405,8 @@ pub fn host(args: &[String]) -> Res<()> {
 /// Glass window how it's going through `C:\ProgramData\Glass\status.txt`.
 pub fn agent(args: &[String]) -> Res<()> {
     service::agent_env();
+    let end = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    service::watch_end(end.clone());
     let status = Arc::new(std::sync::Mutex::new(service::Status::default()));
     let (s1, s2, s3) = (status.clone(), status.clone(), status.clone());
     let update = |s: &Arc<std::sync::Mutex<service::Status>>,
@@ -450,7 +452,7 @@ pub fn agent(args: &[String]) -> Res<()> {
             }
         }),
         stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        end: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        end: end.clone(),
     };
     let mut a = args.to_vec();
     a.push("--desktops".into());

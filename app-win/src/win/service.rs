@@ -64,6 +64,29 @@ pub fn status_path() -> PathBuf {
     data_dir().join("status.txt")
 }
 
+/// Where the Glass window asks the agent to end the current session (any
+/// user on the PC may write here; the agent only looks for one file).
+fn control_dir() -> PathBuf {
+    data_dir().join("control")
+}
+
+/// The window's End session for a session the service hosts.
+pub fn request_end() -> bool {
+    std::fs::write(control_dir().join("end-session"), b"1").is_ok()
+}
+
+/// The agent: watches for End session from the window.
+pub fn watch_end(end: std::sync::Arc<AtomicBool>) {
+    std::thread::spawn(move || loop {
+        let f = control_dir().join("end-session");
+        if f.exists() {
+            let _ = std::fs::remove_file(&f);
+            end.store(true, Ordering::Relaxed);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+}
+
 fn log(line: &str) {
     use std::io::Write;
     let _ = std::fs::create_dir_all(data_dir());
@@ -549,6 +572,11 @@ fn install() -> Res<()> {
         return Err("couldn't restrict the service's identity folder".into());
     }
     println!("  {}", migrate_identity()?);
+    // End session from the window: users may drop a file here.
+    let cd = control_dir();
+    std::fs::create_dir_all(&cd)?;
+    let cds = cd.to_string_lossy().to_string();
+    sh("icacls", &[&cds, "/grant", "*S-1-5-32-545:(OI)(CI)M"]);
     let cli = dst.join("glass-cli.exe");
     let bin = format!("\"{}\" service run", cli.display());
     let svc_exists = sh("sc.exe", &["query", NAME]);

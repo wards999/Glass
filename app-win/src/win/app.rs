@@ -159,6 +159,8 @@ struct GlassApp {
     connecting: Option<String>,
     /// The address being viewed (its row says Viewing, with Disconnect).
     viewing: Option<String>,
+    /// The name of the machine being viewed (for the session bar).
+    viewing_name: String,
     /// Someone is viewing this PC (sharing, in a session).
     viewer_on: bool,
     /// The Glass service (unattended access, M3f) and its agent's status.
@@ -241,6 +243,7 @@ pub fn run(share: bool) -> Res<()> {
                 show_address: false,
                 connecting: None,
                 viewing: None,
+                viewing_name: String::new(),
                 viewer_on: false,
                 svc: super::service::state(),
                 svc_status: super::service::Status::read(),
@@ -263,6 +266,11 @@ pub fn run(share: bool) -> Res<()> {
             if app.demo.as_deref() == Some("share") {
                 app.share_status = "Waiting for a viewer \u{2026}".into();
                 app.pin = Some(("482913".into(), "MacBook Air".into()));
+            }
+            if app.demo.as_deref() == Some("session") {
+                app.viewer_on = true;
+                app.share_status =
+                    "Viewer connected: \"MacBook Air\" from 192.168.4.26 (encrypted)".into();
             }
             if app.demo.as_deref() == Some("settings") {
                 app.dialog = Dialog::Settings;
@@ -579,6 +587,11 @@ impl GlassApp {
             let _ = std::fs::write(dir.join("last-host.txt"), a);
         }
         self.connecting = Some(host.clone());
+        self.viewing_name = self
+            .machines
+            .iter()
+            .find(|m| m.address == host)
+            .map_or(host.clone(), |m| m.name.clone());
         self.notice = None;
         let (wake, device, s) = (
             self.wake.clone(),
@@ -1034,7 +1047,7 @@ impl GlassApp {
         // One session at a time: while viewing, only that row is live (it
         // disconnects).
         let enabled =
-            viewing || (m.version_ok && self.connecting.is_none() && self.viewing.is_none());
+            viewing || (m.version_ok && self.connecting.is_none() && self.session().is_none());
         let (rect, resp) = ui.allocate_exact_size(
             vec2(ui.available_width(), 70.0),
             if enabled {
@@ -1054,7 +1067,11 @@ impl GlassApp {
             Stroke::new(1.0, p.border.lerp_to_gamma(p.accent.gamma_multiply(0.7), h)),
             StrokeKind::Inside,
         );
-        let fade = if m.version_ok { 1.0 } else { 0.5 };
+        let fade = if m.version_ok && (enabled || busy_here) {
+            1.0
+        } else {
+            0.5
+        };
         let tile =
             Rect::from_center_size(pos2(rect.left() + 38.0, rect.center().y), vec2(44.0, 44.0));
         painter.rect_filled(tile, 11, p.accent.gamma_multiply(0.13 * fade));
@@ -1202,6 +1219,88 @@ impl GlassApp {
             disconnect_viewer();
         } else if self.viewer_on {
             self.end_session.store(true, Ordering::Relaxed);
+        } else if self.svc_status.as_ref().is_some_and(|s| s.connected) {
+            super::service::request_end();
+        }
+    }
+
+    /// The session this window is in, if any: what to say and the button.
+    fn session(&self) -> Option<(String, &'static str)> {
+        // "Viewer connected: \"NAME\" from 1.2.3.4 (encrypted)" -> NAME
+        let who =
+            |line: &str| -> String { line.split('"').nth(1).unwrap_or("A device").to_string() };
+        if self.viewing.is_some() {
+            Some((
+                format!("Viewing \u{201C}{}\u{201D}", self.viewing_name),
+                "Disconnect",
+            ))
+        } else if self.viewer_on {
+            Some((
+                format!(
+                    "\u{201C}{}\u{201D} is viewing this PC",
+                    who(&self.share_status)
+                ),
+                "End session",
+            ))
+        } else {
+            let s = self.svc_status.as_ref().filter(|s| s.connected)?;
+            Some((
+                format!("\u{201C}{}\u{201D} is viewing this PC", who(&s.line)),
+                "End session",
+            ))
+        }
+    }
+
+    /// A bar at the top for the whole session, with the way out.
+    fn session_bar(&mut self, ui: &mut egui::Ui, p: &Pal) {
+        let Some((title, button)) = self.session() else {
+            return;
+        };
+        let mut end = false;
+        egui::Frame::new()
+            .fill(p.ok.gamma_multiply(0.12))
+            .stroke(Stroke::new(1.0, p.ok.gamma_multiply(0.5)))
+            .corner_radius(CornerRadius::same(14))
+            .inner_margin(Margin::symmetric(16, 12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (dot, _) = ui.allocate_exact_size(vec2(10.0, 36.0), Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 5.0, p.ok);
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        ui.label(
+                            RichText::new(truncate(&title, 34))
+                                .font(semibold(15.0))
+                                .color(p.strong),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Encrypted \u{00B7} one session at a time",
+                            )
+                            .size(12.5)
+                            .color(p.weak),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let b = egui::Button::new(
+                            RichText::new(button)
+                                .font(semibold(13.5))
+                                .color(Color32::WHITE),
+                        )
+                        .fill(p.danger)
+                        .stroke(Stroke::NONE)
+                        .corner_radius(CornerRadius::same(8))
+                        .min_size(vec2(110.0, 32.0));
+                        if ui.add(b).clicked() {
+                            end = true;
+                        }
+                    });
+                });
+            });
+        if end {
+            self.end_session();
         }
     }
 
@@ -1253,8 +1352,17 @@ impl GlassApp {
                         })
                         .response
                         .on_hover_text("Unattended access is on: the Glass service shares this PC, including the lock screen and UAC prompts. Settings removes it.");
-                } else if toggle(ui, on, p).clicked() && self.demo.is_none() {
-                    self.toggle_share();
+                } else {
+                    let r = toggle(ui, on, p);
+                    let blocked = !on && self.viewing.is_some();
+                    let r = if blocked {
+                        r.on_hover_text("Not while you\u{2019}re viewing another device: one session at a time.")
+                    } else {
+                        r
+                    };
+                    if r.clicked() && self.demo.is_none() && !blocked {
+                        self.toggle_share();
+                    }
                 }
             });
         });
@@ -1424,6 +1532,10 @@ impl eframe::App for GlassApp {
                 ui.set_min_size(ui.available_size());
                 self.header(ui, &ctx, &p);
                 ui.add_space(16.0);
+                if self.session().is_some() {
+                    self.session_bar(ui, &p);
+                    ui.add_space(12.0);
+                }
 
                 // Devices.
                 ui.horizontal(|ui| {
@@ -1445,29 +1557,12 @@ impl eframe::App for GlassApp {
                 });
                 let list_h = (ui.available_height() - self.share_h - 64.0).max(90.0);
                 let mut go = None;
-                let mut end = false;
                 egui::ScrollArea::vertical()
                     .max_height(list_h)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         if self.machines.is_empty() {
                             self.empty_state(ui, &p);
-                            if self.viewing.is_some() || self.viewer_on {
-                                ui.vertical_centered(|ui| {
-                                    let b = egui::Button::new(
-                                        RichText::new("End session")
-                                            .font(semibold(14.0))
-                                            .color(Color32::WHITE),
-                                    )
-                                    .fill(p.danger)
-                                    .stroke(Stroke::NONE)
-                                    .corner_radius(CornerRadius::same(8))
-                                    .min_size(vec2(130.0, 34.0));
-                                    if ui.add(b).clicked() {
-                                        end = true;
-                                    }
-                                });
-                            }
                         }
                         for m in &self.machines {
                             if self.machine_row(ui, m, &p) {
@@ -1475,9 +1570,6 @@ impl eframe::App for GlassApp {
                             }
                         }
                     });
-                if end {
-                    self.end_session();
-                }
                 if let Some((h, port)) = go {
                     if self.viewing.as_deref() == Some(h.as_str()) {
                         disconnect_viewer();
@@ -1518,7 +1610,7 @@ impl eframe::App for GlassApp {
                         let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if ui
                             .add_enabled(
-                                self.connecting.is_none() && self.viewing.is_none(),
+                                self.connecting.is_none() && self.session().is_none(),
                                 accent_button("Connect", &p),
                             )
                             .clicked()

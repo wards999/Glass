@@ -21,6 +21,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     /// that says who.
     private var beingViewed = false
     private var hostStatus = ""
+    /// The name of the machine being viewed (for the session bar).
+    private var viewingName = ""
+    private var sessionCard: NSView?
+    private var sessionTitle: NSTextField?
+    private var sessionButton: NSButton?
     private var addressRow: NSStackView!
     private var addressLink: NSButton!
     private var shareSwitch: NSSwitch?
@@ -419,7 +424,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     // MARK: discovery
 
+    /// The session this Mac is in, if any: what to say and the button.
+    private func session() -> (String, String)? {
+        if viewer != nil {
+            return ("Viewing \u{201C}\(viewingName)\u{201D}", "Disconnect")
+        }
+        if beingViewed {
+            // "Connected to “NAME”" -> NAME
+            let name = hostStatus.split(separator: "\u{201C}").dropFirst().first?
+                .split(separator: "\u{201D}").first.map(String.init) ?? "A device"
+            return ("\u{201C}\(name)\u{201D} is viewing this Mac", "End Session")
+        }
+        return nil
+    }
+
+    /// The session bar at the top, and nothing else connects meanwhile.
+    private func updateSession() {
+        let s = session()
+        sessionCard?.isHidden = s == nil
+        sessionTitle?.stringValue = s?.0 ?? ""
+        sessionButton?.title = s?.1 ?? ""
+        connectButton?.isEnabled = s == nil && connectingHost == nil
+        // Sharing can't start while viewing (one session at a time).
+        shareSwitch?.isEnabled = !(viewer != nil && hostController == nil)
+    }
+
+    @objc private func endSessionTapped() { endSession() }
+
     private func refreshFound() {
+        updateSession()
         guard let listStack else { return }
         listStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         countLabel?.stringValue = found.isEmpty ? "" : "\(found.count)"
@@ -448,7 +481,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             // and it disconnects.
             let row = DeviceRow(name: h.name, detail: "\(kind) \u{00B7} \(h.address)", mac: h.os == "mac",
                                 status: status, statusColour: colour,
-                                enabled: viewing || (versionOK && connectingHost == nil && viewer == nil),
+                                enabled: viewing || (versionOK && connectingHost == nil && session() == nil),
                                 busy: connectingHost == h.address,
                                 action: viewing ? "Disconnect" : "Connect")
             if !versionOK { row.toolTip = "This device runs a different version of Glass. Install the same build on both." }
@@ -475,6 +508,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func connectFound(_ h: DiscoveredHost) {
+        viewingName = h.name
         guard connectButton.isEnabled else { return }
         hostField.stringValue = h.port == GlassClient.defaultPort ? h.address : "\(h.address):\(h.port)"
         connect()
@@ -532,6 +566,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let gear = symbolButton("gearshape", "Settings", #selector(showSettings(_:)))
         gearButton = gear
         let header = NSStackView(views: [icon, names, NSView(), themeToggle, gear])
+
+        // The session bar: who's connected, and the way out (hidden otherwise).
+        let dot = LayerView(fill: .systemGreen, stroke: nil, radius: 5)
+        dot.widthAnchor.constraint(equalToConstant: 10).isActive = true
+        dot.heightAnchor.constraint(equalToConstant: 10).isActive = true
+        let sTitle = NSTextField(labelWithString: "")
+        sTitle.font = .systemFont(ofSize: 14, weight: .semibold)
+        sTitle.lineBreakMode = .byTruncatingTail
+        sTitle.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let sNote = NSTextField(labelWithString: "Encrypted \u{00B7} one session at a time")
+        sNote.font = .systemFont(ofSize: 12)
+        sNote.textColor = .secondaryLabelColor
+        let sTexts = NSStackView(views: [sTitle, sNote])
+        sTexts.orientation = .vertical
+        sTexts.alignment = .leading
+        sTexts.spacing = 1
+        let sButton = NSButton(title: "End Session", target: self, action: #selector(endSessionTapped))
+        sButton.bezelColor = .systemRed
+        sButton.controlSize = .large
+        let sRow = NSStackView(views: [dot, sTexts, NSView(), sButton])
+        sRow.spacing = 10
+        sRow.alignment = .centerY
+        let sCard = Card(sRow, inset: 12)
+        sCard.fill = NSColor.systemGreen.withAlphaComponent(0.12)
+        sCard.stroke = NSColor.systemGreen.withAlphaComponent(0.5)
+        sCard.isHidden = true
+        sessionCard = sCard
+        sessionTitle = sTitle
+        sessionButton = sButton
         header.spacing = 10
         header.alignment = .centerY
 
@@ -637,7 +700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .vertical)
         spacer.setContentCompressionResistancePriority(.init(1), for: .vertical)
-        let stack = NSStackView(views: [header, devicesHeader, scroll, addressLink!, addressRow!, spacer, shareCard])
+        let stack = NSStackView(views: [header, sCard, devicesHeader, scroll, addressLink!, addressRow!, spacer, shareCard])
         stack.distribution = .fill
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -656,7 +719,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             icon.widthAnchor.constraint(equalToConstant: 44),
             icon.heightAnchor.constraint(equalToConstant: 44),
         ]
-        for v in [header, devicesHeader, scroll, addressRow!, shareCard] as [NSView] {
+        for v in [header, sCard, devicesHeader, scroll, addressRow!, shareCard] as [NSView] {
             cs.append(v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -44))
         }
         NSLayoutConstraint.activate(cs)
@@ -700,6 +763,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let h = found.first(where: { $0.name.caseInsensitiveCompare(host) == .orderedSame }) {
             (host, port) = (h.address, h.port)
         }
+        viewingName = found.first(where: { $0.address == host })?.name ?? host
         guard !host.isEmpty, connectButton.isEnabled else { return }
         UserDefaults.standard.set(hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "lastHost")
         connectTo(host, port)

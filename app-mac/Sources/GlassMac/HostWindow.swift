@@ -170,7 +170,9 @@ final class HostController: NSObject {
             return
         }
         do {
-            let r = try HostRunner(device: device, options: .init(), banner: banner)
+            var o = HostRunner.Options()
+            o.clipboard = ClipboardSync.enabled
+            let r = try HostRunner(device: device, options: o, banner: banner)
             r.onEvent = { [weak self] e in self?.event(e) }
             r.onStreamChanged = { [weak self] line in
                 self?.testCard.nowShowing = line

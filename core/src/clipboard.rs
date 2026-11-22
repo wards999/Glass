@@ -22,7 +22,7 @@ pub const CLIP_PNG: u8 = 2;
 pub const CLIP_MAX: usize = 16 << 20;
 
 /// One clipboard item: `CLIP_*` kind and its bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClipItem {
     pub kind: u8,
     pub data: Vec<u8>,

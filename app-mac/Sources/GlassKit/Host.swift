@@ -219,6 +219,21 @@ public final class GlassHostSession {
         _ = glass_session_send_notice(ptr, code)
     }
 
+    /// Sends a clipboard item to the viewer in the background (M5c).
+    public func sendClipboard(_ item: ClipboardSync.Item) {
+        guard let ptr else { return }
+        item.data.withUnsafeBytes { b in
+            _ = glass_session_send_clipboard(ptr, item.kind, b.bindMemory(to: UInt8.self).baseAddress, b.count)
+        }
+    }
+
+    /// The latest clipboard item from the viewer, once.
+    public func takeClipboard() -> ClipboardSync.Item? {
+        guard let ptr, let h = glass_session_take_clipboard(ptr) else { return nil }
+        defer { glass_clip_free(h) }
+        return (glass_clip_kind(h), Data(bytes: glass_clip_data(h), count: glass_clip_len(h)))
+    }
+
     /// Ends the session (keys the viewer held are released first).
     public func close() {
         if let p = ptr {

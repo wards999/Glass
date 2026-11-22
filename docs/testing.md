@@ -10,6 +10,35 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5c test 1 (clipboard: text and pictures, both ways)
+Update **both** machines first. This is protocol v8, so an old build on either
+side refuses to connect. On the PC with the service, run
+`glass-cli service install` from the new zip as administrator (it updates the
+installed service), or use Settings > Unattended access.
+Settings > **Clipboard** should say **Shared** on both.
+
+With a session on (Mac viewing PC, then PC viewing Mac; PC↔PC too if you can):
+1. **Copy, then connect:** copy some text on the viewer, then connect. Paste
+   it on the host (in the viewer window).
+2. **Viewer → host text:** copy a few lines on the viewer (several lines, an
+   emoji, an accented letter). Paste them into Notepad / TextEdit on the host.
+   The line breaks should be right.
+3. **Host → viewer text:** copy text on the host (in the viewer window), then
+   paste it into an app on the viewer, outside Glass.
+4. **Pictures both ways:** take a screenshot to the clipboard (PC:
+   Win+Shift+S; Mac: Ctrl+Cmd+Shift+4) and paste it on the other side (Paint,
+   Word, Preview > New from Clipboard, Mail). Also try an image copied from a
+   web page.
+5. **Big picture while moving:** copy a full-screen screenshot and at once
+   drag a window around in the viewer. The picture must not stutter while the
+   clipboard goes across.
+6. **No echo:** after each paste, the clipboard keeps what you pasted. It
+   shouldn't change back or flicker.
+7. **Off:** set Clipboard to **Off** on the viewer and reconnect. Copying on
+   either side no longer crosses. Set it back to **Shared**.
+8. Send back the viewer and host results (Copy button). Each now has a
+   `clipboard:` line saying how many items went each way.
+
 ## M3f test 1 (the Windows service: unattended access)
 On the PC to be reached from far away (QUIETPC), from the extracted zip:
 1. Open **Glass.exe** > gear > **Unattended access** > **Install service …**.

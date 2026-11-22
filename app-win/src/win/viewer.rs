@@ -61,6 +61,8 @@ pub struct Options {
     pub rule: Option<PcModifierRule>,
     /// Ask for 4:4:4 when possible (else 4:2:0, which uses less bandwidth).
     pub full_colour: bool,
+    /// Share the clipboard with the host (M5c).
+    pub clipboard: bool,
 }
 
 /// Made before connecting: the GPU, and what `Hello` tells the host.
@@ -225,6 +227,10 @@ struct Shared {
     stats_gen: AtomicU32,
     /// Key presses this viewer sent (for the report).
     keys_sent: AtomicU32,
+    clipboard: bool,
+    /// Clipboard items sent and received (for the report).
+    clips_out: AtomicU32,
+    clips_in: AtomicU32,
 }
 
 impl Shared {
@@ -295,6 +301,8 @@ struct Ui {
     notice_shown: u8,
     bar_seen_us: u64,
     last_bar_status_us: u64,
+    /// The clipboard thread (M5c), if sharing it.
+    clip: Option<super::clip::ClipSync>,
 }
 
 thread_local! {
@@ -444,6 +452,9 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         stats_text: Mutex::new(String::new()),
         stats_gen: AtomicU32::new(0),
         keys_sent: AtomicU32::new(0),
+        clipboard: opts.clipboard,
+        clips_out: AtomicU32::new(0),
+        clips_in: AtomicU32::new(0),
         rule: opts.rule.unwrap_or(if client_os == HOST_OS_MAC {
             PcModifierRule::PcStyle
         } else {
@@ -578,6 +589,19 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         match sh.rule {
             PcModifierRule::PcStyle => "PC-style (Ctrl -> Cmd, Win -> Ctrl)",
             PcModifierRule::MacStyle => "as labelled (Ctrl -> Ctrl, Win -> Cmd)",
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  clipboard: {}",
+        if sh.clipboard {
+            format!(
+                "{} sent to the host, {} received",
+                sh.clips_out.load(Ordering::Relaxed),
+                sh.clips_in.load(Ordering::Relaxed)
+            )
+        } else {
+            "off".to_string()
         }
     );
     let _ = writeln!(
@@ -1075,6 +1099,8 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
             notice_shown: NOTICE_NONE,
             bar_seen_us: 0,
             last_bar_status_us: 0,
+            // Sends what's copied now too: copy, connect, paste.
+            clip: sh.clipboard.then(|| super::clip::ClipSync::start(true)),
         })
     });
     with_ui(|ui| ui.layout());
@@ -1662,6 +1688,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 Some(LRESULT(0))
             }
             WM_TIMER if wparam.0 == TIMER_CURSOR => {
+                if let Some(clip) = &ui.clip {
+                    if let Some(item) = c.take_clipboard() {
+                        ui.sh.clips_in.fetch_add(1, Ordering::Relaxed);
+                        clip.put_incoming(item);
+                    }
+                    if let Some(item) = clip.take_outgoing() {
+                        ui.sh.clips_out.fetch_add(1, Ordering::Relaxed);
+                        c.send_clipboard(item);
+                    }
+                }
                 ui.poll_cursor();
                 ui.tick_bar();
                 ui.tick_stats();

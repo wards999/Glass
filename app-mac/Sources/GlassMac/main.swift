@@ -90,6 +90,7 @@ if args.first == "play", args.count >= 2 {
     var o = HostRunner.Options()
     o.testPattern = args.contains("--test-pattern")
     o.allow444 = !args.contains("--no-444")
+    o.clipboard = !args.contains("--no-clipboard")
     HostRunner.measureQuality = args.contains("--measure")
     o.fixedPin = value("--pin")
     if let p = value("--port").flatMap({ UInt16($0) }) { o.port = p }

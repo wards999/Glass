@@ -76,6 +76,21 @@ pub fn sharing_off() -> bool {
     control_dir().join("sharing-off").exists()
 }
 
+/// The Glass window's Clipboard setting, for the service's agent (M5c).
+pub fn clipboard_off() -> bool {
+    control_dir().join("no-clipboard").exists()
+}
+
+/// Passes the Clipboard setting on to the service (if it's installed).
+pub fn set_clipboard(on: bool) {
+    let f = control_dir().join("no-clipboard");
+    if on {
+        let _ = std::fs::remove_file(f);
+    } else if control_dir().is_dir() {
+        let _ = std::fs::write(f, b"1");
+    }
+}
+
 /// The Share switch, when the service is installed.
 pub fn set_sharing(on: bool) -> bool {
     let f = control_dir().join("sharing-off");

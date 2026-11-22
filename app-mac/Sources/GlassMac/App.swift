@@ -348,6 +348,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let note = NSTextField(wrappingLabelWithString: "Fast has the lowest lag. Full colour is exact but adds some lag. Both can be switched while viewing, from the handle at the top of the viewer.")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
+        let clipboard = NSSegmentedControl(labels: ["Shared", "Off"], trackingMode: .selectOne,
+                                           target: self, action: #selector(pickClipboard(_:)))
+        clipboard.selectedSegment = ClipboardSync.enabled ? 0 : 1
+        clipboard.segmentDistribution = .fillEqually
+        let clipNote = NSTextField(wrappingLabelWithString: "Shared: text and pictures copied on one computer can be pasted on the other, both ways, while a session is on. Changes apply from the next session.")
+        clipNote.font = .systemFont(ofSize: 11)
+        clipNote.textColor = .secondaryLabelColor
         // A visible way out (Esc and a click outside work too).
         let closeX = NSButton(image: NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Close") ?? NSImage(),
                               target: self, action: #selector(closeSettingsTapped))
@@ -357,7 +364,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let titleRow = NSStackView(views: [heading("Settings", 17), NSView(), closeX])
         var views: [NSView] = [titleRow, heading("Appearance"), theme,
                                heading("When viewing, start in"), radios,
-                               heading("Colour"), colour, note, heading("Paired devices")]
+                               heading("Colour"), colour, note,
+                               heading("Clipboard"), clipboard, clipNote, heading("Paired devices")]
         let peers = GlassDevice.shared?.peers ?? []
         if peers.isEmpty {
             let none = NSTextField(labelWithString: "None yet.")
@@ -396,11 +404,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         stack.setCustomSpacing(14, after: theme)
         stack.setCustomSpacing(14, after: radios)
         stack.setCustomSpacing(14, after: note)
+        stack.setCustomSpacing(14, after: clipNote)
         stack.setCustomSpacing(14, after: views[views.count - 2])
         stack.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.widthAnchor.constraint(equalToConstant: 380).isActive = true
-        for v in views where !(v is NSTextField) || v === note {
+        for v in views where !(v is NSTextField) || v === note || v === clipNote {
             v.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -36).isActive = true
         }
         return stack
@@ -420,6 +429,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc private func pickColour(_ sender: NSSegmentedControl) {
         UserDefaults.standard.set(sender.selectedSegment == 1, forKey: "fullColour")
+    }
+
+    @objc private func pickClipboard(_ sender: NSSegmentedControl) {
+        UserDefaults.standard.set(sender.selectedSegment == 0, forKey: "shareClipboard")
     }
 
     @objc private func forgetFromSettings(_ sender: NSButton) {

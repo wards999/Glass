@@ -1,6 +1,6 @@
 # Glass protocol
 
-**Version 7 (M3d).** No connection loops; the host says what it is and can do; view modes and stream changes (v5) on top of v4. Paired devices only: mutual TLS 1.3 on the control
+**Version 8 (M5c).** Clipboard sharing (v8); no connection loops; the host says what it is and can do; view modes and stream changes (v5) on top of v4. Paired devices only: mutual TLS 1.3 on the control
 connection, every UDP datagram sealed with AES-128-GCM. LAN, IPv4. This file
 is the source of truth for packet formats and control messages;
 `core/src/protocol.rs`, `packet.rs`, `input.rs`, `seal.rs`, `tls.rs` and
@@ -78,7 +78,7 @@ The host serves one viewer at a time.
 ## Control messages (TLS over TCP)
 
 Framing (inside TLS): `u16 length` (type + body) · `u8 type` · body. Max
-65537 bytes total; everything except CursorShape fits in 32.
+65537 bytes total; everything except CursorShape and ClipChunk fits in 96.
 
 | Type | Name | Direction | Body |
 |---|---|---|---|
@@ -98,6 +98,7 @@ Framing (inside TLS): `u16 length` (type + body) · `u8 type` · body. Max
 | 14 | PairConfirm | either | HMAC-SHA256, 32 bytes |
 | 15 | SetMode | viewer → host | `mode u8`, `allow_444 u8` (0 asks for 4:2:0, e.g. after 4:4:4 failed to decode). A host that can't change ignores it. |
 | 16 | StreamChange | host → viewer | `codec u8`, `chroma u8`, `mode u8`, `reserved u8`, `width u16`, `height u16`, `fps u16`: frames have these parameters from the next IDR on. |
+| 17 | ClipChunk | either | `id u32`, `kind u8` (1 UTF-8 text with `\n` line endings, 2 PNG image), `total u32` (the item's size, 1 B–16 MB), `offset u32`, then up to 60 000 bytes of data. A clipboard item is sent as chunks of one `id`, in order (`offset` 0, 60 000, …) and goes on the receiver's clipboard once `total` bytes have arrived. A chunk that doesn't continue the current item drops it. Sent when the sender's clipboard changes, never echoing back an item that just arrived; interleaved with other control messages. |
 
 View modes (`mode`): **0** the host's own screen (scaled to fit by the viewer); **1** fit: a host display at the viewer's pixel size that looks about as big as the host's own screen (Mac: HiDPI virtual display, "looks like" viewer size ÷ 1.5); **2** fit, more space: the viewer's size at 1×; **3** fit, larger: the viewer's size at 2×. `Welcome` always describes mode 0 at 4:2:0; the host then switches (a `StreamChange` followed by an IDR) if `Hello` asked for another mode or allows 4:4:4.
 
@@ -242,6 +243,7 @@ protocol version, `fp` first 8 bytes of the fingerprint (hex), `ip`, `port`.
 Advisory only: trust comes from the pinned fingerprint, never from discovery.
 
 ## Changelog
+- v8 — M5c clipboard: `ClipChunk` (17) carries text and images both ways.
 - v7 — M3d no-loop rule: `Hello` carries who sees the viewer; reject reason 7 = loop. Control messages may now be up to 96 bytes.
 - v6 — M3d: `Welcome` ends with `host_os` and `host_caps`, so the viewer picks its key mapping and offers only what the host can do; `Hello` caps bit 1 asks to start in 4:2:0.
 - v5 — M3c view modes: `Hello` carries the viewer's refresh rate, decode capabilities and wanted mode; `Welcome`'s reserved byte is the mode; `SetMode` (15) and `StreamChange` (16).

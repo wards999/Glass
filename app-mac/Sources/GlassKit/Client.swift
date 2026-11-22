@@ -121,6 +121,24 @@ public final class GlassClient {
     /// connection dropping (then the viewer reconnects).
     public var hostSaidBye: Bool { with(false) { glass_client_host_said_bye($0) } }
 
+    /// Sends a clipboard item (`GLASS_CLIP_*`) to the host in the background (M5c).
+    public func sendClipboard(_ item: ClipboardSync.Item) {
+        with(()) { p in
+            item.data.withUnsafeBytes { b in
+                _ = glass_client_send_clipboard(p, item.kind, b.bindMemory(to: UInt8.self).baseAddress, b.count)
+            }
+        }
+    }
+
+    /// The latest clipboard item from the host, once.
+    public func takeClipboard() -> ClipboardSync.Item? {
+        with(nil) { p in
+            guard let h = glass_client_take_clipboard(p) else { return nil }
+            defer { glass_clip_free(h) }
+            return (glass_clip_kind(h), Data(bytes: glass_clip_data(h), count: glass_clip_len(h)))
+        }
+    }
+
     private func with<R>(_ fallback: R, _ body: (OpaquePointer) -> R) -> R {
         lock.lock()
         defer { lock.unlock() }

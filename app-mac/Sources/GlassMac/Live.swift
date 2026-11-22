@@ -70,6 +70,10 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private var lastBarUpdate: UInt64 = 0
     private var seenChanges: UInt32 = 0 // main thread
     private var wantFullColour = UserDefaults.standard.bool(forKey: "fullColour")
+    /// Clipboard sharing (M5c; main thread), and when it was last polled.
+    private var clip: ClipboardSync?
+    private var lastClipPoll: UInt64 = 0
+    private var clipSummary = "off" // under `lock`
 
     private var window: NSWindow!
     private var view: MetalView!
@@ -369,6 +373,20 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         }
     }
 
+    // MARK: clipboard
+
+    private func pollClipboard() {
+        if clip == nil, ClipboardSync.enabled {
+            // Sends what's copied now too: copy, connect, paste.
+            clip = ClipboardSync(sendCurrent: true) { [client] item in client.sendClipboard(item) }
+        }
+        guard let clip else { return }
+        if let item = client.takeClipboard() { clip.put(item) }
+        clip.poll()
+        let summary = clip.summary
+        lock.withLock { clipSummary = summary }
+    }
+
     // MARK: pointer
 
     private func pollCursor() {
@@ -553,6 +571,10 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             streamChanged()
         }
         let now = GlassClock.nowUs()
+        if now - lastClipPoll >= 150_000 {
+            lastClipPoll = now
+            pollClipboard()
+        }
         if now - lastOverlay >= 250_000 {
             lastOverlay = now
             updateOverlay(now)
@@ -698,6 +720,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 out.append("  PC notices: \(noticesSeen.sorted().map { $0 == UInt8(GLASS_NOTICE_INPUT_BLOCKED_ELEVATED) ? "input blocked by an admin window" : "UAC prompt / lock screen" }.joined(separator: ", "))")
             }
             out.append("  decoder: \(usingHardware ? "hardware" : "SOFTWARE")")
+            out.append("  clipboard: \(clipSummary)")
             out.append(s.encode.line("encode (host)"))
             out.append(s.network.line("network"))
             out.append(s.queue.line("queue"))

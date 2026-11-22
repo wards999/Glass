@@ -6,6 +6,7 @@ mod bar;
 mod blocker;
 pub mod browse;
 mod capture;
+mod clip;
 mod cuda;
 mod cursor;
 mod d3d;
@@ -79,6 +80,8 @@ struct Args {
     /// Switch this screen to the mode that best fits the viewer while it's
     /// connected (`--keep-resolution` turns it off).
     match_res: bool,
+    /// Share the clipboard with the viewer (M5c; `--no-clipboard` turns it off).
+    clipboard: bool,
     out: String,
 }
 
@@ -95,6 +98,7 @@ fn parse(args: &[String]) -> Res<Args> {
         pin: None,
         desktops: false,
         match_res: true,
+        clipboard: true,
         out: String::new(),
     };
     let mut it = args.iter();
@@ -111,6 +115,7 @@ fn parse(args: &[String]) -> Res<Args> {
             "--pin" => a.pin = Some(val()?.to_string()),
             "--desktops" => a.desktops = true,
             "--keep-resolution" => a.match_res = false,
+            "--no-clipboard" => a.clipboard = false,
             "--chroma" => {
                 a.chroma444 = match val()?.as_str() {
                     "444" => true,
@@ -456,6 +461,9 @@ pub fn agent(args: &[String]) -> Res<()> {
     };
     let mut a = args.to_vec();
     a.push("--desktops".into());
+    if service::clipboard_off() {
+        a.push("--no-clipboard".into());
+    }
     // A heartbeat, so the window knows the agent is alive while it waits.
     let beat = status.clone();
     std::thread::spawn(move || loop {
@@ -824,6 +832,10 @@ fn run_session(
     let mut pointer = cursor::CursorWatch::new();
     let mut watch = blocker::BlockerWatch::new();
     let mut blocked_since = None;
+    // The clipboard, both ways (M5c): the helper thread reads and writes
+    // it; this loop only swaps items with the session.
+    let clip = a.clipboard.then(|| clip::ClipSync::start(false));
+    let (mut clips_in, mut clips_out) = (0u32, 0u32);
     let t0 = clock::now_us();
     let mut pending_idr = true;
     if let Some(frame) = first.take().filter(|f| f.size == (w, h)) {
@@ -894,6 +906,16 @@ fn run_session(
             }
             if b != blocker::Blocker::None {
                 blocked_since = Some(now);
+            }
+        }
+        if let Some(c) = &clip {
+            if let Some(item) = session.take_clipboard() {
+                clips_in += 1;
+                c.put_incoming(item);
+            }
+            if let Some(item) = c.take_outgoing() {
+                clips_out += 1;
+                session.send_clipboard(item);
             }
         }
         match pointer.poll() {
@@ -974,6 +996,15 @@ fn run_session(
         fmt_line("capture interval", &run.intervals.intervals.summary())
     );
     let _ = writeln!(r, "{}", size_line(&run.size.summary()));
+    let _ = writeln!(
+        r,
+        "  clipboard: {}",
+        if a.clipboard {
+            format!("{clips_out} sent to the viewer, {clips_in} received")
+        } else {
+            "off".to_string()
+        }
+    );
     if a.desktops {
         let _ = writeln!(
             r,

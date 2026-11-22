@@ -78,6 +78,8 @@ struct Settings {
     theme: ThemePreference,
     view: u8,
     full_colour: bool,
+    /// Share the clipboard in sessions, both ways (M5c).
+    clipboard: bool,
 }
 
 impl Settings {
@@ -92,6 +94,7 @@ impl Settings {
             theme: ThemePreference::System,
             view: MODE_FIT,
             full_colour: false,
+            clipboard: true,
         };
         for line in std::fs::read_to_string(Self::path())
             .unwrap_or_default()
@@ -102,6 +105,7 @@ impl Settings {
                 Some(("theme", "dark")) => s.theme = ThemePreference::Dark,
                 Some(("view", v)) => s.view = v.parse().unwrap_or(MODE_FIT),
                 Some(("colour", v)) => s.full_colour = v == "444",
+                Some(("clipboard", v)) => s.clipboard = v != "0",
                 _ => {}
             }
         }
@@ -117,7 +121,10 @@ impl Settings {
         let colour = if self.full_colour { "444" } else { "420" };
         let _ = std::fs::write(
             Self::path(),
-            format!("theme={theme}\nview={}\ncolour={colour}\n", self.view),
+            format!(
+                "theme={theme}\nview={}\ncolour={colour}\nclipboard={}\n",
+                self.view, self.clipboard as u8
+            ),
         );
     }
 }
@@ -674,6 +681,11 @@ impl GlassApp {
             self.wake.clone(),
             self.wake.clone(),
         );
+        let args: Vec<String> = if self.settings.clipboard {
+            Vec::new()
+        } else {
+            vec!["--no-clipboard".into()]
+        };
         let ui = super::HostUi {
             event: Box::new(move |e| w1.send(Msg::Host(e))),
             line: Box::new(move |l| w2.send(Msg::HostLine(l.to_string()))),
@@ -685,7 +697,7 @@ impl GlassApp {
             end: self.end_session.clone(),
         };
         std::thread::spawn(move || {
-            let why = match super::host_with(&[], ui) {
+            let why = match super::host_with(&args, ui) {
                 Ok(()) => String::new(),
                 Err(e) => format!("Sharing stopped: {e}"),
             };
@@ -856,6 +868,7 @@ fn connect_worker(
                     seconds: None,
                     rule: None,
                     full_colour: s.full_colour,
+                    clipboard: s.clipboard,
                 };
                 let (report, m) = match viewer::run(c, prep, opts, &crate::banner()) {
                     Ok(r) => r,
@@ -1989,6 +2002,20 @@ impl GlassApp {
                     );
                     ui.add_space(10.0);
 
+                    section(ui, "Clipboard", p);
+                    segmented(
+                        ui,
+                        &mut s.clipboard,
+                        &[(true, "Shared"), (false, "Off")],
+                        p,
+                    );
+                    ui.label(
+                        RichText::new("Shared: text and pictures copied on one computer can be pasted on the other, both ways, while a session is on. Changes apply from the next session.")
+                            .size(12.5)
+                            .color(p.weak),
+                    );
+                    ui.add_space(10.0);
+
                     section(ui, "Unattended access", p);
                     let svc = self.svc;
                     ui.label(
@@ -2075,6 +2102,9 @@ impl GlassApp {
                 if s != self.settings {
                     if s.theme != self.settings.theme {
                         ctx.set_theme(s.theme);
+                    }
+                    if s.clipboard != self.settings.clipboard {
+                        super::service::set_clipboard(s.clipboard);
                     }
                     self.settings = s;
                     self.settings.save();

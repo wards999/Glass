@@ -47,6 +47,7 @@ pub fn connect(args: &[String]) -> Res<()> {
         rule: None, // from the host (Mac: Ctrl acts as ⌘; PC: as labelled)
         // 4:2:0 by default: in m3c-test4 4:4:4 cost ~25 ms on the Mac.
         full_colour: false,
+        clipboard: true,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -56,6 +57,7 @@ pub fn connect(args: &[String]) -> Res<()> {
             "--seconds" => seconds = Some(val()?.parse::<f64>()?),
             "--log" => log = Some(val()?.clone()),
             "--windowed" => opts.windowed = true,
+            "--no-clipboard" => opts.clipboard = false,
             "--colour" | "--color" => {
                 opts.full_colour = match val()?.as_str() {
                     "444" | "4:4:4" => true,

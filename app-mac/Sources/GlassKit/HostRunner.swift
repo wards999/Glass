@@ -27,6 +27,8 @@ public final class HostRunner {
         public var allow444 = true
         /// End each session after this long (CLI tests).
         public var seconds: Double?
+        /// Share the clipboard with the viewer, both ways (M5c).
+        public var clipboard = true
         public init() {}
     }
 
@@ -156,6 +158,7 @@ private final class HostSessionRun {
     var virtualDisp: HostDisplay?
     var virtualNote = ""
     var history: [String] = []
+    var clipSummary = "off"
     let failLock = NSLock()
     var failure: String?
     var cursorWatch: CursorWatch // main thread
@@ -282,6 +285,25 @@ private final class HostSessionRun {
         }
         cursorTimer.resume()
 
+        // The clipboard, both ways (M5c): pasteboard work on the main
+        // thread, session calls on the session queue.
+        var clip: ClipboardSync?
+        var clipTimer: DispatchSourceTimer?
+        if runner.options.clipboard {
+            let sync = ClipboardSync(sendCurrent: false) { [self] item in q.async { [self] in s.sendClipboard(item) } }
+            clip = sync
+            let t = DispatchSource.makeTimerSource(queue: .main)
+            t.schedule(deadline: .now(), repeating: .milliseconds(150))
+            t.setEventHandler { [self] in
+                sync.poll()
+                q.async { [self] in
+                    if let item = s.takeClipboard() { DispatchQueue.main.async { sync.put(item) } }
+                }
+            }
+            t.resume()
+            clipTimer = t
+        }
+
         let deadline = runner.options.seconds.map { started + UInt64($0 * 1e6) }
         var reason = "viewer left"
         while true {
@@ -303,6 +325,8 @@ private final class HostSessionRun {
             Thread.sleep(forTimeInterval: 0.1)
         }
         cursorTimer.cancel()
+        clipTimer?.cancel()
+        clipSummary = DispatchQueue.main.sync { clip.map { $0.summary } } ?? "off"
         pipeline?.stop()
         pipeline = nil
         virtual?.destroy()
@@ -345,6 +369,7 @@ private final class HostSessionRun {
         }
         out.append("  input: \(inp.packets) packets | \(inp.keys) keys, \(inp.clicks) clicks, \(inp.scrolls) scrolls, \(inp.moves) moves | repaired \(inp.repaired)\(o.testPattern ? " (test pattern: not injected)" : "")")
         out.append("  rejected UDP datagrams (failed decryption or replays): \(counters.rejected_datagrams)")
+        out.append("  clipboard: \(clipSummary)")
         if !o.testPattern && !HostPermissions.accessibility {
             out.append("  NOTE: Accessibility is off for Glass, so the viewer's mouse and keyboard did nothing.")
         }

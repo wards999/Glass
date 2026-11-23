@@ -230,6 +230,23 @@
  */
 #define GLASS_CLIP_TO_HELPER 7
 
+/**
+ * Datagrams the queue holds. Fewer than the receiver's replay window
+ * (1024), so packets sent out of order with audio and resends are never
+ * refused.
+ */
+#define GLASS_SLOTS 768
+
+/**
+ * The longest a frame is spread over, as a share of the viewer's refresh.
+ */
+#define GLASS_SPREAD_OF_REFRESH 0.5
+
+/**
+ * Never slower than this times the recent average bitrate.
+ */
+#define GLASS_MIN_RATE_X 4.0
+
 
 
 /**
@@ -1026,6 +1043,14 @@ typedef struct {
    */
   uint32_t qos;
   uint64_t keepalives;
+  /**
+   * Pacing (M5): frames paced, the sum and the longest of their spreads
+   * (µs), and frames whose rest was sent at once for a newer one.
+   */
+  uint64_t paced_frames;
+  uint64_t pace_us_total;
+  uint64_t pace_us_max;
+  uint64_t hurried_frames;
   /**
    * Sound frames sent, and resent after a NACK (M4b).
    */

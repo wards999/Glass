@@ -343,6 +343,12 @@ pub struct HostCounters {
     /// Video packet marking (`qos::QOS_*`), and keep-awakes sent (M4).
     pub qos: u32,
     pub keepalives: u64,
+    /// Pacing (M5): frames paced, the sum and the longest of their spreads
+    /// (µs), and frames whose rest was sent at once for a newer one.
+    pub paced_frames: u64,
+    pub pace_us_total: u64,
+    pub pace_us_max: u64,
+    pub hurried_frames: u64,
     /// Sound frames sent, and resent after a NACK (M4b).
     pub audio_frames: u64,
     pub audio_resent: u64,
@@ -392,6 +398,10 @@ struct HostShared {
     audio: Mutex<Option<crate::audio::AudioSender>>,
     audio_frames: AtomicU64,
     audio_resent: AtomicU64,
+    paced: AtomicU64,
+    pace_total: AtomicU64,
+    pace_max: AtomicU64,
+    hurried: AtomicU64,
 }
 
 /// Sends the host's sound to the viewer, from the capture thread (M4b).
@@ -449,6 +459,29 @@ struct VideoTx {
     marking: Option<crate::qos::Marking>,
     /// When anything was last sent (µs), for the keep-awakes.
     last_send_us: u64,
+    /// Video datagrams waiting for their send time (M5 pacing), the recent
+    /// average video rate (bytes/µs) and when the last frame was queued.
+    pace: crate::pacer::PaceQueue,
+    avg_rate: f64,
+    last_frame_us: u64,
+    /// The viewer's refresh interval (µs), for how far to spread a frame.
+    refresh_us: u64,
+}
+
+impl VideoTx {
+    /// Sends every queued datagram that's due by `now`.
+    fn send_due(&mut self, now: u64, peer: SocketAddrV4) -> usize {
+        let mut n = 0;
+        while let Some(d) = self.pace.front_due(now) {
+            let _ = self.udp.send_to(d, peer);
+            self.pace.pop();
+            n += 1;
+        }
+        if n > 0 {
+            self.last_send_us = now;
+        }
+        n
+    }
 }
 
 /// One connected viewer. Dropping it ends the session (and releases any
@@ -652,7 +685,12 @@ impl HostListener {
             audio: Mutex::new(None),
             audio_frames: AtomicU64::new(0),
             audio_resent: AtomicU64::new(0),
+            paced: AtomicU64::new(0),
+            pace_total: AtomicU64::new(0),
+            pace_max: AtomicU64::new(0),
+            hurried: AtomicU64::new(0),
         });
+        let mut threads = Vec::new();
         let tx = Arc::new(Mutex::new(VideoTx {
             udp: self.udp.try_clone()?,
             packetiser: Packetiser::default(),
@@ -660,8 +698,36 @@ impl HostListener {
             wire: [0; WIRE_MAX],
             marking: None,
             last_send_us: 0,
+            pace: crate::pacer::PaceQueue::new(WIRE_MAX),
+            avg_rate: 0.0,
+            last_frame_us: 0,
+            refresh_us: if viewer.refresh_hz > 0 {
+                1_000_000 / viewer.refresh_hz as u64
+            } else {
+                16_667
+            },
         }));
-        let mut threads = Vec::new();
+        // Sends paced video as it falls due (M5): the frame sender queues,
+        // this thread sends the rest of each frame on time.
+        {
+            let (sh, vtx) = (shared.clone(), tx.clone());
+            threads.push(std::thread::spawn(move || {
+                while !sh.stop.load(Ordering::Relaxed) && sh.connected.load(Ordering::Relaxed) {
+                    let next = {
+                        let Some(peer) = unpack_v4(sh.peer.load(Ordering::Relaxed)) else {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        };
+                        let mut t = lock(&vtx);
+                        let now = clock::now_us();
+                        t.send_due(now, peer);
+                        t.pace.next_due().map(|d| d.saturating_sub(now))
+                    };
+                    let wait = next.unwrap_or(2_000).clamp(100, 2_000);
+                    std::thread::sleep(Duration::from_micros(wait));
+                }
+            }));
+        }
         // Keep the viewer's radio awake while no video goes (M4 step 4).
         {
             let (sh, vtx) = (shared.clone(), tx.clone());
@@ -1024,22 +1090,50 @@ impl HostSession {
         let c = &mut self.counters;
         let mut t = lock(&self.tx);
         t.last_send_us = clock::now_us();
+        // FEC sized to the loss the viewer reports (M4).
+        t.packetiser.fec_loss = self.shared.loss_ppm.load(Ordering::Relaxed) as f32 / 1e6;
+        // Pacing (M5): spread over at most half the viewer's refresh, never
+        // slower than 4x the recent average; what's left of the previous
+        // frame goes now.
+        let now = clock::now_us();
+        if let Some(prev) = (t.last_frame_us > 0).then_some(t.last_frame_us) {
+            let dt = now.saturating_sub(prev).clamp(1_000, 1_000_000) as f64;
+            t.avg_rate += (data.len() as f64 / dt - t.avg_rate) * 0.1;
+        }
+        t.last_frame_us = now;
+        if t.pace.hurry(now) > 0 {
+            self.shared.hurried.fetch_add(1, Ordering::Relaxed);
+        }
+        let rate = crate::pacer::rate(data.len(), t.refresh_us, t.avg_rate);
         let VideoTx {
             udp,
             packetiser,
             sealer,
             wire,
+            pace,
             ..
         } = &mut *t;
-        // FEC sized to the loss the viewer reports (M4).
-        packetiser.fec_loss = self.shared.loss_ppm.load(Ordering::Relaxed) as f32 / 1e6;
+        let mut due = now as f64;
         let mut sent = 0u64;
-        let n = packetiser.send_frame(f, data, clock::now_us(), |pkt| {
+        let n = packetiser.send_frame(f, data, now, |pkt| {
             let len = sealer.seal(pkt, wire);
             c.bytes_sent += len as u64;
             sent += 1;
-            udp.send_to(&wire[..len], peer).map(|_| ())
+            let queued = pace.push(&wire[..len], due as u64);
+            due += len as f64 / rate;
+            if queued {
+                Ok(())
+            } else {
+                udp.send_to(&wire[..len], peer).map(|_| ())
+            }
         })?;
+        // The first datagrams are due now: send them before returning, so
+        // pacing never delays the start of a frame.
+        t.send_due(clock::now_us(), peer);
+        let spread = (due as u64).saturating_sub(now);
+        self.shared.paced.fetch_add(1, Ordering::Relaxed);
+        self.shared.pace_total.fetch_add(spread, Ordering::Relaxed);
+        self.shared.pace_max.fetch_max(spread, Ordering::Relaxed);
         c.packets_sent += sent;
         c.parity_packets += sent - n as u64;
         c.frames_sent += 1;
@@ -1146,6 +1240,10 @@ impl HostSession {
             keepalives: self.shared.keepalives.load(Ordering::Relaxed),
             audio_frames: self.shared.audio_frames.load(Ordering::Relaxed),
             audio_resent: self.shared.audio_resent.load(Ordering::Relaxed),
+            paced_frames: self.shared.paced.load(Ordering::Relaxed),
+            pace_us_total: self.shared.pace_total.load(Ordering::Relaxed),
+            pace_us_max: self.shared.pace_max.load(Ordering::Relaxed),
+            hurried_frames: self.shared.hurried.load(Ordering::Relaxed),
             ..self.counters
         }
     }

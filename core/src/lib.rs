@@ -14,6 +14,7 @@ pub mod input;
 pub mod keymap;
 pub mod media_link;
 pub mod net;
+pub mod pacer;
 pub mod packet;
 pub mod pairing;
 pub mod protocol;

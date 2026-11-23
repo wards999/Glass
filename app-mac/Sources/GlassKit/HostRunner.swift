@@ -381,6 +381,10 @@ private final class HostSessionRun {
                           Double(counters.loss_ppm) / 1e4,
                           counters.nacks, counters.packets_resent))
         out.append("  network (M4): video marked for Wi-Fi priority: \(counters.qos == 1 ? "yes" : counters.qos == 2 ? "no" : "not yet") | keep-awakes sent \(counters.keepalives)")
+        out.append(String(format: "  pacing (M5): %llu frames spread over %.1f ms on average (longest %.1f ms) | %llu sent at once for a newer frame",
+                          counters.paced_frames,
+                          Double(counters.pace_us_total) / Double(max(counters.paced_frames, 1)) / 1e3,
+                          Double(counters.pace_us_max) / 1e3, counters.hurried_frames))
         out.append("  " + wifi.line())
         out.append(t.encode.line("encode"))
         out.append(t.delivery.line("  capture delivery"))

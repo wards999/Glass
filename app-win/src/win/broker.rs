@@ -463,6 +463,14 @@ pub fn run(
             qos_word(c.qos),
             c.keepalives
         );
+        let _ = writeln!(
+            r,
+            "  pacing (M5): {} frames spread over {:.1} ms on average (longest {:.1} ms) | {} sent at once for a newer frame",
+            c.paced_frames,
+            c.pace_us_total as f64 / c.paced_frames.max(1) as f64 / 1e3,
+            c.pace_us_max as f64 / 1e3,
+            c.hurried_frames
+        );
         let _ = writeln!(r, "  {}", wifi.line());
         let _ = writeln!(r, "{}", fmt_line("helper -> service", &hop.summary()));
         let _ = writeln!(

@@ -10,6 +10,15 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 7 (pacing)
+The same 3D pool test, especially the break.
+1. Fewer stutters at the break? The Mac's "worst moments" and "Wi-Fi
+   spikes" lines, against m5-test6.
+2. The PC's results: "pacing (M5): N frames spread over X ms on average
+   (longest Y)": X about 2 ms, Y at most about 8.
+3. The picture's delay (capture -> screen) should be about the same as
+   m5-test6 (36.5 ms): pacing adds at most a few ms to big frames.
+
 ## M5 test 6 (worst moments)
 The same 3D pool test, starting from the menu (the static view) into the
 live table. Note roughly when it felt off (seconds after connecting).

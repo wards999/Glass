@@ -328,6 +328,12 @@ pub struct ReassemblyStats {
     pub nacks: u64,
     pub resent: u64,
     pub frames_nacked: u64,
+    /// Hitches: a frame given up, then frames withheld until a keyframe
+    /// came. How many, and their total and longest length (µs, from giving
+    /// up to the keyframe), M4 step 3.
+    pub recoveries: u64,
+    pub recovery_us_total: u64,
+    pub recovery_us_max: u64,
 }
 
 /// Frames in flight at once: those arriving plus, while an older frame is
@@ -485,6 +491,8 @@ pub struct Reassembler {
     nack: bool,
     rtt_us: u32,
     nack_buf: Vec<u16>,
+    /// When a loss started withholding frames (for `recoveries`).
+    lost_at: Option<u64>,
     pub stats: ReassemblyStats,
 }
 
@@ -504,6 +512,7 @@ impl Reassembler {
             nack: true,
             rtt_us: 0,
             nack_buf: Vec::with_capacity(NACK_MAX),
+            lost_at: None,
             stats: ReassemblyStats::default(),
         }
     }
@@ -602,7 +611,7 @@ impl Reassembler {
                 i
             }
             None => {
-                let Some(i) = self.claim_slot() else {
+                let Some(i) = self.claim_slot(now_us) else {
                     return;
                 };
                 // Evicting may have given up on this very frame.
@@ -770,7 +779,7 @@ impl Reassembler {
                         s.used = false;
                     }
                 }
-                if self.accept(si) {
+                if self.accept(si, now_us) {
                     break si;
                 }
                 continue;
@@ -780,7 +789,7 @@ impl Reassembler {
                 .iter()
                 .position(|s| s.used && s.done && s.frame_id == exp)
             {
-                if self.accept(si) {
+                if self.accept(si, now_us) {
                     break si;
                 }
                 continue;
@@ -789,7 +798,7 @@ impl Reassembler {
             if let Some(si) = self.oldest(|s| s.done && s.flags & FLAG_IDR != 0) {
                 let id = self.slots[si].frame_id;
                 if before(exp, id) {
-                    self.give_up_through(id.wrapping_sub(1));
+                    self.give_up_through(id.wrapping_sub(1), now_us);
                     continue;
                 }
             }
@@ -809,7 +818,7 @@ impl Reassembler {
                 })
             };
             if give_up {
-                self.give_up_through(exp);
+                self.give_up_through(exp, now_us);
                 continue;
             }
             return None;
@@ -851,7 +860,7 @@ impl Reassembler {
 
     /// Every frame up to `id` is lost (or, if complete, useless after one
     /// that's lost): wait for a keyframe.
-    fn give_up_through(&mut self, id: u32) {
+    fn give_up_through(&mut self, id: u32, now_us: u64) {
         let exp = self.next_expected.unwrap_or(id);
         let mut in_slots = 0u64;
         for i in 0..self.slots.len() {
@@ -876,17 +885,18 @@ impl Reassembler {
         self.stats.frames_lost += span.saturating_sub(in_slots);
         self.next_expected = Some(id.wrapping_add(1));
         self.awaiting_idr = true;
+        self.lost_at.get_or_insert(now_us);
     }
 
     /// A free slot, evicting the oldest frame (given up) if all are busy.
-    fn claim_slot(&mut self) -> Option<usize> {
+    fn claim_slot(&mut self, now_us: u64) -> Option<usize> {
         if let Some(i) = self.slots.iter().position(|s| !s.used) {
             return Some(i);
         }
         let oldest = self.oldest(|_| true)?;
         let id = self.slots[oldest].frame_id;
         match self.next_expected {
-            Some(exp) if !before(id, exp) => self.give_up_through(id),
+            Some(exp) if !before(id, exp) => self.give_up_through(id, now_us),
             _ => self.release(oldest),
         }
         self.slots.iter().position(|s| !s.used)
@@ -894,7 +904,7 @@ impl Reassembler {
 
     /// Takes the complete frame in slot `si` off the queue: true if the
     /// decoder may have it.
-    fn accept(&mut self, si: usize) -> bool {
+    fn accept(&mut self, si: usize, now_us: u64) -> bool {
         let id = self.slots[si].frame_id;
         self.next_expected = Some(id.wrapping_add(1));
         // Saved by a NACK only if a resend completed it (m4-test6: 6 asks
@@ -932,6 +942,12 @@ impl Reassembler {
             return false;
         }
         self.awaiting_idr = false;
+        if let Some(t) = self.lost_at.take() {
+            let d = now_us.saturating_sub(t);
+            self.stats.recoveries += 1;
+            self.stats.recovery_us_total += d;
+            self.stats.recovery_us_max = self.stats.recovery_us_max.max(d);
+        }
         self.stats.frames += 1;
         true
     }
@@ -1474,6 +1490,31 @@ mod tests {
         assert_eq!(asked, vec![(1, vec![3])]);
         assert_eq!(feed(&mut r, &h.resend(1, &[3])), vec![(1, d1)]);
         assert!(!r.pending());
+    }
+
+    #[test]
+    fn a_hitch_is_measured_from_giving_up_to_the_keyframe() {
+        let mut h = Host::new(-1.0);
+        let mut r = Reassembler::without_nack();
+        feed(&mut r, &h.send(0, true, &frame_data(0, 100))); // start-up: no hitch
+        let mut p1 = h.send(1, false, &frame_data(1, 5_000));
+        p1.remove(0);
+        for p in &p1 {
+            r.push(p, 50_000);
+        }
+        for p in h.send(2, false, &frame_data(2, 100)) {
+            r.push(&p, 60_000);
+        }
+        assert!(r.pop(60_000).is_none()); // frame 1 lost at 60 ms
+        for p in h.send(3, true, &frame_data(3, 100)) {
+            r.push(&p, 95_000);
+        }
+        assert!(r.pop(95_000).is_some());
+        let s = r.stats;
+        assert_eq!(
+            (s.recoveries, s.recovery_us_total, s.recovery_us_max),
+            (1, 35_000, 35_000)
+        );
     }
 
     #[test]

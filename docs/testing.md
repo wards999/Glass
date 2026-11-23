@@ -10,6 +10,14 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M4 test 10 (no keyframe every 10 s; hitches measured)
+1. View QUIETPC (or Glass.exe sharing) from QUIETPC22 for a few minutes
+   with something moving. The host's results: "IDRs" should be about the
+   keyframe requests plus one, not one per 10 s as before.
+2. The viewer's FEC line ends with "hitches after a loss: N (avg, max
+   ms)": how long the picture waited for a keyframe after a frame was lost.
+   Send it, especially from a bad Wi-Fi spot.
+
 ## M4 test 9 (Mac session logs, a tidier Mac window, paired devices)
 1. On the Mac, share and view for over 10 s. `~/Library/Logs/Glass` gets a
    `host-…txt` / `viewer-…txt` that updates every 10 s while the session

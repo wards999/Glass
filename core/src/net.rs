@@ -1234,7 +1234,7 @@ struct CursorState {
 
 #[derive(Default)]
 struct AtomicRx {
-    v: [AtomicU64; 15],
+    v: [AtomicU64; 18],
 }
 
 impl AtomicRx {
@@ -1255,6 +1255,9 @@ impl AtomicRx {
             s.nacks,
             s.resent,
             s.frames_nacked,
+            s.recoveries,
+            s.recovery_us_total,
+            s.recovery_us_max,
         ];
         for (slot, v) in self.v.iter().zip(a) {
             slot.store(v, Ordering::Relaxed);
@@ -1279,6 +1282,9 @@ impl AtomicRx {
             nacks: l(12),
             resent: l(13),
             frames_nacked: l(14),
+            recoveries: l(15),
+            recovery_us_total: l(16),
+            recovery_us_max: l(17),
         }
     }
 }

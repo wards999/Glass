@@ -736,6 +736,14 @@ typedef struct {
   uint64_t nacks;
   uint64_t resent;
   uint64_t frames_nacked;
+  /**
+   * Hitches: a frame given up, then frames withheld until a keyframe
+   * came. How many, and their total and longest length (µs, from giving
+   * up to the keyframe), M4 step 3.
+   */
+  uint64_t recoveries;
+  uint64_t recovery_us_total;
+  uint64_t recovery_us_max;
 } GLASS_ReassemblyStats;
 
 /**

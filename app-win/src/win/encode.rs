@@ -98,7 +98,11 @@ impl Encoder {
             (*ctx).sw_pix_fmt = ff::AVPixelFormat::AV_PIX_FMT_BGRA;
             (*ctx).hw_frames_ctx = ff::av_buffer_ref(frames);
             (*ctx).max_b_frames = 0;
-            (*ctx).gop_size = (cfg.fps * 10) as i32; // LATER(M4): IDR on request only.
+            // IDRs only at the start and on request (a loss the viewer
+            // couldn't recover, a new viewer): no periodic one, which was a
+            // burst every 10 s for nothing (M4 step 3, ADR 0022). i32::MAX
+            // frames is NVENC's GOP for "never" in practice.
+            (*ctx).gop_size = i32::MAX;
             (*ctx).bit_rate = cfg.bitrate;
             (*ctx).rc_max_rate = cfg.bitrate;
             (*ctx).rc_buffer_size = (cfg.bitrate / cfg.fps as i64) as i32; // ~1-frame VBV

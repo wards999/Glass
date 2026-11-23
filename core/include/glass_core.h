@@ -147,6 +147,16 @@
 
 #define GLASS_HID_RGUI 231
 
+/**
+ * The largest message (an encoded keyframe at a high bitrate fits easily).
+ */
+#define GLASS_MAX_MESSAGE (16 << 20)
+
+/**
+ * Broker → clipboard helper: a clipboard control message from the viewer.
+ */
+#define GLASS_CLIP_TO_HELPER 7
+
 
 
 #define GLASS_PIN_LIFETIME_US 120000000

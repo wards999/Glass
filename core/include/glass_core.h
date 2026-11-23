@@ -275,8 +275,15 @@
  * [`NACK_GIVE_UP_MIN_US`]..[`NACK_GIVE_UP_MAX_US`]. Newer frames wait
  * meanwhile, so a recovered frame costs a few ms of delay instead of a
  * keyframe's hitch.
+ *
+ * The idle wait is 8 ms since pacing (m5-test7): a frame's packets now
+ * arrive over several ms, and Wi-Fi delivers in clumps, so 3 ms asked for
+ * packets still on their way (1,142 NACKs, 0 frames saved, 36,964
+ * duplicates). The host sends frames strictly in order, so a newer frame's
+ * packets are the reliable sign; the idle wait only matters for the last
+ * frame before a still screen.
  */
-#define GLASS_NACK_IDLE_US 3000
+#define GLASS_NACK_IDLE_US 8000
 
 #define GLASS_NACK_RETRY_MIN_US 4000
 

@@ -351,7 +351,14 @@ const WORDS: usize = (u16::MAX as usize).div_ceil(64);
 /// [`NACK_GIVE_UP_MIN_US`]..[`NACK_GIVE_UP_MAX_US`]. Newer frames wait
 /// meanwhile, so a recovered frame costs a few ms of delay instead of a
 /// keyframe's hitch.
-pub const NACK_IDLE_US: u64 = 3_000;
+///
+/// The idle wait is 8 ms since pacing (m5-test7): a frame's packets now
+/// arrive over several ms, and Wi-Fi delivers in clumps, so 3 ms asked for
+/// packets still on their way (1,142 NACKs, 0 frames saved, 36,964
+/// duplicates). The host sends frames strictly in order, so a newer frame's
+/// packets are the reliable sign; the idle wait only matters for the last
+/// frame before a still screen.
+pub const NACK_IDLE_US: u64 = 8_000;
 pub const NACK_RETRY_MIN_US: u64 = 4_000;
 pub const NACK_GIVE_UP_MIN_US: u64 = 20_000;
 pub const NACK_GIVE_UP_MAX_US: u64 = 60_000;
@@ -1515,6 +1522,29 @@ mod tests {
             (s.recoveries, s.recovery_us_total, s.recovery_us_max),
             (1, 35_000, 35_000)
         );
+    }
+
+    /// m5-test7: paced frames arrive over several ms, in Wi-Fi clumps; the
+    /// old 3 ms idle wait asked for packets still on their way.
+    #[test]
+    fn a_paced_frame_in_clumps_is_not_asked_for() {
+        let mut h = Host::new(0.02);
+        let mut r = Reassembler::new();
+        feed(&mut r, &h.send(0, true, &frame_data(0, 100)));
+        let p1 = h.send(1, false, &frame_data(1, 40 * MAX_PAYLOAD));
+        let mut now = 100_000u64;
+        let mut asked = 0;
+        // Clumps of 8 packets, 4 ms apart.
+        for clump in p1.chunks(8) {
+            for p in clump {
+                r.push(p, now);
+            }
+            r.poll(now, |_, _| asked += 1);
+            now += 4_000;
+            r.poll(now, |_, _| asked += 1);
+        }
+        assert_eq!(asked, 0);
+        assert!(r.pop(now).is_some());
     }
 
     #[test]

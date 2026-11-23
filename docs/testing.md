@@ -10,6 +10,11 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 8 (no false NACKs)
+As M5 test 7. The Mac's "NACK:" line should show few asks (m5-test7: 1,142,
+none needed) and "dup" in the hundreds, not tens of thousands. The PC's
+"NACKs answered" drops the same way.
+
 ## M5 test 7 (pacing)
 The same 3D pool test, especially the break.
 1. Fewer stutters at the break? The Mac's "worst moments" and "Wi-Fi

@@ -17,8 +17,8 @@ ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # UDP socket buffer sizes (std has no SO_RCVBUF/SO_SNDBUF).
 socket2 = "0.6"
+spake2 = "0.4"
 
 # Packet marking on Windows (qWAVE, M4 step 4).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_QoS", "Win32_Networking_WinSock"] }
-spake2 = "0.4"

@@ -559,7 +559,13 @@ impl GlassApp {
     /// What Settings > Session results shows: this app's last session, and
     /// the service's (on a PC with the service).
     fn results_text(&self) -> String {
-        let mut t = self.last_report.clone().unwrap_or_default();
+        // This run's last session, else the newest session log (written
+        // while sessions run, so it survives Glass being closed or killed).
+        let mut t = self
+            .last_report
+            .clone()
+            .or_else(super::slog::latest)
+            .unwrap_or_default();
         if self.svc != super::service::State::NotInstalled {
             let svc = std::fs::read_to_string(super::service::data_dir().join("agent-results.txt"))
                 .unwrap_or_default();

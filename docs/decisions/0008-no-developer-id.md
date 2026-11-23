@@ -37,6 +37,20 @@ each update.
 - Antivirus may flag unsigned builds that inject input or capture the
   screen. If it does, the user allows Glass once. We never try to evade
   detection.
+  - It happened: Windows Defender removed Glass.exe during an m4-test1
+    session, as "severe". The user restored it.
+  - Since m4-test3 both exes carry version information (product,
+    description, version, build). Unsigned programs without any score worse
+    with Defender's machine learning.
+  - The service's privileged code (token duplication, starting processes in
+    another session, named pipes) is only in glass-cli.exe. The release
+    linker leaves it out of Glass.exe, whose imports were checked with
+    dumpbin. Glass.exe keeps only what remote desktop needs: input
+    injection, the keyboard hook, following the secure desktop, the
+    clipboard, and the service's state.
+  - Sessions write a running log every 10 s
+    (`%LOCALAPPDATA%\Glass\logs`), so a killed session still leaves its
+    numbers.
 
 **Both**
 - Check every new feature against this ADR before choosing an approach. If

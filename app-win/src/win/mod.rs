@@ -24,6 +24,7 @@ mod mdns;
 mod pipe;
 mod present;
 pub mod service;
+mod slog;
 mod stats_box;
 mod vfiles;
 pub mod viewer;
@@ -925,6 +926,8 @@ fn run_session<V: ViewerLink>(
         clip::ClipSync::start(s.clip_link(), false)
     });
     let t0 = clock::now_us();
+    let log = session.counters().map(|_| slog::SessionLog::start("host"));
+    let mut next_log = t0 + slog::EVERY_US;
     let mut pending_idr = true;
     if let Some(frame) = first.take().filter(|f| f.size == (w, h)) {
         // Encoded now and kept as the last frame; the keyframe the viewer
@@ -941,6 +944,19 @@ fn run_session<V: ViewerLink>(
         && !end.load(Ordering::Relaxed)
     {
         cap.wait(5);
+        // The running log (in-app host: if Glass is killed, its numbers so
+        // far are still there; m4-test1).
+        if let Some(log) = &log {
+            let now = clock::now_us();
+            if now >= next_log {
+                next_log = now + slog::EVERY_US;
+                log.write(&format!(
+                    "{}\n{}",
+                    crate::banner(),
+                    host_report(session, &run, a, cap, t0, clip_here, None)
+                ));
+            }
+        }
         pending_idr |= session.take_keyframe_request();
         // The viewer switched colour (4:2:0 <-> 4:4:4); view modes need a
         // virtual display, which a PC host doesn't have yet (M7).
@@ -1040,15 +1056,60 @@ fn run_session<V: ViewerLink>(
             })?;
         }
     }
+    let r = host_report(
+        session,
+        &run,
+        a,
+        cap,
+        t0,
+        clip_here,
+        Some(run.error.as_deref().unwrap_or("viewer left")),
+    );
+    if let Some(log) = &log {
+        log.write(&format!(
+            "{}
+{r}",
+            crate::banner()
+        ));
+    }
+    if let Some(since) = blocked_since {
+        run.blocked_us += clock::now_us() - since;
+    }
+    Ok((r, run.blocked_by, run.blocked_us))
+}
+
+/// A session's results so far: at the end (`ended`: why), or for the
+/// running log while it's on.
+#[allow(clippy::too_many_arguments)]
+fn host_report<V: ViewerLink>(
+    session: &V,
+    run: &HostRun,
+    a: &Args,
+    cap: &capture::Capture,
+    t0: u64,
+    clip_here: bool,
+    ended: Option<&str>,
+) -> String {
     let secs = (clock::now_us() - t0) as f64 / 1e6;
     let mut r = String::new();
-    let _ = writeln!(
-        r,
-        "Session with {} ended after {:.1} s ({})",
-        session.peer(),
-        secs,
-        run.error.as_deref().unwrap_or("viewer left")
-    );
+    match ended {
+        Some(why) => {
+            let _ = writeln!(
+                r,
+                "Session with {} ended after {:.1} s ({why})",
+                session.peer(),
+                secs
+            );
+        }
+        None => {
+            let _ = writeln!(
+                r,
+                "Session with {}, still on after {:.1} s (written every 10 s)",
+                session.peer(),
+                secs
+            );
+        }
+    }
     if let Some(c) = session.counters() {
         let _ = writeln!(
             r,
@@ -1111,8 +1172,5 @@ fn run_session<V: ViewerLink>(
             cap.desktop_switches()
         );
     }
-    if let Some(since) = blocked_since {
-        run.blocked_us += clock::now_us() - since;
-    }
-    Ok((r, run.blocked_by, run.blocked_us))
+    r
 }

@@ -10,6 +10,17 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M4 test 3 (FEC, the loss fix, logs)
+If Windows Defender removes Glass.exe again: Windows Security > Virus &
+threat protection > Protection history > the entry > Actions > Allow on
+device. It's unsigned (ADR 0008). Each build is new to Defender.
+1. As M4 test 1 below, including a YouTube video from QUIETPC on QUIETPC22.
+2. Glass.exe > right-click > Properties > Details now says "Glass remote
+   desktop", version 0.0.1 (m4-test3).
+3. While a session runs, `%LOCALAPPDATA%\Glass\logs` gets a `viewer-…txt`
+   (and `host-…txt` when Glass.exe shares) that updates every 10 s.
+   Settings > Session results shows the newest one after Glass restarts.
+
 ## M4 test 1 (FEC: lost packets rebuilt)
 Protocol v10: update all three machines, and the service on QUIETPC.
 1. View QUIETPC from QUIETPC22, and the Mac from QUIETPC22, for a few

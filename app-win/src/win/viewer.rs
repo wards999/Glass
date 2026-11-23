@@ -466,16 +466,35 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         .store((w as u64) << 32 | h as u64, Ordering::Relaxed);
 
     let report = Arc::new(Mutex::new(Report::default()));
+    // The results so far, rewritten every 10 s while the session is on, so
+    // an abrupt end still leaves them (m4-test1).
+    let head = Arc::new(ReportHead {
+        banner: banner.to_string(),
+        gpu: gpu.name.clone(),
+        display: display.clone(),
+        hello,
+        started,
+    });
+    let log = Arc::new(super::slog::SessionLog::start("viewer"));
     let render = {
         let sh = sh.clone();
         let report = report.clone();
+        let (head, log) = (head.clone(), log.clone());
         let device = gpu.device.clone();
         let raw = hwnd.0 as isize;
         let seconds = opts.seconds;
         std::thread::spawn(move || {
             let hwnd = HWND(raw as *mut _);
             let mut r = Report::default();
-            if let Err(e) = render_loop(&sh, &device, hwnd, &mut r, seconds) {
+            let running = |r: &Report| {
+                log.write(&session_report(
+                    &sh,
+                    r,
+                    &head,
+                    "still on; written every 10 s",
+                ))
+            };
+            if let Err(e) = render_loop(&sh, &device, hwnd, &mut r, seconds, &running) {
                 sh.end(&format!("error: {e}"));
             }
             *report.lock().unwrap_or_else(|e| e.into_inner()) = r;
@@ -508,25 +527,40 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         }
     }
 
-    // Report.
-    let secs = (clock::now_us() - started) as f64 / 1e6;
-    let st = sh.client.stats();
-    let r = report.lock().unwrap_or_else(|e| e.into_inner());
     let reason = sh
         .reason
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_else(|| "viewer closed".into());
+    let r = report.lock().unwrap_or_else(|e| e.into_inner());
+    let out = session_report(&sh, &r, &head, &format!("ended: {reason}"));
+    log.write(&out);
+    Ok((out, sh.mode.load(Ordering::Relaxed)))
+}
+
+/// What a session's results say about the viewer, besides its stats.
+struct ReportHead {
+    banner: String,
+    gpu: String,
+    display: String,
+    hello: ViewerHello,
+    started: u64,
+}
+
+/// The session's results so far (at the end, or for the running log).
+fn session_report(sh: &Shared, r: &Report, head: &ReportHead, reason: &str) -> String {
+    let secs = (clock::now_us() - head.started) as f64 / 1e6;
+    let st = sh.client.stats();
     let host = sh.client.host();
     let info = sh.client.info();
     let mut out = String::new();
     use std::fmt::Write;
-    let _ = writeln!(out, "{banner}");
-    let _ = writeln!(out, "PC: {} | display {display}", gpu.name);
+    let _ = writeln!(out, "{}", head.banner);
+    let _ = writeln!(out, "PC: {} | display {}", head.gpu, head.display);
     let _ = writeln!(
         out,
-        "Live: {} {}:{} (paired, encrypted)  {}x{} @ {} Hz HEVC {}, {secs:.1} s (ended: {reason})",
+        "Live: {} {}:{} (paired, encrypted)  {}x{} @ {} Hz HEVC {}, {secs:.1} s ({reason})",
         sh.client.peer().name,
         host.ip(),
         host.port(),
@@ -609,7 +643,7 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         out,
         "  shown: {} | 4:4:4 decode on this PC: {} | present timing: {}",
         r.views.join(" -> "),
-        if hello.caps & CAP_HEVC_444 == 0 {
+        if head.hello.caps & CAP_HEVC_444 == 0 {
             "no"
         } else if sh.can_444.load(Ordering::Relaxed) {
             "yes (NVDEC)"
@@ -643,7 +677,7 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
     ] {
         let _ = writeln!(out, "{}", line(name, &s.summary()));
     }
-    Ok((out, sh.mode.load(Ordering::Relaxed)))
+    out
 }
 
 /// The decoder for the current stream: D3D11VA (4:2:0), or NVDEC (4:4:4).
@@ -837,6 +871,7 @@ fn render_loop(
     hwnd: HWND,
     r: &mut Report,
     seconds: Option<f64>,
+    running: &dyn Fn(&Report),
 ) -> Res<()> {
     let c = &sh.client;
     let make = |info: &glass_core::protocol::StreamInfo| -> Res<Dec> {
@@ -859,6 +894,7 @@ fn render_loop(
     let mut stats_failures = 0u32;
     let end = seconds.map(|s| clock::now_us() + (s * 1e6) as u64);
     let mut next_stats = 0u64;
+    let mut next_log = 0u64;
     let mut rates = Rates::default();
     // Frames that queued up while the window and decoder were being made
     // are stale: drop them and start from a fresh keyframe.
@@ -1001,6 +1037,10 @@ fn render_loop(
 
         // The on-screen stats, four times a second while they're shown.
         let now = clock::now_us();
+        if now >= next_log {
+            next_log = now + super::slog::EVERY_US;
+            running(r);
+        }
         if now >= next_stats && sh.show_stats.load(Ordering::Relaxed) {
             next_stats = now + 250_000;
             let text = overlay_text(sh, r, &info, &dec, &mut rates, now);

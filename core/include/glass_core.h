@@ -197,10 +197,34 @@
 #define GLASS_FEC_GROUP_MAX 64
 
 /**
+ * Frames are resent only this long after they were first sent (µs): past
+ * that the viewer has given up on them anyway.
+ */
+#define GLASS_RESEND_MAX_AGE_US 150000
+
+/**
  * The loss to protect against before the viewer has said how lossy the
  * link is.
  */
 #define GLASS_FEC_LOSS_START 0.02
+
+/**
+ * NACK timing (M4, ADR 0021). An incomplete frame is stalled, and asked
+ * for, once a newer frame's packets arrive or none of its own came for
+ * [`NACK_IDLE_US`]. It's asked for again every round trip and a half (at
+ * least [`NACK_RETRY_MIN_US`]), and given up (lost: wait for a keyframe)
+ * four round trips plus 10 ms after the first ask, within
+ * [`NACK_GIVE_UP_MIN_US`]..[`NACK_GIVE_UP_MAX_US`]. Newer frames wait
+ * meanwhile, so a recovered frame costs a few ms of delay instead of a
+ * keyframe's hitch.
+ */
+#define GLASS_NACK_IDLE_US 3000
+
+#define GLASS_NACK_RETRY_MIN_US 4000
+
+#define GLASS_NACK_GIVE_UP_MIN_US 20000
+
+#define GLASS_NACK_GIVE_UP_MAX_US 60000
 
 #define GLASS_PIN_LIFETIME_US 120000000
 
@@ -218,7 +242,7 @@
  * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
  * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 10
+#define GLASS_PROTOCOL_VERSION 11
 
 /**
  * Most "seen by" ids a `Hello` carries (no-loop rule).
@@ -260,7 +284,20 @@
  */
 #define GLASS_FLAG_REFINEMENT (1 << 1)
 
+/**
+ * This packet is a resend, asked for with a [`Nack`] (M4). Not part of the
+ * frame's flags.
+ */
+#define GLASS_FLAG_RESENT (1 << 2)
+
 #define GLASS_PUNCH_SIZE 8
+
+/**
+ * At most this many packet indices in one NACK.
+ */
+#define GLASS_NACK_MAX 128
+
+#define GLASS_NACK_HEADER 13
 
 /**
  * View modes (viewer's choice; the host may fall back to `MODE_HOST_SCREEN`).
@@ -692,6 +729,13 @@ typedef struct {
    */
   uint64_t data_expected;
   uint64_t data_missing;
+  /**
+   * NACKs sent, resent packets that came and were used, and frames
+   * completed after a NACK (M4).
+   */
+  uint64_t nacks;
+  uint64_t resent;
+  uint64_t frames_nacked;
 } GLASS_ReassemblyStats;
 
 /**
@@ -856,6 +900,11 @@ typedef struct {
    * follows it).
    */
   uint32_t loss_ppm;
+  /**
+   * NACKs from the viewer, and data packets resent for them (M4).
+   */
+  uint64_t nacks;
+  uint64_t packets_resent;
 } GLASS_HostCounters;
 
 /**

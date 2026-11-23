@@ -594,9 +594,12 @@ fn session_report(sh: &Shared, r: &Report, head: &ReportHead, reason: &str) -> S
     );
     let _ = writeln!(
         out,
-        "  FEC (M4): rebuilt {} lost packets in {} frames | packet loss seen {:.2}%",
+        "  FEC (M4): rebuilt {} lost packets in {} frames | NACK: {} asks, {} packets resent, {} frames saved | packet loss seen {:.2}%",
         st.rx.recovered,
         st.rx.frames_recovered,
+        st.rx.nacks,
+        st.rx.resent,
+        st.rx.frames_nacked,
         st.rx.data_missing as f64 * 100.0 / st.rx.data_expected.max(1) as f64
     );
     let _ = writeln!(

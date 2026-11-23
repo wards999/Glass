@@ -9,7 +9,7 @@
 /// announces new stream parameters mid-session (`StreamChange`).
 /// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
 /// datagrams. v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 10;
+pub const PROTOCOL_VERSION: u8 = 11;
 
 /// Most "seen by" ids a `Hello` carries (no-loop rule).
 pub const MAX_SEEN_BY: usize = 8;
@@ -32,6 +32,9 @@ pub const DEFAULT_PORT: u16 = 47800;
 pub const FLAG_IDR: u8 = 1 << 0;
 /// Frame is a still-region refinement update.
 pub const FLAG_REFINEMENT: u8 = 1 << 1;
+/// This packet is a resend, asked for with a [`Nack`] (M4). Not part of the
+/// frame's flags.
+pub const FLAG_RESENT: u8 = 1 << 2;
 
 /// Header at the start of every video packet. Fixed size, big-endian.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -178,6 +181,67 @@ pub fn decode_punch(b: &[u8]) -> Option<u32> {
         return None;
     }
     Some(u32::from_be_bytes(b[4..8].try_into().ok()?))
+}
+
+/// UDP datagram viewer -> host asking for a frame's missing data packets
+/// again (M4 NACK): `"GLNK"`, session id u32, frame id u32, count u8, then
+/// `count` packet indices (u16). No indices: every data packet of the frame
+/// (none of it came). Sealed with the viewer's key, like input.
+pub const NACK_MAGIC: [u8; 4] = *b"GLNK";
+/// At most this many packet indices in one NACK.
+pub const NACK_MAX: usize = 128;
+pub const NACK_HEADER: usize = 13;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nack<'a> {
+    pub session_id: u32,
+    pub frame_id: u32,
+    /// Big-endian u16 packet indices (`count * 2` bytes).
+    indices: &'a [u8],
+}
+
+impl Nack<'_> {
+    /// Writes a NACK into `out` (at least `NACK_HEADER + 2 * NACK_MAX`
+    /// bytes); returns its length. Indices past [`NACK_MAX`] are left out.
+    pub fn encode(session_id: u32, frame_id: u32, indices: &[u16], out: &mut [u8]) -> usize {
+        let n = indices.len().min(NACK_MAX);
+        out[0..4].copy_from_slice(&NACK_MAGIC);
+        out[4..8].copy_from_slice(&session_id.to_be_bytes());
+        out[8..12].copy_from_slice(&frame_id.to_be_bytes());
+        out[12] = n as u8;
+        for (i, ix) in indices[..n].iter().enumerate() {
+            out[NACK_HEADER + 2 * i..NACK_HEADER + 2 * i + 2].copy_from_slice(&ix.to_be_bytes());
+        }
+        NACK_HEADER + 2 * n
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Nack<'_>> {
+        if b.len() < NACK_HEADER || b[0..4] != NACK_MAGIC {
+            return None;
+        }
+        let n = b[12] as usize;
+        if n > NACK_MAX || b.len() != NACK_HEADER + 2 * n {
+            return None;
+        }
+        Some(Nack {
+            session_id: u32::from_be_bytes(b[4..8].try_into().ok()?),
+            frame_id: u32::from_be_bytes(b[8..12].try_into().ok()?),
+            indices: &b[NACK_HEADER..],
+        })
+    }
+
+    /// The packet indices asked for (empty: the whole frame).
+    pub fn indices(&self) -> impl Iterator<Item = u16> + '_ {
+        self.indices
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes(*c))
+    }
+
+    pub fn whole_frame(&self) -> bool {
+        self.indices.is_empty()
+    }
 }
 
 /// Stream description sent by the host in [`Control::Welcome`].
@@ -798,6 +862,24 @@ impl<'a> Message<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nack_round_trip() {
+        let mut b = [0u8; NACK_HEADER + 2 * NACK_MAX];
+        let n = Nack::encode(7, 0xDEAD_BEEF, &[3, 900, 65_000], &mut b);
+        let k = Nack::decode(&b[..n]).unwrap();
+        assert_eq!((k.session_id, k.frame_id), (7, 0xDEAD_BEEF));
+        assert_eq!(k.indices().collect::<Vec<_>>(), vec![3, 900, 65_000]);
+        assert!(!k.whole_frame());
+        let n = Nack::encode(7, 1, &[], &mut b);
+        assert!(Nack::decode(&b[..n]).unwrap().whole_frame());
+        // Too many indices are cut to NACK_MAX; bad lengths are refused.
+        let many: Vec<u16> = (0..300).collect();
+        let n = Nack::encode(7, 1, &many, &mut b);
+        assert_eq!(Nack::decode(&b[..n]).unwrap().indices().count(), NACK_MAX);
+        assert!(Nack::decode(&b[..n - 1]).is_none());
+        assert!(decode_punch(&b[..8]).is_none());
+    }
 
     #[test]
     fn control_round_trip() {

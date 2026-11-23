@@ -13,11 +13,25 @@
 //! exactly as the host does (up fast, down slowly), or protects against a
 //! fixed loss with `--assume P`.
 //!
+//! Each scenario runs twice: FEC alone, and FEC with NACKs (M4 step 2). The
+//! NACK run keeps time: packets take [`ONE_WAY_US`] each way, so a NACK and
+//! its resends cost a round trip, and NACKs and resends can be lost too.
+//! It reports how much later than "on time" the frames were handed out.
+//!
 //! `losssim` prints a table of scenarios. `losssim --check` exits non-zero
-//! unless 5% random loss loses no frame (CLAUDE.md).
+//! unless 5% random loss loses no frame (CLAUDE.md), with FEC alone and
+//! with NACKs.
 
 use glass_core::packet::{OutFrame, Packetiser, Reassembler, MAX_PAYLOAD};
 use glass_core::protocol::FLAG_IDR;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
+/// One-way network time (µs): a 4 ms round trip, typical Wi-Fi.
+const ONE_WAY_US: u64 = 2_000;
+/// Gap between a frame's packets on the wire (µs).
+const PACKET_GAP_US: u64 = 20;
+const FRAME_US: u64 = 16_667;
 
 /// A small fast PRNG (xorshift), seeded so runs repeat.
 struct Rng(u64);
@@ -58,6 +72,11 @@ impl Loss {
 struct Outcome {
     frames: u32,
     lost: u32,
+    nacks: u64,
+    resent: u64,
+    /// How much later than on time frames were handed out (µs): p99, max.
+    late_p99: u64,
+    late_max: u64,
     recovered: u64,
     data_missing: u64,
     data_expected: u64,
@@ -65,12 +84,24 @@ struct Outcome {
     data: u64,
 }
 
+enum Event {
+    /// A datagram reaches the viewer.
+    Packet(Vec<u8>),
+    /// A NACK reaches the host.
+    Nack(u32, Vec<u16>),
+}
+
 /// One run: `frames` frames at 60 fps (a keyframe every 2 s, the rest small
-/// P-frames of varying size).
-fn run(loss: Loss, frames: u32, fixed_fec: Option<f32>, seed: u64) -> Outcome {
+/// P-frames of varying size), with NACKs or FEC alone.
+fn run(loss: Loss, frames: u32, fixed_fec: Option<f32>, seed: u64, nack: bool) -> Outcome {
     let mut rng = Rng(seed);
     let mut tx = Packetiser::default();
-    let mut rx = Reassembler::new();
+    let mut rx = if nack {
+        Reassembler::new()
+    } else {
+        Reassembler::without_nack()
+    };
+    rx.set_rtt(2 * ONE_WAY_US as u32);
     let mut bad_state = false;
     let mut lost_now = |rng: &mut Rng| -> bool {
         match loss {
@@ -83,8 +114,80 @@ fn run(loss: Loss, frames: u32, fixed_fec: Option<f32>, seed: u64) -> Outcome {
     };
     let (mut loss_ewma, mut last) = (0.0f32, (0u64, 0u64));
     let (mut parity, mut data) = (0u64, 0u64);
-    let mut payload = vec![0u8; 400 * MAX_PAYLOAD];
-    for id in 0..frames {
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    // When each frame was "on time": its last packet sent plus one way.
+    let mut due: Vec<u64> = Vec::new();
+    let mut late: Vec<u64> = Vec::new();
+    let mut events: BinaryHeap<Reverse<(u64, u64)>> = BinaryHeap::new();
+    let mut bodies: std::collections::HashMap<u64, Event> = Default::default();
+    let mut seq = 0u64;
+    let mut push_event = |events: &mut BinaryHeap<Reverse<(u64, u64)>>,
+                          bodies: &mut std::collections::HashMap<u64, Event>,
+                          t: u64,
+                          e: Event| {
+        seq += 1;
+        events.push(Reverse((t, seq)));
+        bodies.insert(seq, e);
+    };
+    for id in 0..frames + 6 {
+        let t0 = id as u64 * FRAME_US;
+        // Everything up to this frame's send time, the viewer waking every
+        // 2 ms while a frame is incomplete.
+        let mut wake = None::<u64>;
+        loop {
+            let next_ev = events.peek().map(|Reverse((t, _))| *t);
+            let t = match (next_ev, wake) {
+                (Some(e), Some(w)) => e.min(w),
+                (Some(e), None) => e,
+                (None, Some(w)) => w,
+                (None, None) => break,
+            };
+            if t >= t0 {
+                break;
+            }
+            if next_ev == Some(t) {
+                let Reverse((_, k)) = events.pop().unwrap();
+                match bodies.remove(&k).unwrap() {
+                    Event::Packet(p) => rx.push(&p, t),
+                    Event::Nack(fid, ix) => {
+                        let mut out = Vec::new();
+                        tx.resend(fid, ix.into_iter(), t, |p| {
+                            out.push(p.to_vec());
+                            Ok(())
+                        })
+                        .unwrap();
+                        for (j, p) in out.into_iter().enumerate() {
+                            if !lost_now(&mut rng) {
+                                let at = t + ONE_WAY_US + j as u64 * PACKET_GAP_US;
+                                push_event(&mut events, &mut bodies, at, Event::Packet(p));
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            let mut asked = Vec::new();
+            rx.poll(t, |fid, ix| asked.push((fid, ix.to_vec())));
+            for (fid, ix) in asked {
+                if !lost_now(&mut rng) {
+                    push_event(
+                        &mut events,
+                        &mut bodies,
+                        t + ONE_WAY_US,
+                        Event::Nack(fid, ix),
+                    );
+                }
+            }
+            while let Some(got) = rx.pop(t) {
+                let i = got.frame_id as usize;
+                assert_eq!(got.data, &payloads[i][..], "frame {i} came back wrong");
+                late.push(t.saturating_sub(due[i]));
+            }
+            wake = rx.pending().then_some(t + 2_000);
+        }
+        if id >= frames {
+            continue; // let the last frames finish
+        }
         // Every 15 frames (0.25 s), the receiver's report, as the host sees it.
         if id % 15 == 0 {
             let (e, m) = (
@@ -106,23 +209,24 @@ fn run(loss: Loss, frames: u32, fixed_fec: Option<f32>, seed: u64) -> Outcome {
             2 + (rng.next() % 30) as usize
         };
         let len = packets * MAX_PAYLOAD - 20;
-        for (i, b) in payload[..len].iter_mut().enumerate() {
-            *b = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(id) as u8;
-        }
+        let payload: Vec<u8> = (0..len)
+            .map(|i| (i as u32).wrapping_mul(2_654_435_761).wrapping_add(id) as u8)
+            .collect();
         let f = OutFrame {
             frame_id: id,
             flags: if idr { FLAG_IDR } else { 0 },
-            capture_ts_us: id as u64 * 16_667,
+            capture_ts_us: t0,
             encode_us: 5_000,
             input_seq: 0,
         };
         let mut wire: Vec<Vec<u8>> = Vec::new();
         let n = tx
-            .send_frame(&f, &payload[..len], |p| {
+            .send_frame(&f, &payload, t0, |p| {
                 wire.push(p.to_vec());
                 Ok(())
             })
             .expect("packetise");
+        payloads.push(payload);
         data += n as u64;
         parity += wire.len() as u64 - n as u64;
         // A little reordering, as Wi-Fi aggregation does.
@@ -131,18 +235,24 @@ fn run(loss: Loss, frames: u32, fixed_fec: Option<f32>, seed: u64) -> Outcome {
                 wire.swap(i, i + 1);
             }
         }
-        for p in wire {
+        due.push(t0 + ONE_WAY_US + wire.len() as u64 * PACKET_GAP_US);
+        for (j, p) in wire.into_iter().enumerate() {
             if lost_now(&mut rng) {
                 continue;
             }
-            if let Some(got) = rx.push(&p, id as u64 * 16_667) {
-                assert_eq!(got.data, &payload[..len], "frame {id} came back wrong");
-            }
+            let at = t0 + ONE_WAY_US + j as u64 * PACKET_GAP_US;
+            push_event(&mut events, &mut bodies, at, Event::Packet(p));
         }
     }
+    late.sort_unstable();
+    let p99 = late.get(late.len() * 99 / 100).copied().unwrap_or(0);
     Outcome {
         frames,
         lost: rx.stats.frames_lost as u32,
+        nacks: rx.stats.nacks,
+        resent: rx.stats.resent,
+        late_p99: p99,
+        late_max: late.last().copied().unwrap_or(0),
         recovered: rx.stats.recovered,
         data_missing: rx.stats.data_missing,
         data_expected: rx.stats.data_expected,
@@ -182,22 +292,42 @@ fn main() {
         ))
     );
     println!(
-        "{:<26} {:>9} {:>14} {:>10} {:>10}",
-        "loss", "seen", "frames lost", "rebuilt", "FEC extra"
+        "{:<26} {:>7} {:>9} {:>9} | {:>9} {:>7} {:>8} {:>16}",
+        "loss", "seen", "FEC extra", "lost", "lost", "NACKs", "resent", "late p99 / max"
+    );
+    println!(
+        "{:<26} {:>7} {:>9} {:>9} | {:>9}",
+        "", "", "", "FEC only", "with NACK"
     );
     let mut failed = false;
     for (i, &loss) in scenarios.iter().enumerate() {
-        let o = run(loss, frames, fixed, 0x9E37_79B9_7F4A_7C15 ^ i as u64);
+        let seed = 0x9E37_79B9_7F4A_7C15 ^ i as u64;
+        let o = run(loss, frames, fixed, seed, false);
+        let n = run(loss, frames, fixed, seed, true);
+        let pct = |l: u32| l as f64 * 100.0 / frames as f64;
         println!(
-            "{:<26} {:>8.2}% {:>6} ({:>4.2}%) {:>10} {:>9.1}%",
+            "{:<26} {:>6.2}% {:>8.1}% {:>4} {:>3.2}% | {:>4} {:>3.2}% {:>7} {:>8} {:>6.1} / {:>4.1} ms",
             loss.name(),
             o.data_missing as f64 * 100.0 / o.data_expected.max(1) as f64,
-            o.lost,
-            o.lost as f64 * 100.0 / o.frames as f64,
-            o.recovered,
             o.parity as f64 * 100.0 / o.data as f64,
+            o.lost,
+            pct(o.lost),
+            n.lost,
+            pct(n.lost),
+            n.nacks,
+            n.resent,
+            n.late_p99 as f64 / 1e3,
+            n.late_max as f64 / 1e3,
         );
-        if matches!(loss, Loss::Random(p) if p == 0.05) && o.lost > 0 {
+        let _ = (
+            o.recovered,
+            o.frames,
+            o.late_p99,
+            o.late_max,
+            o.nacks,
+            o.resent,
+        );
+        if matches!(loss, Loss::Random(p) if p == 0.05) && (o.lost > 0 || n.lost > 0) {
             failed = true;
         }
     }

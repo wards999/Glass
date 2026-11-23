@@ -337,6 +337,9 @@ pub struct HostCounters {
     /// The viewer's latest reported packet loss, parts per million (the FEC
     /// follows it).
     pub loss_ppm: u32,
+    /// NACKs from the viewer, and data packets resent for them (M4).
+    pub nacks: u64,
+    pub packets_resent: u64,
 }
 
 /// Called on the host's UDP thread for every input action, in order.
@@ -374,17 +377,26 @@ struct HostShared {
     loss_ppm: AtomicU32,
     /// Pass the viewer's clipboard messages to a helper instead (ADR 0017).
     clip_relay: Mutex<Option<crate::clipboard::FrameWriter>>,
+    nacks: AtomicU64,
+    resent: AtomicU64,
+}
+
+/// Video out: frames from the encoder and, for NACKs, resends from the UDP
+/// thread. One sealer for both: its counter (the nonce) must never repeat.
+/// The lock is only ever contended while a NACK is being answered.
+struct VideoTx {
+    udp: UdpSocket,
+    packetiser: Packetiser,
+    sealer: Sealer,
+    wire: [u8; WIRE_MAX],
 }
 
 /// One connected viewer. Dropping it ends the session (and releases any
 /// keys/buttons the viewer was holding).
 pub struct HostSession {
     shared: Arc<HostShared>,
-    udp: UdpSocket,
     out: TlsWriter,
-    packetiser: Packetiser,
-    sealer: Sealer,
-    wire: [u8; WIRE_MAX],
+    tx: Arc<Mutex<VideoTx>>,
     counters: HostCounters,
     cursor_buf: Vec<u8>,
     pub peer_tcp: SocketAddr,
@@ -573,7 +585,15 @@ impl HostListener {
             )))),
             clip_relay: Mutex::new(None),
             loss_ppm: AtomicU32::new(0),
+            nacks: AtomicU64::new(0),
+            resent: AtomicU64::new(0),
         });
+        let tx = Arc::new(Mutex::new(VideoTx {
+            udp: self.udp.try_clone()?,
+            packetiser: Packetiser::default(),
+            sealer: Sealer::new(to_viewer, session_id),
+            wire: [0; WIRE_MAX],
+        }));
         let mut threads = Vec::new();
 
         // Control: answer pings, take keyframe requests, notice disconnects.
@@ -693,6 +713,7 @@ impl HostListener {
         let client_ip = peer_tcp.ip();
         let sh = shared.clone();
         let mut on_input = on_input;
+        let vtx = tx.clone();
         threads.push(std::thread::spawn(move || {
             let mut buf = [0u8; WIRE_MAX + 64];
             let mut opener = Opener::new(from_viewer, session_id);
@@ -715,6 +736,27 @@ impl HostListener {
                         // New destination: it needs a fresh IDR.
                         sh.keyframe.store(true, Ordering::Relaxed);
                     }
+                } else if let Some(nk) = crate::protocol::Nack::decode(d) {
+                    // Resend at once, from here: the frame sender may be
+                    // idle (a still screen) for a long time.
+                    let peer = unpack_v4(sh.peer.load(Ordering::Relaxed));
+                    if let (true, Some(peer)) = (nk.session_id == session_id, peer) {
+                        let mut t = lock(&vtx);
+                        let VideoTx {
+                            udp,
+                            packetiser,
+                            sealer,
+                            wire,
+                        } = &mut *t;
+                        let n = packetiser
+                            .resend(nk.frame_id, nk.indices(), clock::now_us(), |pkt| {
+                                let len = sealer.seal(pkt, wire);
+                                udp.send_to(&wire[..len], peer).map(|_| ())
+                            })
+                            .unwrap_or(0);
+                        sh.nacks.fetch_add(1, Ordering::Relaxed);
+                        sh.resent.fetch_add(n as u64, Ordering::Relaxed);
+                    }
                 } else if let Some(p) = InputPacket::decode(d) {
                     if p.session_id == session_id && applier.apply(&p, &mut on_input) {
                         sh.input_seq.store(applier.applied_seq, Ordering::Release);
@@ -728,11 +770,8 @@ impl HostListener {
 
         Ok(Some(HostSession {
             shared,
-            udp: self.udp.try_clone()?,
             out,
-            packetiser: Packetiser::default(),
-            sealer: Sealer::new(to_viewer, session_id),
-            wire: [0; WIRE_MAX],
+            tx,
             counters: HostCounters::default(),
             cursor_buf: Vec::with_capacity(FRAME_MAX),
             peer_tcp,
@@ -859,14 +898,18 @@ impl HostSession {
         let Some(peer) = unpack_v4(self.shared.peer.load(Ordering::Relaxed)) else {
             return Ok(false);
         };
-        let udp = &self.udp;
         let c = &mut self.counters;
-        let sealer = &mut self.sealer;
-        let wire = &mut self.wire;
+        let mut t = lock(&self.tx);
+        let VideoTx {
+            udp,
+            packetiser,
+            sealer,
+            wire,
+        } = &mut *t;
         // FEC sized to the loss the viewer reports (M4).
-        self.packetiser.fec_loss = self.shared.loss_ppm.load(Ordering::Relaxed) as f32 / 1e6;
+        packetiser.fec_loss = self.shared.loss_ppm.load(Ordering::Relaxed) as f32 / 1e6;
         let mut sent = 0u64;
-        let n = self.packetiser.send_frame(f, data, |pkt| {
+        let n = packetiser.send_frame(f, data, clock::now_us(), |pkt| {
             let len = sealer.seal(pkt, wire);
             c.bytes_sent += len as u64;
             sent += 1;
@@ -964,6 +1007,8 @@ impl HostSession {
             input: *lock(&self.shared.input),
             rejected_datagrams: self.shared.rejected.load(Ordering::Relaxed),
             loss_ppm: self.shared.loss_ppm.load(Ordering::Relaxed),
+            nacks: self.shared.nacks.load(Ordering::Relaxed),
+            packets_resent: self.shared.resent.load(Ordering::Relaxed),
             ..self.counters
         }
     }
@@ -1189,7 +1234,7 @@ struct CursorState {
 
 #[derive(Default)]
 struct AtomicRx {
-    v: [AtomicU64; 12],
+    v: [AtomicU64; 15],
 }
 
 impl AtomicRx {
@@ -1207,6 +1252,9 @@ impl AtomicRx {
             s.frames_recovered,
             s.data_expected,
             s.data_missing,
+            s.nacks,
+            s.resent,
+            s.frames_nacked,
         ];
         for (slot, v) in self.v.iter().zip(a) {
             slot.store(v, Ordering::Relaxed);
@@ -1228,6 +1276,9 @@ impl AtomicRx {
             frames_recovered: l(9),
             data_expected: l(10),
             data_missing: l(11),
+            nacks: l(12),
+            resent: l(13),
+            frames_nacked: l(14),
         }
     }
 }
@@ -1245,6 +1296,8 @@ struct InputTx {
     wire: [u8; WIRE_MAX],
     packets: u64,
     active: bool, // any input yet (no heartbeats before the first event)
+    session_id: u32,
+    nack: [u8; crate::protocol::NACK_HEADER + 2 * crate::protocol::NACK_MAX],
 }
 
 impl InputTx {
@@ -1254,6 +1307,13 @@ impl InputTx {
         let _ = self.udp.send_to(&self.wire[..len], self.dest);
         self.packets += 1;
         self.active = true;
+    }
+
+    /// Asks the host for packets of a frame again (M4).
+    fn send_nack(&mut self, frame_id: u32, indices: &[u16]) {
+        let n = crate::protocol::Nack::encode(self.session_id, frame_id, indices, &mut self.nack);
+        let len = self.sealer.seal(&self.nack[..n], &mut self.wire);
+        let _ = self.udp.send_to(&self.wire[..len], self.dest);
     }
 
     fn send_punch(&mut self) {
@@ -1506,6 +1566,8 @@ impl Client {
             dest: host_udp,
             sealer: Sealer::new(to_host, session_id),
             punch: encode_punch(session_id),
+            session_id,
+            nack: [0; crate::protocol::NACK_HEADER + 2 * crate::protocol::NACK_MAX],
             plain: [0; MAX_INPUT_DATAGRAM],
             wire: [0; WIRE_MAX],
             packets: 0,
@@ -1766,6 +1828,7 @@ fn spawn_receiver(
         let mut r = Reassembler::new();
         let mut buf = [0u8; WIRE_MAX + 64];
         let mut last_punch = clock::now_us();
+        let mut short_wait = false;
         let host_ip = std::net::IpAddr::V4(*host_udp.ip());
         while !sh.stop.load(Ordering::Relaxed) && sh.connected.load(Ordering::Relaxed) {
             let now = clock::now_us();
@@ -1778,22 +1841,32 @@ fn spawn_receiver(
                 lock(&sh.input).send_punch();
                 last_punch = now;
             }
-            let Ok((n, from)) = udp.recv_from(&mut buf) else {
-                continue;
-            };
-            if from.ip() != host_ip {
-                continue;
+            // Wake every 2 ms while a frame is incomplete: NACKs and giving
+            // up are timed (M4).
+            let short = r.pending();
+            if short != short_wait {
+                let t = if short { 2 } else { 100 };
+                let _ = udp.set_read_timeout(Some(Duration::from_millis(t)));
+                short_wait = short;
             }
-            let plain = match opener.open(&mut buf[..n]) {
-                Ok(p) => p,
-                Err(_) => {
-                    sh.crypto_bad.store(opener.stats.bad, Ordering::Relaxed);
-                    sh.crypto_replayed
-                        .store(opener.stats.replayed, Ordering::Relaxed);
-                    continue;
-                }
-            };
-            if let Some(f) = r.push(plain, clock::now_us()) {
+            r.set_rtt(sh.last_rtt.load(Ordering::Relaxed));
+            match udp.recv_from(&mut buf) {
+                Ok((n, from)) if from.ip() == host_ip => match opener.open(&mut buf[..n]) {
+                    Ok(plain) => r.push(plain, clock::now_us()),
+                    Err(_) => {
+                        sh.crypto_bad.store(opener.stats.bad, Ordering::Relaxed);
+                        sh.crypto_replayed
+                            .store(opener.stats.replayed, Ordering::Relaxed);
+                        continue;
+                    }
+                },
+                Ok(_) => continue,
+                Err(_) if !short => continue,
+                Err(_) => {}
+            }
+            let now = clock::now_us();
+            r.poll(now, |id, ix| lock(&sh.input).send_nack(id, ix));
+            while let Some(f) = r.pop(now) {
                 let meta = LiveFrameMeta {
                     frame_id: f.frame_id,
                     flags: f.flags,

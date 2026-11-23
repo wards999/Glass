@@ -15,7 +15,7 @@
 //! as it has as many of its packets as it has data packets.
 
 use crate::fec;
-use crate::protocol::{FrameInfo, VideoPacketHeader, FLAG_IDR};
+use crate::protocol::{FrameInfo, VideoPacketHeader, FLAG_IDR, FLAG_RESENT, NACK_MAX};
 use std::io;
 
 /// Whole video datagram before encryption, header included. Sealed, it's
@@ -89,12 +89,34 @@ pub fn group_size(count: usize, groups: usize, g: usize) -> usize {
     count / groups + usize::from(g < count % groups)
 }
 
-/// Cuts frames into datagrams in reusable buffers, adding FEC.
+/// Sent frames kept for resending (M4 NACK).
+const HISTORY: usize = 32;
+/// Frames are resent only this long after they were first sent (µs): past
+/// that the viewer has given up on them anyway.
+pub const RESEND_MAX_AGE_US: u64 = 150_000;
+
+/// A sent frame, kept for resends.
+#[derive(Default)]
+struct Sent {
+    used: bool,
+    f: OutFrame,
+    count: usize,
+    groups: u8,
+    m: u8,
+    /// FrameInfo plus data (the logical payload's real length).
+    total: usize,
+    logical: Vec<u8>,
+    at_us: u64,
+}
+
+/// Cuts frames into datagrams in reusable buffers, adding FEC, and keeps
+/// the last [`HISTORY`] frames to resend packets the viewer asks for.
 pub struct Packetiser {
     buf: [u8; MAX_DATAGRAM],
     /// The frame's logical payload, zero-padded to whole chunks.
     logical: Vec<u8>,
     parity: Vec<u8>,
+    history: Vec<Sent>,
     /// The packet loss to protect against (negative: no FEC); set from the
     /// viewer's reports.
     pub fec_loss: f32,
@@ -106,8 +128,29 @@ impl Default for Packetiser {
             buf: [0; MAX_DATAGRAM],
             logical: Vec::with_capacity(1 << 20),
             parity: Vec::with_capacity(1 << 18),
+            history: (0..HISTORY).map(|_| Sent::default()).collect(),
             fec_loss: FEC_LOSS_START,
         }
+    }
+}
+
+fn header(
+    f: &OutFrame,
+    flags: u8,
+    index: usize,
+    count: usize,
+    groups: u8,
+    m: u8,
+) -> VideoPacketHeader {
+    VideoPacketHeader {
+        stream_id: 0,
+        flags,
+        frame_id: f.frame_id,
+        packet_index: index as u16,
+        packet_count: count as u16,
+        fec_groups: groups,
+        fec_parity: m,
+        capture_ts_us: f.capture_ts_us,
     }
 }
 
@@ -117,11 +160,13 @@ pub const FEC_LOSS_START: f32 = 0.02;
 
 impl Packetiser {
     /// Calls `send` once per datagram: the data packets in order, then the
-    /// parity packets. Returns the number of data packets.
+    /// parity packets. Returns the number of data packets. The frame is
+    /// kept (sent at `now_us`) for [`Self::resend`].
     pub fn send_frame(
         &mut self,
         f: &OutFrame,
         data: &[u8],
+        now_us: u64,
         mut send: impl FnMut(&[u8]) -> io::Result<()>,
     ) -> io::Result<u16> {
         let count = packet_count(data.len());
@@ -148,16 +193,7 @@ impl Packetiser {
         self.logical.extend_from_slice(data);
         self.logical.resize(count * MAX_PAYLOAD, 0);
         let hs = VideoPacketHeader::SIZE;
-        let header = |index: usize| VideoPacketHeader {
-            stream_id: 0,
-            flags: f.flags,
-            frame_id: f.frame_id,
-            packet_index: index as u16,
-            packet_count: count as u16,
-            fec_groups: groups,
-            fec_parity: m,
-            capture_ts_us: f.capture_ts_us,
-        };
+        let header = |index: usize| header(f, f.flags, index, count, groups, m);
         for i in 0..count {
             let start = i * MAX_PAYLOAD;
             let end = (start + MAX_PAYLOAD).min(total);
@@ -185,7 +221,60 @@ impl Packetiser {
                 send(&self.buf[..hs + MAX_PAYLOAD])?;
             }
         }
+        // Keep it for resends: swap buffers, so nothing is copied or
+        // allocated once every slot has grown to its size.
+        let h = &mut self.history[f.frame_id as usize % HISTORY];
+        h.used = true;
+        h.f = *f;
+        h.count = count;
+        h.groups = groups;
+        h.m = m;
+        h.total = total;
+        h.at_us = now_us;
+        std::mem::swap(&mut h.logical, &mut self.logical);
         Ok(count as u16)
+    }
+
+    /// Sends data packets `indices` of frame `frame_id` again (every one if
+    /// `indices` is empty), flagged [`FLAG_RESENT`]. Returns how many went:
+    /// 0 if the frame is unknown or older than [`RESEND_MAX_AGE_US`].
+    pub fn resend(
+        &mut self,
+        frame_id: u32,
+        indices: impl Iterator<Item = u16>,
+        now_us: u64,
+        mut send: impl FnMut(&[u8]) -> io::Result<()>,
+    ) -> io::Result<usize> {
+        let h = &self.history[frame_id as usize % HISTORY];
+        if !h.used || h.f.frame_id != frame_id || now_us.saturating_sub(h.at_us) > RESEND_MAX_AGE_US
+        {
+            return Ok(0);
+        }
+        let hs = VideoPacketHeader::SIZE;
+        let mut sent = 0;
+        let mut one = |i: usize, buf: &mut [u8; MAX_DATAGRAM]| -> io::Result<()> {
+            let start = i * MAX_PAYLOAD;
+            let end = (start + MAX_PAYLOAD).min(h.total);
+            header(&h.f, h.f.flags | FLAG_RESENT, i, h.count, h.groups, h.m)
+                .encode(buf)
+                .map_err(|_| io::Error::other("header"))?;
+            buf[hs..hs + end - start].copy_from_slice(&h.logical[start..end]);
+            sent += 1;
+            send(&buf[..hs + end - start])
+        };
+        let mut any = false;
+        for i in indices {
+            any = true;
+            if (i as usize) < h.count {
+                one(i as usize, &mut self.buf)?;
+            }
+        }
+        if !any {
+            for i in 0..h.count {
+                one(i, &mut self.buf)?;
+            }
+        }
+        Ok(sent)
     }
 }
 
@@ -234,17 +323,39 @@ pub struct ReassemblyStats {
     /// them didn't arrive (rebuilt or not): the loss the host's FEC follows.
     pub data_expected: u64,
     pub data_missing: u64,
+    /// NACKs sent, resent packets that came and were used, and frames
+    /// completed after a NACK (M4).
+    pub nacks: u64,
+    pub resent: u64,
+    pub frames_nacked: u64,
 }
 
-/// Frames in flight at once. More than enough without reordering across
-/// frames (M2); M5's jitter buffer may want more.
-const SLOTS: usize = 4;
-/// Initial per-slot buffer: a 1440p IDR is ~75-210 KB; 4K scene changes more.
-const INITIAL_FRAME_CAP: usize = 1 << 20;
+/// Frames in flight at once: those arriving plus, while an older frame is
+/// being recovered with a NACK, the complete ones held behind it.
+const SLOTS: usize = 16;
+/// Initial per-slot buffer; a slot grows (once) for a bigger frame.
+const INITIAL_FRAME_CAP: usize = 256 << 10;
 const WORDS: usize = (u16::MAX as usize).div_ceil(64);
+
+/// NACK timing (M4, ADR 0021). An incomplete frame is stalled, and asked
+/// for, once a newer frame's packets arrive or none of its own came for
+/// [`NACK_IDLE_US`]. It's asked for again every round trip and a half (at
+/// least [`NACK_RETRY_MIN_US`]), and given up (lost: wait for a keyframe)
+/// four round trips plus 10 ms after the first ask, within
+/// [`NACK_GIVE_UP_MIN_US`]..[`NACK_GIVE_UP_MAX_US`]. Newer frames wait
+/// meanwhile, so a recovered frame costs a few ms of delay instead of a
+/// keyframe's hitch.
+pub const NACK_IDLE_US: u64 = 3_000;
+pub const NACK_RETRY_MIN_US: u64 = 4_000;
+pub const NACK_GIVE_UP_MIN_US: u64 = 20_000;
+pub const NACK_GIVE_UP_MAX_US: u64 = 60_000;
 
 struct Slot {
     used: bool,
+    /// False for a frame known only to be missing (none of it came yet).
+    known: bool,
+    /// Every data packet is here (or rebuilt).
+    done: bool,
     frame_id: u32,
     flags: u8,
     capture_ts_us: u64,
@@ -252,11 +363,18 @@ struct Slot {
     groups: u8,
     parity: u8,
     got: u16,
-    /// Data packets that came (before any rebuilding), for the loss report.
+    /// Data packets that came the first time (not rebuilt, not resent), for
+    /// the loss report.
     arrived: u16,
     total: usize,
     first_us: u64,
     last_us: u64,
+    /// When it was first and last asked for (0: never), and how often.
+    nack_first: u64,
+    nack_last: u64,
+    /// From FrameInfo, once accepted.
+    encode_us: u32,
+    input_seq: u32,
     bits: Vec<u64>,
     pbits: Vec<u64>,
     buf: Vec<u8>,
@@ -270,6 +388,8 @@ impl Slot {
     fn new() -> Self {
         Self {
             used: false,
+            known: false,
+            done: false,
             frame_id: 0,
             flags: 0,
             capture_ts_us: 0,
@@ -281,6 +401,10 @@ impl Slot {
             total: 0,
             first_us: 0,
             last_us: 0,
+            nack_first: 0,
+            nack_last: 0,
+            encode_us: 0,
+            input_seq: 0,
             bits: vec![0; WORDS],
             pbits: vec![0; WORDS],
             buf: vec![0; INITIAL_FRAME_CAP],
@@ -297,6 +421,38 @@ impl Slot {
     fn set(bits: &mut [u64], i: usize) {
         bits[i / 64] |= 1 << (i % 64);
     }
+
+    /// Ready for frame `h`'s packets (keeping any NACK state).
+    fn init(&mut self, h: &VideoPacketHeader, now_us: u64) {
+        let need = h.packet_count as usize * MAX_PAYLOAD;
+        if self.buf.len() < need {
+            self.buf.resize(need, 0); // rare: only frames larger than any before
+        }
+        let pneed = h.fec_groups as usize * h.fec_parity as usize * MAX_PAYLOAD;
+        if self.pbuf.len() < pneed {
+            self.pbuf.resize(pneed, 0);
+        }
+        let words = (h.packet_count as usize).div_ceil(64);
+        self.bits[..words].fill(0);
+        let pwords = (h.fec_groups as usize * h.fec_parity as usize).div_ceil(64);
+        self.pbits[..pwords].fill(0);
+        self.gdata[..h.fec_groups as usize].fill(0);
+        self.gpar[..h.fec_groups as usize].fill(0);
+        self.used = true;
+        self.known = true;
+        self.done = false;
+        self.frame_id = h.frame_id;
+        self.flags = h.flags & !FLAG_RESENT;
+        self.capture_ts_us = h.capture_ts_us;
+        self.count = h.packet_count;
+        self.groups = h.fec_groups;
+        self.parity = h.fec_parity;
+        self.got = 0;
+        self.arrived = 0;
+        self.total = 0;
+        self.first_us = now_us;
+        self.last_us = now_us;
+    }
 }
 
 /// Wrapping frame-id order: true if `a` is before `b`.
@@ -307,15 +463,24 @@ fn before(a: u32, b: u32) -> bool {
 /// Rebuilds frames from datagrams and decides which ones the decoder may see.
 ///
 /// Lost data packets are rebuilt from the frame's FEC parity as soon as a
-/// group has enough packets. HEVC P-frames depend on the previous frame, so
-/// after a frame is lost anyway the reassembler withholds frames until the
-/// next IDR ([`Self::needs_keyframe`] tells the client to ask for one).
-/// Frames are delivered in order; a frame still incomplete when a newer one
-/// completes counts as lost. LATER(M4 step 2): NACK and a reorder window.
+/// group has enough packets. What FEC can't rebuild, [`Self::poll`] asks
+/// the host for again (NACK), just as many packets as each group still
+/// needs. Frames are handed out in order by [`Self::pop`]; newer complete
+/// frames wait while an older one is being recovered. HEVC P-frames depend
+/// on the previous frame, so once a frame is given up the reassembler
+/// withholds frames until the next IDR ([`Self::needs_keyframe`] tells the
+/// client to ask for one).
 pub struct Reassembler {
     slots: Vec<Slot>,
     next_expected: Option<u32>,
+    /// The newest frame any packet came for.
+    newest: Option<u32>,
     awaiting_idr: bool,
+    /// False: no NACKs, an incomplete frame is lost as soon as a newer one
+    /// is complete (M4 step 1; losssim compares).
+    nack: bool,
+    rtt_us: u32,
+    nack_buf: Vec<u16>,
     pub stats: ReassemblyStats,
 }
 
@@ -330,9 +495,27 @@ impl Reassembler {
         Self {
             slots: (0..SLOTS).map(|_| Slot::new()).collect(),
             next_expected: None,
+            newest: None,
             awaiting_idr: true,
+            nack: true,
+            rtt_us: 0,
+            nack_buf: Vec::with_capacity(NACK_MAX),
             stats: ReassemblyStats::default(),
         }
+    }
+
+    /// Without NACKs: a frame that FEC can't complete is lost as soon as a
+    /// newer one completes.
+    pub fn without_nack() -> Self {
+        Self {
+            nack: false,
+            ..Self::new()
+        }
+    }
+
+    /// The latest round trip to the host (µs), for NACK timing.
+    pub fn set_rtt(&mut self, rtt_us: u32) {
+        self.rtt_us = rtt_us;
     }
 
     /// True while frames are being withheld until an IDR arrives.
@@ -345,28 +528,48 @@ impl Reassembler {
         self.awaiting_idr = true;
     }
 
-    /// Feeds one datagram received at `now_us`. Returns a frame when this
-    /// packet completed one that may be decoded.
-    pub fn push(&mut self, pkt: &[u8], now_us: u64) -> Option<ReceivedFrame<'_>> {
+    /// A frame is incomplete: call [`Self::poll`] and [`Self::pop`] again
+    /// within a few ms even if no packet comes.
+    pub fn pending(&self) -> bool {
+        self.slots.iter().any(|s| s.used && !s.done)
+    }
+
+    fn retry_us(&self) -> u64 {
+        (self.rtt_us as u64 * 3 / 2 + 1_000).max(NACK_RETRY_MIN_US)
+    }
+
+    fn give_up_us(&self) -> u64 {
+        (self.rtt_us as u64 * 4 + 10_000).clamp(NACK_GIVE_UP_MIN_US, NACK_GIVE_UP_MAX_US)
+    }
+
+    /// Feeds one datagram received at `now_us`. Complete frames come out of
+    /// [`Self::pop`].
+    pub fn push(&mut self, pkt: &[u8], now_us: u64) {
         let Ok(h) = VideoPacketHeader::decode(pkt) else {
             self.stats.bad += 1;
-            return None;
+            return;
         };
         let payload = &pkt[VideoPacketHeader::SIZE..];
         self.stats.packets += 1;
         self.stats.bytes += pkt.len() as u64;
+        let resent = h.flags & FLAG_RESENT != 0;
         if let Some(exp) = self.next_expected {
             if before(h.frame_id, exp) {
                 // Parity for a frame that's done (it came whole): expected.
-                // A data packet of the frame just delivered was only
-                // reordered: FEC rebuilt it first. Not lost after all, and
-                // not "late" (that slows file copies down).
-                if h.frame_id == exp.wrapping_sub(1) && !h.is_parity() {
-                    self.stats.data_missing = self.stats.data_missing.saturating_sub(1);
-                } else if !h.is_parity() {
-                    self.stats.late += 1;
+                // A data packet of a recent frame was only reordered, or
+                // resent as well: not lost, and not "late" (that slows file
+                // copies down). One of the frame just delivered that FEC
+                // rebuilt wasn't lost after all.
+                if !h.is_parity() {
+                    if h.frame_id == exp.wrapping_sub(1) && !resent {
+                        self.stats.data_missing = self.stats.data_missing.saturating_sub(1);
+                    } else if exp.wrapping_sub(h.frame_id) <= SLOTS as u32 {
+                        self.stats.duplicates += 1;
+                    } else {
+                        self.stats.late += 1;
+                    }
                 }
-                return None;
+                return;
             }
         }
         let last = h.packet_index + 1 == h.packet_count;
@@ -375,9 +578,12 @@ impl Reassembler {
         } else {
             payload.len() <= MAX_PAYLOAD
         };
-        if !size_ok {
+        if !size_ok || (resent && h.is_parity()) {
             self.stats.bad += 1;
-            return None;
+            return;
+        }
+        if self.newest.is_none_or(|n| before(n, h.frame_id)) {
+            self.newest = Some(h.frame_id);
         }
 
         let si = match self
@@ -385,20 +591,42 @@ impl Reassembler {
             .iter()
             .position(|s| s.used && s.frame_id == h.frame_id)
         {
-            Some(i) => i,
-            None => self.claim_slot(&h, now_us),
+            Some(i) => {
+                if !self.slots[i].known {
+                    self.slots[i].init(&h, now_us);
+                }
+                i
+            }
+            None => {
+                let Some(i) = self.claim_slot() else {
+                    return;
+                };
+                // Evicting may have given up on this very frame.
+                if self.next_expected.is_some_and(|e| before(h.frame_id, e)) {
+                    return;
+                }
+                let s = &mut self.slots[i];
+                s.nack_first = 0;
+                s.nack_last = 0;
+                s.init(&h, now_us);
+                i
+            }
         };
         let s = &mut self.slots[si];
         if s.count != h.packet_count || s.groups != h.fec_groups || s.parity != h.fec_parity {
             self.stats.bad += 1;
-            return None;
+            return;
+        }
+        if s.done {
+            self.stats.duplicates += 1;
+            return;
         }
         let groups = s.groups as usize;
         let group = if h.is_parity() {
             let pi = (h.packet_index - h.packet_count) as usize;
             if Slot::has(&s.pbits, pi) {
                 self.stats.duplicates += 1;
-                return None;
+                return;
             }
             Slot::set(&mut s.pbits, pi);
             s.pbuf[pi * MAX_PAYLOAD..(pi + 1) * MAX_PAYLOAD].copy_from_slice(payload);
@@ -409,7 +637,7 @@ impl Reassembler {
             let i = h.packet_index as usize;
             if Slot::has(&s.bits, i) {
                 self.stats.duplicates += 1;
-                return None;
+                return;
             }
             Slot::set(&mut s.bits, i);
             let off = i * MAX_PAYLOAD;
@@ -420,7 +648,11 @@ impl Reassembler {
                 s.buf[off + payload.len()..off + MAX_PAYLOAD].fill(0);
             }
             s.got += 1;
-            s.arrived += 1;
+            if resent {
+                self.stats.resent += 1;
+            } else {
+                s.arrived += 1;
+            }
             if groups > 0 {
                 s.gdata[i % groups] += 1;
             }
@@ -430,10 +662,270 @@ impl Reassembler {
         if let Some(g) = group {
             Self::try_rebuild(s, g, &mut self.stats);
         }
-        if s.got < s.count {
-            return None;
+        if s.got >= s.count {
+            s.done = true;
         }
-        self.complete(si)
+    }
+
+    /// Asks for what stalled frames still need: `nack(frame_id, indices)`
+    /// (no indices: the whole frame, none of it came). Call after each
+    /// packet and every few ms while [`Self::pending`].
+    pub fn poll(&mut self, now_us: u64, mut nack: impl FnMut(u32, &[u16])) {
+        if !self.nack || self.awaiting_idr {
+            return; // nothing worth recovering: a keyframe is needed anyway
+        }
+        let (Some(exp), Some(newest)) = (self.next_expected, self.newest) else {
+            return;
+        };
+        // Frames that never showed at all, between the next one due and the
+        // newest: placeholders, so they're asked for (and timed) too.
+        let mut id = exp;
+        for _ in 0..SLOTS {
+            if !before(id, newest) {
+                break;
+            }
+            if !self.slots.iter().any(|s| s.used && s.frame_id == id) {
+                let Some(i) = self.slots.iter().position(|s| !s.used) else {
+                    break;
+                };
+                let s = &mut self.slots[i];
+                s.used = true;
+                s.known = false;
+                s.done = false;
+                s.frame_id = id;
+                s.count = 0;
+                s.arrived = 0;
+                s.first_us = now_us;
+                s.last_us = now_us;
+                s.nack_first = 0;
+                s.nack_last = 0;
+            }
+            id = id.wrapping_add(1);
+        }
+        let retry = self.retry_us();
+        for s in &mut self.slots {
+            if !s.used || s.done || before(s.frame_id, exp) {
+                continue;
+            }
+            let stalled =
+                before(s.frame_id, newest) || now_us.saturating_sub(s.last_us) >= NACK_IDLE_US;
+            if !stalled || (s.nack_last != 0 && now_us.saturating_sub(s.nack_last) < retry) {
+                continue;
+            }
+            self.nack_buf.clear();
+            if s.known {
+                let (count, groups) = (s.count as usize, s.groups as usize);
+                if groups == 0 {
+                    self.nack_buf.extend(
+                        (0..count)
+                            .filter(|&i| !Slot::has(&s.bits, i))
+                            .map(|i| i as u16)
+                            .take(NACK_MAX),
+                    );
+                } else {
+                    // Per group, only as many as FEC still lacks.
+                    for g in 0..groups {
+                        let k = group_size(count, groups, g);
+                        let have = s.gdata[g] as usize + s.gpar[g] as usize;
+                        let need = k.saturating_sub(have);
+                        let room = NACK_MAX - self.nack_buf.len();
+                        self.nack_buf.extend(
+                            (g..count)
+                                .step_by(groups)
+                                .filter(|&i| !Slot::has(&s.bits, i))
+                                .map(|i| i as u16)
+                                .take(need.min(room)),
+                        );
+                    }
+                }
+                if self.nack_buf.is_empty() {
+                    continue;
+                }
+            }
+            nack(s.frame_id, &self.nack_buf);
+            self.stats.nacks += 1;
+            s.nack_last = now_us;
+            if s.nack_first == 0 {
+                s.nack_first = now_us;
+            }
+        }
+    }
+
+    /// The next frame the decoder may have, if it's here. Call until `None`
+    /// after [`Self::push`] / [`Self::poll`].
+    pub fn pop(&mut self, now_us: u64) -> Option<ReceivedFrame<'_>> {
+        let si = loop {
+            let Some(exp) = self.next_expected else {
+                // Start-up: the oldest complete frame; anything older is
+                // dropped.
+                let si = self.oldest(|s| s.done)?;
+                let id = self.slots[si].frame_id;
+                for s in &mut self.slots {
+                    if s.used && before(s.frame_id, id) {
+                        s.used = false;
+                    }
+                }
+                if self.accept(si) {
+                    break si;
+                }
+                continue;
+            };
+            if let Some(si) = self
+                .slots
+                .iter()
+                .position(|s| s.used && s.done && s.frame_id == exp)
+            {
+                if self.accept(si) {
+                    break si;
+                }
+                continue;
+            }
+            // The next frame isn't here. A newer keyframe makes it moot.
+            if let Some(si) = self.oldest(|s| s.done && s.flags & FLAG_IDR != 0) {
+                let id = self.slots[si].frame_id;
+                if before(exp, id) {
+                    self.give_up_through(id.wrapping_sub(1));
+                    continue;
+                }
+            }
+            let newer_done = self
+                .slots
+                .iter()
+                .any(|s| s.used && s.done && before(exp, s.frame_id));
+            let give_up = if !self.nack || self.awaiting_idr {
+                newer_done
+            } else {
+                let deadline = self.give_up_us();
+                self.slots.iter().any(|s| {
+                    s.used
+                        && s.frame_id == exp
+                        && s.nack_first != 0
+                        && now_us.saturating_sub(s.nack_first) >= deadline
+                })
+            };
+            if give_up {
+                self.give_up_through(exp);
+                continue;
+            }
+            return None;
+        };
+        let s = &self.slots[si];
+        Some(ReceivedFrame {
+            frame_id: s.frame_id,
+            flags: s.flags,
+            capture_ts_us: s.capture_ts_us,
+            encode_us: s.encode_us,
+            input_seq: s.input_seq,
+            first_packet_us: s.first_us,
+            last_packet_us: s.last_us,
+            packets: s.count,
+            data: &s.buf[FrameInfo::SIZE..s.total],
+        })
+    }
+
+    /// The used slot with the oldest frame among those `f` picks.
+    fn oldest(&self, f: impl Fn(&Slot) -> bool) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (i, s) in self.slots.iter().enumerate() {
+            if s.used && f(s) && best.is_none_or(|b| before(s.frame_id, self.slots[b].frame_id)) {
+                best = Some(i);
+            }
+        }
+        best
+    }
+
+    /// Frees a slot, counting its data packets for the loss report.
+    fn release(&mut self, si: usize) {
+        let s = &mut self.slots[si];
+        if s.known {
+            self.stats.data_expected += s.count as u64;
+            self.stats.data_missing += (s.count - s.arrived) as u64;
+        }
+        s.used = false;
+    }
+
+    /// Every frame up to `id` is lost (or, if complete, useless after one
+    /// that's lost): wait for a keyframe.
+    fn give_up_through(&mut self, id: u32) {
+        let exp = self.next_expected.unwrap_or(id);
+        let mut in_slots = 0u64;
+        for i in 0..self.slots.len() {
+            let s = &self.slots[i];
+            if s.used && !before(id, s.frame_id) {
+                if s.done {
+                    self.stats.frames_skipped += 1;
+                } else {
+                    self.stats.frames_lost += 1;
+                }
+                if !before(s.frame_id, exp) {
+                    in_slots += 1;
+                }
+                self.release(i);
+            }
+        }
+        if before(id, exp) {
+            return;
+        }
+        // Frames that never showed and had no slot.
+        let span = id.wrapping_sub(exp) as u64 + 1;
+        self.stats.frames_lost += span.saturating_sub(in_slots);
+        self.next_expected = Some(id.wrapping_add(1));
+        self.awaiting_idr = true;
+    }
+
+    /// A free slot, evicting the oldest frame (given up) if all are busy.
+    fn claim_slot(&mut self) -> Option<usize> {
+        if let Some(i) = self.slots.iter().position(|s| !s.used) {
+            return Some(i);
+        }
+        let oldest = self.oldest(|_| true)?;
+        let id = self.slots[oldest].frame_id;
+        match self.next_expected {
+            Some(exp) if !before(id, exp) => self.give_up_through(id),
+            _ => self.release(oldest),
+        }
+        self.slots.iter().position(|s| !s.used)
+    }
+
+    /// Takes the complete frame in slot `si` off the queue: true if the
+    /// decoder may have it.
+    fn accept(&mut self, si: usize) -> bool {
+        let id = self.slots[si].frame_id;
+        self.next_expected = Some(id.wrapping_add(1));
+        let nacked = self.slots[si].nack_first != 0;
+        self.release(si);
+        let s = &mut self.slots[si];
+        if s.count > s.arrived {
+            self.stats.frames_recovered += 1;
+        }
+        if nacked {
+            self.stats.frames_nacked += 1;
+        }
+        let whole = s.count as usize * MAX_PAYLOAD;
+        let info = FrameInfo::from_bytes(&s.buf[..whole.min(s.buf.len())]);
+        if s.total == 0 {
+            // The last packet was rebuilt: the frame's length says where it ends.
+            s.total = info.map_or(0, |i| FrameInfo::SIZE + i.frame_len as usize);
+        }
+        let Some(info) = info.filter(|i| {
+            i.frame_len as usize + FrameInfo::SIZE == s.total
+                && s.total <= whole
+                && s.total > whole - MAX_PAYLOAD
+        }) else {
+            self.stats.bad += 1;
+            self.awaiting_idr = true;
+            return false;
+        };
+        s.encode_us = info.encode_us;
+        s.input_seq = info.input_seq;
+        let is_idr = s.flags & FLAG_IDR != 0;
+        if self.awaiting_idr && !is_idr {
+            self.stats.frames_skipped += 1;
+            return false;
+        }
+        self.awaiting_idr = false;
+        self.stats.frames += 1;
+        true
     }
 
     /// Rebuilds group `g`'s missing data packets once enough of its packets
@@ -479,115 +971,6 @@ impl Reassembler {
         s.got += rebuilt as u16;
         stats.recovered += rebuilt as u64;
     }
-
-    fn claim_slot(&mut self, h: &VideoPacketHeader, now_us: u64) -> usize {
-        let si = match self.slots.iter().position(|s| !s.used) {
-            Some(i) => i,
-            None => {
-                // Evict the oldest incomplete frame; it's lost.
-                let mut oldest = 0;
-                for (i, s) in self.slots.iter().enumerate() {
-                    if before(s.frame_id, self.slots[oldest].frame_id) {
-                        oldest = i;
-                    }
-                }
-                let s = &self.slots[oldest];
-                self.stats.data_expected += s.count as u64;
-                self.stats.data_missing += (s.count - s.arrived) as u64;
-                oldest
-            }
-        };
-        let s = &mut self.slots[si];
-        let need = h.packet_count as usize * MAX_PAYLOAD;
-        if s.buf.len() < need {
-            s.buf.resize(need, 0); // rare: only frames larger than any before
-        }
-        let pneed = h.fec_groups as usize * h.fec_parity as usize * MAX_PAYLOAD;
-        if s.pbuf.len() < pneed {
-            s.pbuf.resize(pneed, 0);
-        }
-        let words = (h.packet_count as usize).div_ceil(64);
-        s.bits[..words].fill(0);
-        let pwords = (h.fec_groups as usize * h.fec_parity as usize).div_ceil(64);
-        s.pbits[..pwords].fill(0);
-        s.gdata[..h.fec_groups as usize].fill(0);
-        s.gpar[..h.fec_groups as usize].fill(0);
-        s.used = true;
-        s.frame_id = h.frame_id;
-        s.flags = h.flags;
-        s.capture_ts_us = h.capture_ts_us;
-        s.count = h.packet_count;
-        s.groups = h.fec_groups;
-        s.parity = h.fec_parity;
-        s.got = 0;
-        s.arrived = 0;
-        s.total = 0;
-        s.first_us = now_us;
-        si
-    }
-
-    fn complete(&mut self, si: usize) -> Option<ReceivedFrame<'_>> {
-        let id = self.slots[si].frame_id;
-        self.slots[si].used = false;
-        // Anything older still in flight can never be delivered now.
-        for s in &mut self.slots {
-            if s.used && before(s.frame_id, id) {
-                s.used = false;
-                self.stats.data_expected += s.count as u64;
-                self.stats.data_missing += (s.count - s.arrived) as u64;
-            }
-        }
-        if let Some(exp) = self.next_expected {
-            let gap = id.wrapping_sub(exp) as u64;
-            if gap > 0 {
-                self.stats.frames_lost += gap;
-                self.awaiting_idr = true;
-            }
-        }
-        self.next_expected = Some(id.wrapping_add(1));
-
-        let s = &mut self.slots[si];
-        let missing = (s.count - s.arrived) as u64;
-        self.stats.data_expected += s.count as u64;
-        self.stats.data_missing += missing;
-        if missing > 0 {
-            self.stats.frames_recovered += 1;
-        }
-        let whole = s.count as usize * MAX_PAYLOAD;
-        let info = FrameInfo::from_bytes(&s.buf[..whole.min(s.buf.len())]);
-        if s.total == 0 {
-            // The last packet was rebuilt: the frame's length says where it ends.
-            s.total = info.map_or(0, |i| FrameInfo::SIZE + i.frame_len as usize);
-        }
-        let Some(info) = info.filter(|i| {
-            i.frame_len as usize + FrameInfo::SIZE == s.total
-                && s.total <= whole
-                && s.total > whole - MAX_PAYLOAD
-        }) else {
-            self.stats.bad += 1;
-            self.awaiting_idr = true;
-            return None;
-        };
-        let is_idr = s.flags & FLAG_IDR != 0;
-        if self.awaiting_idr && !is_idr {
-            self.stats.frames_skipped += 1;
-            return None;
-        }
-        self.awaiting_idr = false;
-        self.stats.frames += 1;
-        let s = &self.slots[si];
-        Some(ReceivedFrame {
-            frame_id: id,
-            flags: s.flags,
-            capture_ts_us: s.capture_ts_us,
-            encode_us: info.encode_us,
-            input_seq: info.input_seq,
-            first_packet_us: s.first_us,
-            last_packet_us: s.last_us,
-            packets: s.count,
-            data: &s.buf[FrameInfo::SIZE..s.total],
-        })
-    }
 }
 
 #[cfg(test)]
@@ -620,7 +1003,7 @@ mod tests {
             ..Default::default()
         };
         let n = pk
-            .send_frame(&f, data, |p| {
+            .send_frame(&f, data, 0, |p| {
                 out.push(p.to_vec());
                 Ok(())
             })
@@ -636,7 +1019,9 @@ mod tests {
     fn feed(r: &mut Reassembler, pkts: &[Vec<u8>]) -> Vec<(u32, Vec<u8>)> {
         let mut got = Vec::new();
         for (i, p) in pkts.iter().enumerate() {
-            if let Some(f) = r.push(p, 10_000 + i as u64) {
+            let now = 10_000 + i as u64;
+            r.push(p, now);
+            while let Some(f) = r.pop(now) {
                 assert!(f.last_packet_us >= f.first_packet_us);
                 assert_eq!(f.encode_us, 2_500);
                 assert_eq!(f.input_seq, f.frame_id);
@@ -710,7 +1095,7 @@ mod tests {
 
     #[test]
     fn loss_withholds_until_idr() {
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::without_nack();
         feed(&mut r, &packets(0, true, &frame_data(0, 5_000)));
         // Frame 1 loses a packet.
         let mut p1 = packets(1, false, &frame_data(1, 5_000));
@@ -720,10 +1105,11 @@ mod tests {
         assert!(feed(&mut r, &packets(2, false, &frame_data(2, 5_000))).is_empty());
         assert_eq!(r.stats.frames_lost, 1);
         assert!(r.needs_keyframe());
-        // Late packet for frame 1 is ignored.
+        // A late packet for frame 1 is ignored (a recent frame: counted as
+        // a duplicate, not late).
         let late = packets(1, false, &frame_data(1, 5_000));
         assert!(feed(&mut r, &late[2..3]).is_empty());
-        assert_eq!(r.stats.late, 1);
+        assert_eq!((r.stats.late, r.stats.duplicates), (0, 1));
         // IDR resumes delivery.
         let got = feed(&mut r, &packets(3, true, &frame_data(3, 5_000)));
         assert_eq!(got.len(), 1);
@@ -736,7 +1122,7 @@ mod tests {
 
     #[test]
     fn whole_frame_missing_is_lost() {
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::without_nack();
         feed(&mut r, &packets(10, true, &frame_data(10, 100)));
         // Frames 11 and 12 never arrive at all.
         assert!(feed(&mut r, &packets(13, false, &frame_data(13, 100))).is_empty());
@@ -745,7 +1131,7 @@ mod tests {
 
     #[test]
     fn evicts_when_all_slots_incomplete() {
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::without_nack();
         feed(&mut r, &packets(0, true, &frame_data(0, 100)));
         // SLOTS+1 frames each missing their last packet.
         for id in 1..=SLOTS as u32 + 1 {
@@ -761,11 +1147,11 @@ mod tests {
     #[test]
     fn rejects_bad_packets() {
         let mut r = Reassembler::new();
-        assert!(r.push(&[1, 2, 3], 0).is_none());
+        r.push(&[1, 2, 3], 0);
         let mut p = packets(0, true, &frame_data(0, 5_000));
         // Non-last packet truncated.
         p[0].truncate(100);
-        assert!(r.push(&p[0], 0).is_none());
+        r.push(&p[0], 0);
         assert_eq!(r.stats.bad, 2);
     }
 
@@ -784,7 +1170,8 @@ mod tests {
         // capture_ts check in feed() assumes small ids; check data only.
         let mut got = Vec::new();
         for p in &all {
-            if let Some(f) = r.push(p, 1) {
+            r.push(p, 1);
+            while let Some(f) = r.pop(1) {
                 got.push((f.frame_id, f.data.to_vec()));
             }
         }
@@ -837,7 +1224,7 @@ mod tests {
 
     #[test]
     fn too_much_loss_is_still_a_loss() {
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::without_nack();
         feed(&mut r, &with_fec(0, true, &frame_data(0, 100), 0.0));
         let mut p = with_fec(1, false, &frame_data(1, 10 * MAX_PAYLOAD), 0.0);
         assert_eq!(fec_layout(11, 0.0), (1, 2));
@@ -879,7 +1266,7 @@ mod tests {
     /// probability 5%, protected for 5% reported loss.
     #[test]
     fn five_percent_random_loss() {
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::without_nack();
         let mut x: u32 = 0x1234_5678;
         let mut rnd = move || {
             x ^= x << 13;
@@ -900,5 +1287,198 @@ mod tests {
         assert_eq!(r.stats.frames_lost, 0, "{:?}", r.stats);
         assert_eq!(delivered, 2000);
         assert!(r.stats.recovered > 500, "{:?}", r.stats);
+    }
+
+    /// A host that keeps its packetiser, for resends.
+    struct Host {
+        pk: Packetiser,
+    }
+
+    impl Host {
+        fn new(loss: f32) -> Self {
+            Self {
+                pk: Packetiser {
+                    fec_loss: loss,
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn send(&mut self, id: u32, idr: bool, data: &[u8]) -> Vec<Vec<u8>> {
+            let f = OutFrame {
+                frame_id: id,
+                flags: if idr { FLAG_IDR } else { 0 },
+                capture_ts_us: 1_000 + id as u64,
+                encode_us: 2_500,
+                input_seq: id,
+            };
+            let mut out = Vec::new();
+            self.pk
+                .send_frame(&f, data, 0, |p| {
+                    out.push(p.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+            out
+        }
+
+        fn resend(&mut self, id: u32, ix: &[u16]) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            self.pk
+                .resend(id, ix.iter().copied(), 1_000, |p| {
+                    out.push(p.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+            out
+        }
+    }
+
+    fn nacks(r: &mut Reassembler, now: u64) -> Vec<(u32, Vec<u16>)> {
+        let mut v = Vec::new();
+        r.poll(now, |id, ix| v.push((id, ix.to_vec())));
+        v
+    }
+
+    #[test]
+    fn nack_recovers_a_lost_packet() {
+        let mut h = Host::new(-1.0); // no FEC: only the NACK can help
+        let mut r = Reassembler::new();
+        let d: Vec<Vec<u8>> = (0..3).map(|i| frame_data(i, 5_000)).collect();
+        assert_eq!(feed(&mut r, &h.send(0, true, &d[0])).len(), 1);
+        let mut p1 = h.send(1, false, &d[1]);
+        p1.remove(2);
+        assert!(feed(&mut r, &p1).is_empty());
+        // Frame 2 arrives whole: held behind frame 1, which is asked for.
+        assert!(feed(&mut r, &h.send(2, false, &d[2])).is_empty());
+        let asked = nacks(&mut r, 20_000);
+        assert_eq!(asked, vec![(1, vec![2])]);
+        // Not again before the retry time.
+        assert!(nacks(&mut r, 21_000).is_empty());
+        let again = h.resend(1, &[2]);
+        assert_eq!(again.len(), 1);
+        assert!(header_of(&again[0]).flags & FLAG_RESENT != 0);
+        let got = feed(&mut r, &again);
+        assert_eq!(got, vec![(1, d[1].clone()), (2, d[2].clone())]);
+        let s = r.stats;
+        assert_eq!(
+            (s.frames_lost, s.nacks, s.resent, s.frames_nacked),
+            (0, 1, 1, 1)
+        );
+        // The loss report still sees the original loss.
+        assert_eq!(s.data_missing, 1);
+        assert!(!r.needs_keyframe());
+    }
+
+    #[test]
+    fn nack_asks_only_what_fec_lacks() {
+        let mut h = Host::new(0.0);
+        let mut r = Reassembler::new();
+        feed(&mut r, &h.send(0, true, &frame_data(0, 100)));
+        let d1 = frame_data(1, 10 * MAX_PAYLOAD);
+        assert_eq!(fec_layout(11, 0.0), (1, 2));
+        let mut p1 = h.send(1, false, &d1);
+        p1.drain(0..3); // three data packets lost, two parity came
+        assert!(feed(&mut r, &p1).is_empty());
+        feed(&mut r, &h.send(2, false, &frame_data(2, 100)));
+        let asked = nacks(&mut r, 20_000);
+        assert_eq!(asked, vec![(1, vec![0])], "one more packet is enough");
+        let got = feed(&mut r, &h.resend(1, &asked[0].1));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], (1, d1));
+        assert_eq!(r.stats.recovered, 2);
+    }
+
+    #[test]
+    fn nack_asks_for_a_whole_missing_frame() {
+        let mut h = Host::new(0.02);
+        let mut r = Reassembler::new();
+        feed(&mut r, &h.send(0, true, &frame_data(0, 100)));
+        let d1 = frame_data(1, 300);
+        let _gone = h.send(1, false, &d1);
+        feed(&mut r, &h.send(2, false, &frame_data(2, 300)));
+        let asked = nacks(&mut r, 20_000);
+        assert_eq!(asked, vec![(1, vec![])]);
+        let got = feed(&mut r, &h.resend(1, &[]));
+        assert_eq!(got.iter().map(|g| g.0).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(got[0].1, d1);
+        assert_eq!(r.stats.frames_lost, 0);
+    }
+
+    #[test]
+    fn nack_gives_up_in_time() {
+        let mut h = Host::new(-1.0);
+        let mut r = Reassembler::new();
+        r.set_rtt(3_000);
+        feed(&mut r, &h.send(0, true, &frame_data(0, 100)));
+        let mut p1 = h.send(1, false, &frame_data(1, 5_000));
+        p1.remove(1);
+        feed(&mut r, &p1);
+        feed(&mut r, &h.send(2, false, &frame_data(2, 100)));
+        assert_eq!(nacks(&mut r, 20_000).len(), 1);
+        // Asked again after a round trip and a half.
+        assert_eq!(nacks(&mut r, 26_000).len(), 1);
+        assert!(r.pop(39_000).is_none());
+        assert_eq!(r.stats.frames_lost, 0);
+        // 4 round trips + 10 ms (22 ms) after the first ask: lost.
+        assert!(r.pop(42_000).is_none());
+        assert_eq!((r.stats.frames_lost, r.stats.frames_skipped), (1, 1));
+        assert!(r.needs_keyframe());
+        // Nothing more is asked for while waiting for a keyframe.
+        assert!(nacks(&mut r, 50_000).is_empty());
+    }
+
+    #[test]
+    fn nack_for_the_last_frame_before_a_still_screen() {
+        let mut h = Host::new(-1.0);
+        let mut r = Reassembler::new();
+        feed(&mut r, &h.send(0, true, &frame_data(0, 100)));
+        let d1 = frame_data(1, 5_000);
+        let mut p1 = h.send(1, false, &d1);
+        p1.pop();
+        feed(&mut r, &p1); // last packet at 10_002
+        assert!(r.pending());
+        assert!(
+            nacks(&mut r, 11_000).is_empty(),
+            "its burst may not be over"
+        );
+        let asked = nacks(&mut r, 10_002 + NACK_IDLE_US);
+        assert_eq!(asked, vec![(1, vec![3])]);
+        assert_eq!(feed(&mut r, &h.resend(1, &[3])), vec![(1, d1)]);
+        assert!(!r.pending());
+    }
+
+    #[test]
+    fn a_newer_keyframe_ends_the_wait() {
+        let mut h = Host::new(-1.0);
+        let mut r = Reassembler::new();
+        feed(&mut r, &h.send(0, true, &frame_data(0, 100)));
+        let mut p1 = h.send(1, false, &frame_data(1, 5_000));
+        p1.remove(0);
+        feed(&mut r, &p1);
+        let d2 = frame_data(2, 100);
+        assert_eq!(feed(&mut r, &h.send(2, true, &d2)), vec![(2, d2)]);
+        assert_eq!(r.stats.frames_lost, 1);
+        assert!(!r.needs_keyframe());
+    }
+
+    #[test]
+    fn resends_stop_when_too_old() {
+        let mut h = Host::new(-1.0);
+        h.send(7, true, &frame_data(7, 100));
+        let mut n = 0;
+        let mut go = |now| {
+            h.pk.resend(7, std::iter::empty(), now, |_| {
+                n += 1;
+                Ok(())
+            })
+            .unwrap()
+        };
+        assert_eq!(go(RESEND_MAX_AGE_US), 1);
+        assert_eq!(go(RESEND_MAX_AGE_US + 1), 0);
+        assert_eq!(
+            h.pk.resend(8, std::iter::empty(), 0, |_| Ok(())).unwrap(),
+            0
+        );
     }
 }

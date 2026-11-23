@@ -353,10 +353,11 @@ private final class HostSessionRun {
         out.append(String(format: "  frames sent %ld (%.1f fps), IDRs %ld (idle re-sends %ld), viewer keyframe requests %ld, not sent (viewer not ready) %ld",
                           t.frames, Double(t.frames) / secs, t.idrs, t.idleIDRs, Int(counters.keyframe_requests), t.notSent))
         out.append(String(format: "  bitrate %.1f Mbps avg | %ld packets", Double(t.bytes) * 8 / secs / 1e6, Int(counters.packets_sent)))
-        out.append(String(format: "  FEC (M4): %llu parity packets (%.1f%% of packets) | the viewer's latest reported loss %.2f%%",
+        out.append(String(format: "  FEC (M4): %llu parity packets (%.1f%% of packets) | the viewer's latest reported loss %.2f%% | NACKs answered %llu (%llu packets resent)",
                           counters.parity_packets,
                           Double(counters.parity_packets) * 100 / Double(max(counters.packets_sent, 1)),
-                          Double(counters.loss_ppm) / 1e4))
+                          Double(counters.loss_ppm) / 1e4,
+                          counters.nacks, counters.packets_resent))
         out.append(t.encode.line("encode"))
         out.append(t.delivery.line("  capture delivery"))
         out.append(t.vtEncode.line("  VideoToolbox"))

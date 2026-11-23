@@ -208,7 +208,7 @@ Header (24 bytes):
 |---|---|---|---|
 | 0 | 1 | version | `PROTOCOL_VERSION` (4). Mismatch → drop. |
 | 1 | 1 | stream_id | 0 (video) |
-| 2 | 1 | flags | bit 0 `IDR`, bit 1 `REFINEMENT`; others 0 |
+| 2 | 1 | flags | bit 0 `IDR`, bit 1 `REFINEMENT`, bit 2 `RESENT` (an answer to a NACK, data packets only); others 0 |
 | 3 | 1 | reserved | 0 |
 | 4 | 4 | frame_id | +1 per sent frame, wraps |
 | 8 | 2 | packet_index | must be `< packet_count` |
@@ -253,15 +253,37 @@ goes in the packet with `packet_index = i`, so a receiver can place packets at
   smallest count such that a group loses more than that about 1 in 10 000
   times at 1.5 × the reported loss + 0.5 %, at least 1.
 
+### NACK (viewer → host, 13 + 2n bytes; M4, v11)
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `"GLNK"` |
+| 4 | 4 | session_id |
+| 8 | 4 | frame_id |
+| 12 | 1 | n: packet indices that follow (≤ 128; 0 = the whole frame) |
+| 13 | 2n | data `packet_index`es, u16 each |
+
+Sealed with the viewer's key, like input. The host resends those data
+packets (all of them if n = 0) with the `RESENT` flag, from the frames it
+sent in the last 150 ms (it keeps 32); older or unknown frames are ignored.
+See ADR 0021.
+
 ### Receiver rules
 - A frame is complete when all `packet_count` data packets are there, arrived
   or rebuilt. Parity for a frame already delivered is ignored, not counted as
-  late; a data packet of the frame just delivered (FEC got there first) was
-  only reordered.
-- Frames are delivered in `frame_id` order. When a frame completes, any older
-  incomplete frame is lost; packets for frames older than the last delivered
-  one are ignored.
+  late; a data packet of a recent frame (reordered, or resent as well) is a
+  duplicate, not late.
+- An incomplete frame is stalled once a newer frame's packets arrive, or
+  none of its own came for 3 ms. The viewer then NACKs as many data packets
+  per FEC group as the group still lacks (the whole frame if none of it
+  came), again every 1.5 round trips (≥ 4 ms), and gives up 4 round trips
+  + 10 ms after the first NACK (20–60 ms).
+- Frames are delivered in `frame_id` order: newer complete frames wait while
+  an older one is recovered. A frame given up is lost, and so is every
+  older one; a newer complete IDR ends the wait at once.
 - After any loss (and at start), frames are withheld until an IDR completes.
+  No NACKs are sent meanwhile.
+- Resent packets don't count as arrived in `ReceiverReport`.
 
 ## Not yet defined
 - Resolution negotiation (M7)
@@ -273,6 +295,7 @@ protocol version, `fp` first 8 bytes of the fingerprint (hex), `ip`, `port`.
 Advisory only: trust comes from the pinned fingerprint, never from discovery.
 
 ## Changelog
+- v11 — M4: NACK datagram (`"GLNK"`), `RESENT` flag (bit 2) on resent video packets.
 - v10 — M4: FEC on video (`fec_groups`, `fec_parity` in the header, parity packets), `ReceiverReport` (22).
 - v9 — M5c: `FileRate` (21): file speed adapts to the picture instead of a fixed 60 Mbps.
 - v8 — M5c clipboard: `ClipChunk` (17) carries text, and offers of pictures and files, both ways; a paste sends `FileRequest` (20), answered by the picture or `FileData` (18); `FileCancel` (19).

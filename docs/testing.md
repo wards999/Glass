@@ -10,6 +10,17 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M4 test 6 (NACK: lost packets asked for again)
+Protocol v11: update all three machines, and the service on QUIETPC.
+1. As M4 test 1: a few minutes on Wi-Fi with ordinary use and a video,
+   QUIETPC22 viewing QUIETPC, then the Mac. Make the Wi-Fi worse if you can.
+2. The picture should hitch less: a lost packet is now asked for again
+   (one round trip, a few ms) instead of waiting for a whole new keyframe.
+3. Send the viewer results. The FEC line now ends with
+   `NACK: N asks, R packets resent, F frames saved`. `lost frames` and
+   `keyframe requests` should be lower than before.
+4. The host's FEC line ends with `NACKs answered N (R packets resent)`.
+
 ## M4 test 3 (FEC, the loss fix, logs)
 If Windows Defender removes Glass.exe again: Windows Security > Virus &
 threat protection > Protection history > the entry > Actions > Allow on

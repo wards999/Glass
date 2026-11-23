@@ -717,8 +717,9 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             out.append("Live: \(client.hostName) \(client.host):\(client.port) (paired, encrypted)  \(streamDesc), \(String(format: "%.1f", secs)) s (ended: \(reason))")
             out.append(String(format: "  received %ld frames (%.1f fps), submitted %ld, presented %ld (%.1f fps), superseded %ld, decode errors %ld",
                               s.frames, Double(s.frames) / secs, submittedCount, s.presented, Double(s.presented) / secs, superseded, decodeErrors))
-            out.append(String(format: "  FEC (M4): rebuilt %llu lost packets in %llu frames | packet loss seen %.2f%%",
+            out.append(String(format: "  FEC (M4): rebuilt %llu lost packets in %llu frames | NACK: %llu asks, %llu packets resent, %llu frames saved | packet loss seen %.2f%%",
                               st.rx.recovered, st.rx.frames_recovered,
+                              st.rx.nacks, st.rx.resent, st.rx.frames_nacked,
                               Double(st.rx.data_missing) * 100 / Double(max(st.rx.data_expected, 1))))
             out.append("  packets \(st.rx.packets) | lost frames \(st.rx.frames_lost) | skipped \(st.rx.frames_skipped) | late \(st.rx.late) | dup \(st.rx.duplicates) | bad \(st.rx.bad) | rejected \(st.crypto_bad + st.crypto_replayed) | queue full \(st.queue_full) | keyframe requests \(st.keyframe_requests)")
             out.append(String(format: "  bitrate %.1f Mbps avg | clock sync %@ (best RTT %.2f ms, last %.2f ms)",

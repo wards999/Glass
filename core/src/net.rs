@@ -623,8 +623,12 @@ impl HostListener {
                         Message::Control(Control::ReceiverReport { expected, missing }) => {
                             // Up fast, down slowly: FEC follows a worsening
                             // link at once and relaxes over a few seconds.
-                            if expected > 0 {
-                                let now = (missing as f64 / expected as f64 * 1e6).min(1e6);
+                            // A report of more missing than expected is
+                            // nonsense; and FEC never plans for more than
+                            // 15 % loss: past that the link is full, and
+                            // more parity only fills it further.
+                            if expected > 0 && missing <= expected {
+                                let now = (missing as f64 / expected as f64 * 1e6).min(150_000.0);
                                 let old = sh.loss_ppm.load(Ordering::Relaxed) as f64;
                                 let w = if now > old { 0.5 } else { 0.1 };
                                 let v = old + (now - old) * w;
@@ -1871,9 +1875,15 @@ fn spawn_control(
                 let lo = sh.frame_lo.swap(u32::MAX, Ordering::Relaxed);
                 let hi = sh.frame_hi.swap(0, Ordering::Relaxed);
                 // What arrived of the video since the last report (M4 FEC).
+                // Saturating: a reordered packet takes one back off the
+                // missing count, which can go below the last report's
+                // (m4-test1: it wrapped to "100 % loss" and the host
+                // doubled the video with parity).
+                let expected = st.data_expected.saturating_sub(last_report.0);
+                let missing = st.data_missing.saturating_sub(last_report.1).min(expected);
                 let rep = Control::ReceiverReport {
-                    expected: (st.data_expected - last_report.0).min(u32::MAX as u64) as u32,
-                    missing: (st.data_missing - last_report.1).min(u32::MAX as u64) as u32,
+                    expected: expected.min(u32::MAX as u64) as u32,
+                    missing: missing.min(u32::MAX as u64) as u32,
                 };
                 last_report = (st.data_expected, st.data_missing);
                 ok &= send_control(&out, rep).is_ok();

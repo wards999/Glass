@@ -59,8 +59,14 @@ pub fn fec_layout(count: usize, loss: f32) -> (u8, u8) {
     }
     let groups = count.div_ceil(FEC_GROUP_MAX);
     let k = count.div_ceil(groups); // the biggest group
-    let p = (loss as f64 * 1.5 + 0.005).min(0.5);
-    let cap = k.min(fec::MAX_SHARDS - k).max(1);
+    let p = (loss.min(0.15) as f64 * 1.5 + 0.005).min(0.5);
+    // Never more than half again (3 for tiny frames), and the loss planned
+    // for is capped at 15 %: when loss comes from a full link, more parity
+    // only makes it fuller (m4-test1 could reach 100 % extra).
+    let cap = k
+        .min(fec::MAX_SHARDS - k)
+        .min(((k as f64 * 0.5).ceil() as usize).max(3))
+        .max(1);
     let m = (1..=cap)
         .find(|&m| binomial_tail(k + m, m, p) < FEC_TARGET)
         .unwrap_or(cap);
@@ -840,6 +846,23 @@ mod tests {
         assert!(feed(&mut r, &with_fec(2, false, &frame_data(2, 100), 0.0)).is_empty());
         assert_eq!(r.stats.frames_lost, 1);
         assert!(r.needs_keyframe());
+    }
+
+    /// m4-test1: a bogus "100 % loss" report made the host double the video
+    /// with parity and the session drowned. Parity stays at most half again,
+    /// whatever the reported loss.
+    #[test]
+    fn parity_is_capped_whatever_the_loss() {
+        for count in [1, 2, 3, 10, 40, 64, 65, 200, 1000] {
+            for loss in [0.0, 0.05, 0.15, 0.5, 1.0, 100.0] {
+                let (g, m) = fec_layout(count, loss);
+                let k = count.div_ceil(g as usize);
+                assert!(
+                    m as usize <= (k.div_ceil(2)).max(3).min(k),
+                    "{count} {loss}: {m}"
+                );
+            }
+        }
     }
 
     #[test]

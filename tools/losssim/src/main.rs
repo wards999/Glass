@@ -88,8 +88,8 @@ fn run(loss: Loss, frames: u32, fixed_fec: Option<f32>, seed: u64) -> Outcome {
         // Every 15 frames (0.25 s), the receiver's report, as the host sees it.
         if id % 15 == 0 {
             let (e, m) = (
-                rx.stats.data_expected - last.0,
-                rx.stats.data_missing - last.1,
+                rx.stats.data_expected.saturating_sub(last.0),
+                rx.stats.data_missing.saturating_sub(last.1),
             );
             last = (rx.stats.data_expected, rx.stats.data_missing);
             if e > 0 {

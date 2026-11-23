@@ -384,6 +384,11 @@ pub struct AudioReceiver {
     pcm: [f32; FRAME_LEN],
     out: Vec<f32>,
     target_us: u64,
+    /// The margin for losses: up after a gap, down slowly when calm. The
+    /// target is the larger of it and the picture-sync hold, so a change
+    /// in the hold takes effect at once (m5-test2: after a rise the target
+    /// came down 5 ms per 10 s and the sound stayed 34 ms late).
+    loss_target_us: u64,
     /// Smoothed buffer depth (µs) and the resampling ratio from it.
     depth_avg: f64,
     ratio: f64,
@@ -429,6 +434,7 @@ impl AudioReceiver {
             pcm: [0.0; FRAME_LEN],
             out: Vec::with_capacity(FRAME_LEN * 2),
             target_us: START_TARGET_US,
+            loss_target_us: START_TARGET_US,
             depth_avg: 0.0,
             ratio: 1.0,
             pos: 0.0,
@@ -542,18 +548,16 @@ impl AudioReceiver {
         // Adapt the target: up at once after a gap, down slowly when calm,
         // never below what keeps the sound with the picture.
         let floor = self.sync_floor_us;
-        if self.target_us < floor {
-            self.target_us = floor;
-        }
         let u = self.ring.underruns();
         if u > self.last_underruns {
             self.last_underruns = u;
-            self.target_us = (self.target_us + 10_000).min(MAX_TARGET_US.max(floor));
+            self.loss_target_us = (self.loss_target_us + 10_000).min(MAX_TARGET_US);
             self.calm_since_us = now_us;
         } else if now_us.saturating_sub(self.calm_since_us) > 10_000_000 {
-            self.target_us = self.target_us.saturating_sub(5_000).max(floor);
+            self.loss_target_us = self.loss_target_us.saturating_sub(5_000).max(MIN_TARGET_US);
             self.calm_since_us = now_us;
         }
+        self.target_us = self.loss_target_us.max(floor);
         self.catch_up(next);
         next = self.next.unwrap_or(next);
         loop {
@@ -596,8 +600,8 @@ impl AudioReceiver {
                 // It really didn't come: conceal (Opus fades it in), no
                 // click, and make room so the next burst is covered.
                 self.stats.concealed += 1;
-                self.target_us =
-                    (self.target_us + 5_000).min(MAX_TARGET_US.max(self.sync_floor_us));
+                self.loss_target_us = (self.loss_target_us + 5_000).min(MAX_TARGET_US);
+                self.target_us = self.loss_target_us.max(self.sync_floor_us);
                 self.calm_since_us = now_us;
                 self.dec.decode_float(&[], &mut self.pcm, false)
             } else {
@@ -1044,6 +1048,37 @@ mod tests {
         }
         let st = r.stats;
         assert!((50..=65).contains(&st.latency_ms), "{st:?}");
+        assert_eq!((st.concealed, st.underruns), (0, 0), "{st:?}");
+    }
+
+    /// m5-test2: the hold went up, then the picture got quicker, and the
+    /// sound stayed 34 ms late for minutes.
+    #[test]
+    fn the_sound_comes_back_when_the_picture_does() {
+        let mut s = AudioSender::new().unwrap();
+        let mut r = AudioReceiver::new().unwrap();
+        r.set_clock_offset(Some(0));
+        let ring = r.ring();
+        let mut pull = [0f32; FRAME_LEN / 2];
+        for ms in 0..8_000u64 {
+            let now = ms * 1_000;
+            r.set_min_target(if ms < 4_000 { 70_000 } else { 20_000 });
+            if ms % 10 == 0 {
+                let d = s.frame(&tone((ms / 10) as u32), now + 1).unwrap().to_vec();
+                r.push(&d, now);
+            }
+            r.tick(now, |_, _| {});
+            if ms > 40 && ms % 5 == 0 {
+                ring.read(&mut pull, 1.0);
+            }
+            if ms == 3_999 {
+                assert!(r.stats.latency_ms >= 60, "{:?}", r.stats);
+            }
+        }
+        let st = r.stats;
+        // 4 s after the hold came down: back near 20 ms, by playing
+        // faster, with no gap.
+        assert!(st.latency_ms <= 35, "{st:?}");
         assert_eq!((st.concealed, st.underruns), (0, 0), "{st:?}");
     }
 

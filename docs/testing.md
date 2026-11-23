@@ -10,6 +10,15 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 3 (frames shown as soon as they're decoded)
+The same 3D pool test, windowed and full screen (⌃⌥⌘F).
+1. The Mac's results: "presented by: as decoded", and "present" plus
+   "wait for refresh" lower than m5-test2's 32 + 9 ms. "capture -> screen"
+   lower than 54 ms.
+2. The PC's: "frames sent" about 60 fps or a little over.
+3. Sound: "A/V" within a few ms behind the picture.
+4. Note any stutters, and when (the break, scrolling, a still moment).
+
 ## M5 test 2 (60 fps for real; one refresh to show it)
 The same 3D pool test.
 1. Smooth? The PC's results: "frames sent" close to 60 fps while the game

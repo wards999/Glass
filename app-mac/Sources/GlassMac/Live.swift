@@ -80,10 +80,12 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private var layer: CAMetalLayer!
     private var overlay: NSTextField!
     private var link: CADisplayLink?
-    /// Presents frames with one refresh of latency (M5, m5-test1: with the
-    /// view's display link a frame took two refreshes, 32 ms, to show).
-    private var metalLink: CAMetalDisplayLink?
-    private var presentPath = "display link (2 frames)"
+    /// Frames on their way to the screen (main thread). Each is presented
+    /// as soon as it's decoded, up to two at once; more and the newest
+    /// waits (m5-test2: presenting at the display link's tick, just after
+    /// a refresh, cost two refreshes, 32 ms, even with CAMetalDisplayLink).
+    private var inFlight = 0
+    private let presentPath = "as decoded (up to 2 in flight)"
     private var keyMonitor: Any?
     private var finished = false
     private let started = GlassClock.nowUs()
@@ -244,14 +246,6 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         let link = view.displayLink(target: self, selector: #selector(tick(_:)))
         link.add(to: .main, forMode: .common)
         self.link = link
-        // Frames go out through a Metal display link asking for one frame
-        // of latency; the view's link above keeps doing the housekeeping.
-        let ml = CAMetalDisplayLink(metalLayer: layer)
-        ml.preferredFrameLatency = 1
-        ml.delegate = self
-        ml.add(to: .main, forMode: .common)
-        metalLink = ml
-        presentPath = "CAMetalDisplayLink (1 frame)"
 
         let t = Thread { self.decodeLoop() }
         t.name = "glass.decode"
@@ -502,6 +496,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                     }
                     guard let pb else { return }
                     if latest != nil { superseded += 1 }
+                    DispatchQueue.main.async { [weak self] in self?.presentNow() }
                     latest = (pb, FrameTiming(captureLocal: capture, lastPacket: meta.last_packet_us,
                                               decodeEnd: t1, inputSeq: meta.input_seq))
                 }
@@ -596,11 +591,9 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     // MARK: main thread
 
     @objc private func tick(_ link: CADisplayLink) {
-        let item: (CVPixelBuffer, FrameTiming)? = metalLink != nil ? nil : lock.withLock {
-            defer { latest = nil }
-            return latest
-        }
-        if metalLink == nil, let item { present(item.0, item.1) }
+        // Presenting happens as frames are decoded (presentNow); the tick
+        // only picks up one that waited for a slot.
+        presentNow()
         pollCursor()
         tickBar()
         let changes = client.infoChanges
@@ -647,23 +640,33 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         }
     }
 
-    /// The Metal display link's turn: the newest decoded frame, if any, into
-    /// the drawable it gives.
-    fileprivate func metalTick(_ update: CAMetalDisplayLink.Update) {
+    /// Presents the newest decoded frame now if a slot is free (main
+    /// thread): the window manager picks it up at the very next refresh,
+    /// instead of waiting for the tick at the start of one.
+    fileprivate func presentNow() {
+        guard !finished, inFlight < 2 else { return }
         let item: (CVPixelBuffer, FrameTiming)? = lock.withLock {
             defer { latest = nil }
             return latest
         }
-        if let item { present(item.0, item.1, into: update.drawable) }
+        guard let item else { return }
+        if present(item.0, item.1) { inFlight += 1 }
     }
 
-    private func present(_ pb: CVPixelBuffer, _ t: FrameTiming, into given: CAMetalDrawable? = nil) {
-        guard let drawable = given ?? layer.nextDrawable(), let cb = renderer.queue.makeCommandBuffer() else { return }
+    @discardableResult
+    private func present(_ pb: CVPixelBuffer, _ t: FrameTiming) -> Bool {
+        guard let drawable = layer.nextDrawable(), let cb = renderer.queue.makeCommandBuffer() else { return false }
         renderer.encode(pb, to: drawable.texture, in: cb, fit: true)
         let submitted = GlassClock.nowUs()
         lock.withLock { submittedCount += 1 }
         let client = self.client
         drawable.addPresentedHandler { [weak self] d in
+            // Shown (or dropped): its slot is free; the newest waiting goes.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.inFlight = max(0, self.inFlight - 1)
+                self.presentNow()
+            }
             guard let self, d.presentedTime > 0 else { return }
             let shown = GlassClock.us(fromMediaTime: d.presentedTime)
             // First frame showing a newer input: input -> screen.
@@ -684,6 +687,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         }
         cb.present(drawable)
         cb.commit()
+        return true
     }
 
     private func updateOverlay(_ now: UInt64) {
@@ -744,8 +748,6 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         keyMonitor = nil
         link?.invalidate()
         link = nil
-        metalLink?.invalidate()
-        metalLink = nil
         closingReason = reason
         // Free resizing from here on (clears the aspect ratio), so leaving
         // full screen can always work out a window size.
@@ -841,11 +843,5 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             out.append(s.interval.line("present interval"))
             return out.joined(separator: "\n")
         }
-    }
-}
-
-extension LiveViewer: CAMetalDisplayLinkDelegate {
-    func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
-        metalTick(update)
     }
 }

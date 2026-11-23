@@ -447,7 +447,7 @@ private final class Pipeline {
         idle = DispatchSource.makeTimerSource(queue: run.q)
         let viewerHz = Int(run.viewerHz)
         sendHz = viewerHz > 0 ? min(viewerHz, display.fps) : display.fps
-        minGapUs = sendHz > 0 && sendHz < display.fps ? UInt64(950_000 / sendHz) : 0
+        minGapUs = sendHz > 0 && sendHz < display.fps ? UInt64(900_000 / sendHz) : 0
         run.totals.sendHz = sendHz
         run.totals.hardware = encoder.usingHardware
         run.totals.lowLatency = encoder.lowLatencyRateControl

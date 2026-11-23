@@ -979,7 +979,7 @@ fn run_session<V: ViewerLink>(
     let mut next_log = t0 + slog::EVERY_US;
     let mut pending_idr = true;
     // The frame-rate cap: the viewer's refresh (it says in Hello), never
-    // more than this screen's. 95 % of the interval, so a frame per refresh
+    // more than this screen's. 90 % of the interval, so a frame per refresh
     // always arrives in time for it.
     let viewer_hz = session.viewer().refresh_hz as u32;
     let send_hz = if viewer_hz == 0 {
@@ -987,7 +987,7 @@ fn run_session<V: ViewerLink>(
     } else {
         viewer_hz.min(fps.max(1))
     };
-    let min_gap = 950_000 / send_hz.max(1) as u64;
+    let min_gap = 900_000 / send_hz.max(1) as u64;
     let mut last_sent = 0u64;
     let mut held: Option<u64> = None;
     run.send_hz = send_hz;

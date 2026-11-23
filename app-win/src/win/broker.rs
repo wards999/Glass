@@ -302,6 +302,8 @@ pub fn run(
         let t0 = clock::now_us();
         let (mut frame_id, mut idrs, mut not_sent, mut switches) = (0u32, 0u32, 0u32, 0u32);
         let mut send_ring = StatRing::new();
+        // Encoded in the helper -> handed to the network here (the pipe hop).
+        let mut hop = StatRing::new();
         let mut seq = 0u32;
         let mut helper_report = String::new();
         let mut gap_since: Option<u64> = None;
@@ -329,6 +331,7 @@ pub fn run(
                     };
                     frame_id = frame_id.wrapping_add(1);
                     let out = clock::now_us();
+                    hop.push(out.saturating_sub(capture_us + encode_us as u64) as u32);
                     match session.send_frame(&f, &buf[at..]) {
                         Ok(true) => {
                             send_ring.push((clock::now_us() - out) as u32);
@@ -431,6 +434,7 @@ pub fn run(
             c.packets_sent
         );
         let _ = writeln!(r, "{}", fmt_line("send (packetise)", &send_ring.summary()));
+        let _ = writeln!(r, "{}", fmt_line("helper -> service", &hop.summary()));
         let _ = writeln!(
             r,
             "  session switches with the viewer kept connected: {switches}{}",

@@ -9,7 +9,7 @@
 /// announces new stream parameters mid-session (`StreamChange`).
 /// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
 /// datagrams. v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 11;
+pub const PROTOCOL_VERSION: u8 = 12;
 
 /// Most "seen by" ids a `Hello` carries (no-loop rule).
 pub const MAX_SEEN_BY: usize = 8;
@@ -242,6 +242,24 @@ impl Nack<'_> {
     pub fn whole_frame(&self) -> bool {
         self.indices.is_empty()
     }
+}
+
+/// UDP datagram host -> viewer that keeps the viewer's radio awake while
+/// no video is going (a still screen): `"GLKA"` + session id, every
+/// [`KEEPALIVE_US`] the host sent nothing else (M4 step 4). The viewer's
+/// punches do the same the other way.
+pub const KEEPALIVE_MAGIC: [u8; 4] = *b"GLKA";
+pub const KEEPALIVE_US: u64 = 10_000;
+
+pub fn encode_keepalive(session_id: u32) -> [u8; 8] {
+    let mut b = [0u8; 8];
+    b[0..4].copy_from_slice(&KEEPALIVE_MAGIC);
+    b[4..8].copy_from_slice(&session_id.to_be_bytes());
+    b
+}
+
+pub fn is_keepalive(b: &[u8]) -> bool {
+    b.len() == 8 && b[0..4] == KEEPALIVE_MAGIC
 }
 
 /// Stream description sent by the host in [`Control::Welcome`].

@@ -25,6 +25,16 @@ Audio before M4 would sit on a transport with no loss recovery and need
 reworking straight after. Audio after M5 would mean tuning smoothness
 without the real traffic.
 
+## Requirement for M4b (user, 2026-11-23)
+Sound must never lose quality or turn broken or choppy while it plays,
+including during a file copy or on a weak Wi-Fi spot. So:
+- audio gets the same loss recovery as video (FEC and NACK on its stream),
+  with priority over video and files;
+- the playout buffer stays steady, with no gaps;
+- a lost packet is concealed (Opus PLC) and never heard as a click;
+- the bitrate stays high enough for music, not just speech;
+- the results report audio gaps and concealed packets.
+
 ## Consequences
 - M5b becomes "Gaming: feel" (relative mouse, game mode, cadence).
 - The milestone order follows the top rule: speed, smoothness and sharp

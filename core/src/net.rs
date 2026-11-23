@@ -340,6 +340,9 @@ pub struct HostCounters {
     /// NACKs from the viewer, and data packets resent for them (M4).
     pub nacks: u64,
     pub packets_resent: u64,
+    /// Video packet marking (`qos::QOS_*`), and keep-awakes sent (M4).
+    pub qos: u32,
+    pub keepalives: u64,
 }
 
 /// Called on the host's UDP thread for every input action, in order.
@@ -379,6 +382,8 @@ struct HostShared {
     clip_relay: Mutex<Option<crate::clipboard::FrameWriter>>,
     nacks: AtomicU64,
     resent: AtomicU64,
+    qos: AtomicU32,
+    keepalives: AtomicU64,
 }
 
 /// Video out: frames from the encoder and, for NACKs, resends from the UDP
@@ -389,6 +394,10 @@ struct VideoTx {
     packetiser: Packetiser,
     sealer: Sealer,
     wire: [u8; WIRE_MAX],
+    /// Packet marking towards the viewer (redone when its address changes).
+    marking: Option<crate::qos::Marking>,
+    /// When anything was last sent (µs), for the keep-awakes.
+    last_send_us: u64,
 }
 
 /// One connected viewer. Dropping it ends the session (and releases any
@@ -587,14 +596,46 @@ impl HostListener {
             loss_ppm: AtomicU32::new(0),
             nacks: AtomicU64::new(0),
             resent: AtomicU64::new(0),
+            qos: AtomicU32::new(0),
+            keepalives: AtomicU64::new(0),
         });
         let tx = Arc::new(Mutex::new(VideoTx {
             udp: self.udp.try_clone()?,
             packetiser: Packetiser::default(),
             sealer: Sealer::new(to_viewer, session_id),
             wire: [0; WIRE_MAX],
+            marking: None,
+            last_send_us: 0,
         }));
         let mut threads = Vec::new();
+        // Keep the viewer's radio awake while no video goes (M4 step 4).
+        {
+            let (sh, vtx) = (shared.clone(), tx.clone());
+            let ka = crate::protocol::encode_keepalive(session_id);
+            threads.push(std::thread::spawn(move || {
+                while !sh.stop.load(Ordering::Relaxed) && sh.connected.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(4));
+                    let Some(peer) = unpack_v4(sh.peer.load(Ordering::Relaxed)) else {
+                        continue;
+                    };
+                    let now = clock::now_us();
+                    // Never make a frame wait: busy means it's sending.
+                    let Ok(mut t) = vtx.try_lock() else {
+                        continue;
+                    };
+                    if now.saturating_sub(t.last_send_us) < crate::protocol::KEEPALIVE_US {
+                        continue;
+                    }
+                    let VideoTx {
+                        udp, sealer, wire, ..
+                    } = &mut *t;
+                    let len = sealer.seal(&ka, wire);
+                    let _ = udp.send_to(&wire[..len], peer);
+                    t.last_send_us = now;
+                    sh.keepalives.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
 
         // Control: answer pings, take keyframe requests, notice disconnects.
         let ch_peer = ch.peer;
@@ -733,8 +774,14 @@ impl HostListener {
                 if decode_punch(d) == Some(session_id) {
                     let packed = pack_v4(v4);
                     if sh.peer.swap(packed, Ordering::Relaxed) != packed {
-                        // New destination: it needs a fresh IDR.
+                        // New destination: it needs a fresh IDR, and the
+                        // video's marking follows it.
                         sh.keyframe.store(true, Ordering::Relaxed);
+                        let mut t = lock(&vtx);
+                        t.marking = None;
+                        let m = crate::qos::mark(&t.udp, crate::qos::Class::Video, v4);
+                        sh.qos.store(m.state as u32, Ordering::Relaxed);
+                        t.marking = Some(m);
                     }
                 } else if let Some(nk) = crate::protocol::Nack::decode(d) {
                     // Resend at once, from here: the frame sender may be
@@ -747,6 +794,7 @@ impl HostListener {
                             packetiser,
                             sealer,
                             wire,
+                            ..
                         } = &mut *t;
                         let n = packetiser
                             .resend(nk.frame_id, nk.indices(), clock::now_us(), |pkt| {
@@ -754,6 +802,7 @@ impl HostListener {
                                 udp.send_to(&wire[..len], peer).map(|_| ())
                             })
                             .unwrap_or(0);
+                        t.last_send_us = clock::now_us();
                         sh.nacks.fetch_add(1, Ordering::Relaxed);
                         sh.resent.fetch_add(n as u64, Ordering::Relaxed);
                     }
@@ -900,11 +949,13 @@ impl HostSession {
         };
         let c = &mut self.counters;
         let mut t = lock(&self.tx);
+        t.last_send_us = clock::now_us();
         let VideoTx {
             udp,
             packetiser,
             sealer,
             wire,
+            ..
         } = &mut *t;
         // FEC sized to the loss the viewer reports (M4).
         packetiser.fec_loss = self.shared.loss_ppm.load(Ordering::Relaxed) as f32 / 1e6;
@@ -1009,6 +1060,8 @@ impl HostSession {
             loss_ppm: self.shared.loss_ppm.load(Ordering::Relaxed),
             nacks: self.shared.nacks.load(Ordering::Relaxed),
             packets_resent: self.shared.resent.load(Ordering::Relaxed),
+            qos: self.shared.qos.load(Ordering::Relaxed),
+            keepalives: self.shared.keepalives.load(Ordering::Relaxed),
             ..self.counters
         }
     }
@@ -1211,6 +1264,9 @@ pub struct ClientStats {
     /// UDP datagrams that failed authentication / were replays.
     pub crypto_bad: u64,
     pub crypto_replayed: u64,
+    /// Input marking (`qos::QOS_*`) and keep-awakes sent (M4 step 4).
+    pub qos: u32,
+    pub keepalives: u64,
 }
 
 /// The host's pointer as last reported. `generation` changes on every update.
@@ -1304,6 +1360,11 @@ struct InputTx {
     active: bool, // any input yet (no heartbeats before the first event)
     session_id: u32,
     nack: [u8; crate::protocol::NACK_HEADER + 2 * crate::protocol::NACK_MAX],
+    /// When anything was last sent (µs), for the keep-awakes.
+    last_send_us: u64,
+    /// Input marked as voice (M4 step 4).
+    marking: crate::qos::Marking,
+    keepalives: u64,
 }
 
 impl InputTx {
@@ -1313,6 +1374,7 @@ impl InputTx {
         let _ = self.udp.send_to(&self.wire[..len], self.dest);
         self.packets += 1;
         self.active = true;
+        self.last_send_us = now;
     }
 
     /// Asks the host for packets of a frame again (M4).
@@ -1320,11 +1382,13 @@ impl InputTx {
         let n = crate::protocol::Nack::encode(self.session_id, frame_id, indices, &mut self.nack);
         let len = self.sealer.seal(&self.nack[..n], &mut self.wire);
         let _ = self.udp.send_to(&self.wire[..len], self.dest);
+        self.last_send_us = clock::now_us();
     }
 
     fn send_punch(&mut self) {
         let len = self.sealer.seal(&self.punch, &mut self.wire);
         let _ = self.udp.send_to(&self.wire[..len], self.dest);
+        self.last_send_us = clock::now_us();
     }
 }
 
@@ -1574,6 +1638,9 @@ impl Client {
             punch: encode_punch(session_id),
             session_id,
             nack: [0; crate::protocol::NACK_HEADER + 2 * crate::protocol::NACK_MAX],
+            last_send_us: 0,
+            marking: crate::qos::mark(&udp, crate::qos::Class::Input, host_udp),
+            keepalives: 0,
             plain: [0; MAX_INPUT_DATAGRAM],
             wire: [0; WIRE_MAX],
             packets: 0,
@@ -1626,6 +1693,7 @@ impl Client {
                 Opener::new(from_host, session_id),
             ),
             spawn_control(shared.clone(), tls_in, writer, reader),
+            spawn_keepalive(shared.clone()),
         ];
         Ok(Self {
             shared,
@@ -1792,9 +1860,14 @@ impl Client {
 
     pub fn stats(&self) -> ClientStats {
         let sh = &self.shared;
-        let (events, packets) = {
+        let (events, packets, qos, keepalives) = {
             let tx = lock(&sh.input);
-            (tx.sender.events_total, tx.packets)
+            (
+                tx.sender.events_total,
+                tx.packets,
+                tx.marking.state as u32,
+                tx.keepalives,
+            )
         };
         ClientStats {
             rx: sh.rx.load(),
@@ -1810,6 +1883,8 @@ impl Client {
             host_notice: sh.host_notice.load(Ordering::Relaxed),
             crypto_bad: sh.crypto_bad.load(Ordering::Relaxed),
             crypto_replayed: sh.crypto_replayed.load(Ordering::Relaxed),
+            qos,
+            keepalives,
         }
     }
 
@@ -1858,6 +1933,7 @@ fn spawn_receiver(
             r.set_rtt(sh.last_rtt.load(Ordering::Relaxed));
             match udp.recv_from(&mut buf) {
                 Ok((n, from)) if from.ip() == host_ip => match opener.open(&mut buf[..n]) {
+                    Ok(plain) if crate::protocol::is_keepalive(plain) => {}
                     Ok(plain) => r.push(plain, clock::now_us()),
                     Err(_) => {
                         sh.crypto_bad.store(opener.stats.bad, Ordering::Relaxed);
@@ -1913,6 +1989,25 @@ fn spawn_receiver(
             sh.rx.store(&r.stats);
         }
         sh.queue.wake();
+    })
+}
+
+/// Keeps this side's radio awake (M4 step 4): a punch whenever nothing was
+/// sent to the host for [`crate::protocol::KEEPALIVE_US`], so Wi-Fi power
+/// save doesn't add its wake-up delay between frames.
+fn spawn_keepalive(sh: Arc<ClientShared>) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !sh.stop.load(Ordering::Relaxed) && sh.connected.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(4));
+            // Never make input wait: busy means it's sending.
+            let Ok(mut tx) = sh.input.try_lock() else {
+                continue;
+            };
+            if clock::now_us().saturating_sub(tx.last_send_us) >= crate::protocol::KEEPALIVE_US {
+                tx.send_punch();
+                tx.keepalives += 1;
+            }
+        }
     })
 }
 

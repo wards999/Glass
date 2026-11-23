@@ -21,6 +21,7 @@ mod encode;
 mod helper;
 mod inject;
 mod mdns;
+mod netif;
 mod pipe;
 mod present;
 pub mod service;
@@ -306,8 +307,22 @@ pub fn record(args: &[String]) -> Res<()> {
     Ok(())
 }
 
-/// This PC's LAN address as the OS would route it (no packet is sent).
+/// The results' word for `qos::QOS_*`.
+pub(crate) fn qos_word(q: u32) -> &'static str {
+    match q as u8 {
+        glass_core::qos::QOS_MARKED => "yes",
+        glass_core::qos::QOS_REFUSED => "no (refused by Windows)",
+        _ => "not yet",
+    }
+}
+
+/// This PC's LAN address: an Ethernet or Wi-Fi adapter's (not a VPN's or
+/// a virtual switch's, `netif`), else the one the OS would route through
+/// (no packet is sent).
 fn lan_ip() -> Option<std::net::IpAddr> {
+    if let Some(v4) = netif::lan_ipv4() {
+        return Some(std::net::IpAddr::V4(v4));
+    }
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("192.0.2.1:9").ok()?; // TEST-NET-1: only used to pick a route
     s.local_addr().ok().map(|a| a.ip())
@@ -1136,6 +1151,12 @@ fn host_report<V: ViewerLink>(
             c.loss_ppm as f64 / 1e4,
             c.nacks,
             c.packets_resent
+        );
+        let _ = writeln!(
+            r,
+            "  network (M4): video marked for Wi-Fi priority: {} | keep-awakes sent {}",
+            qos_word(c.qos),
+            c.keepalives
         );
     } else {
         let _ = writeln!(

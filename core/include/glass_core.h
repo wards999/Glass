@@ -242,7 +242,7 @@
  * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
  * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 11
+#define GLASS_PROTOCOL_VERSION 12
 
 /**
  * Most "seen by" ids a `Hello` carries (no-loop rule).
@@ -298,6 +298,8 @@
 #define GLASS_NACK_MAX 128
 
 #define GLASS_NACK_HEADER 13
+
+#define GLASS_KEEPALIVE_US 10000
 
 /**
  * View modes (viewer's choice; the host may fall back to `MODE_HOST_SCREEN`).
@@ -427,6 +429,16 @@
 #define GLASS_VideoPacketHeader_SIZE 24
 
 #define GLASS_FrameInfo_SIZE 12
+
+/**
+ * The result, for the session results (`HostCounters::qos`,
+ * `ClientStats::qos`): 0 not tried yet, 1 marked, 2 the OS refused.
+ */
+#define GLASS_QOS_NONE 0
+
+#define GLASS_QOS_MARKED 1
+
+#define GLASS_QOS_REFUSED 2
 
 #define GLASS_FORMAT_VERSION 1
 
@@ -781,6 +793,11 @@ typedef struct {
    */
   uint64_t crypto_bad;
   uint64_t crypto_replayed;
+  /**
+   * Input marking (`qos::QOS_*`) and keep-awakes sent (M4 step 4).
+   */
+  uint32_t qos;
+  uint64_t keepalives;
 } GLASS_ClientStats;
 
 /**
@@ -913,6 +930,11 @@ typedef struct {
    */
   uint64_t nacks;
   uint64_t packets_resent;
+  /**
+   * Video packet marking (`qos::QOS_*`), and keep-awakes sent (M4).
+   */
+  uint32_t qos;
+  uint64_t keepalives;
 } GLASS_HostCounters;
 
 /**
@@ -1743,5 +1765,7 @@ uint64_t glass_replay_input_actions(const GLASS_Replay *r);
  * `r` must come from `glass_replay_start` (or be null) and not be used afterwards.
  */
 void glass_replay_stop(GLASS_Replay *r);
+
+extern int32_t setsockopt(int32_t fd, int32_t level, int32_t name, const void *value, uint32_t len);
 
 #endif  /* GLASS_CORE_H */

@@ -373,6 +373,7 @@ private final class HostSessionRun {
                           Double(counters.parity_packets) * 100 / Double(max(counters.packets_sent, 1)),
                           Double(counters.loss_ppm) / 1e4,
                           counters.nacks, counters.packets_resent))
+        out.append("  network (M4): video marked for Wi-Fi priority: \(counters.qos == 1 ? "yes" : counters.qos == 2 ? "no" : "not yet") | keep-awakes sent \(counters.keepalives)")
         out.append(t.encode.line("encode"))
         out.append(t.delivery.line("  capture delivery"))
         out.append(t.vtEncode.line("  VideoToolbox"))

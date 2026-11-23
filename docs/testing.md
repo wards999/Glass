@@ -10,6 +10,18 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M4 test 11 (Wi-Fi priority, the right adapter, radios kept awake)
+Protocol v12: update all three machines, and the service on QUIETPC.
+1. View QUIETPC from QUIETPC22, and the Mac, for a few minutes, including a
+   file copy and a still screen.
+2. Both results have a new line: "network (M4): … marked for Wi-Fi
+   priority: yes | keep-awakes sent N". Send it if it says "no".
+3. After the screen has been still for a while, the first frame of a
+   change should arrive no slower than any other (compare the network p99
+   and max with m4-test10).
+4. If either PC has a VPN or Hyper-V/WSL installed: the Glass list on the
+   other machine should show its real LAN address.
+
 ## M4 test 10 (no keyframe every 10 s; hitches measured)
 1. View QUIETPC (or Glass.exe sharing) from QUIETPC22 for a few minutes
    with something moving. The host's results: "IDRs" should be about the

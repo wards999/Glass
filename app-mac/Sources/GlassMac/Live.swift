@@ -736,6 +736,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                               st.rx.recoveries,
                               Double(st.rx.recovery_us_total) / Double(max(st.rx.recoveries, 1)) / 1e3,
                               Double(st.rx.recovery_us_max) / 1e3))
+            out.append("  network (M4): input marked for Wi-Fi priority: \(st.qos == 1 ? "yes" : st.qos == 2 ? "no" : "not yet") | keep-awakes sent \(st.keepalives)")
             out.append("  packets \(st.rx.packets) | lost frames \(st.rx.frames_lost) | skipped \(st.rx.frames_skipped) | late \(st.rx.late) | dup \(st.rx.duplicates) | bad \(st.rx.bad) | rejected \(st.crypto_bad + st.crypto_replayed) | queue full \(st.queue_full) | keyframe requests \(st.keyframe_requests)")
             out.append(String(format: "  bitrate %.1f Mbps avg | clock sync %@ (best RTT %.2f ms, last %.2f ms)",
                               Double(s.bytes) * 8 / secs / 1e6, st.clock_valid ? "ok" : "NOT SYNCED",

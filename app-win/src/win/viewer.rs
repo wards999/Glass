@@ -607,6 +607,12 @@ fn session_report(sh: &Shared, r: &Report, head: &ReportHead, reason: &str) -> S
     );
     let _ = writeln!(
         out,
+        "  network (M4): input marked for Wi-Fi priority: {} | keep-awakes sent {}",
+        super::qos_word(st.qos),
+        st.keepalives
+    );
+    let _ = writeln!(
+        out,
         "  bitrate {:.1} Mbps avg | clock sync {} (best RTT {:.2} ms, last {:.2} ms)",
         r.bytes as f64 * 8.0 / secs / 1e6,
         if st.clock_valid { "ok" } else { "NOT SYNCED" },

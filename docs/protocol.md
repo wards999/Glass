@@ -268,6 +268,18 @@ packets (all of them if n = 0) with the `RESENT` flag, from the frames it
 sent in the last 150 ms (it keeps 32); older or unknown frames are ignored.
 See ADR 0021.
 
+### Keep-awake (host → viewer, 8 bytes; M4, v12)
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `"GLKA"` |
+| 4 | 4 | session_id |
+
+Sealed with the host's key. Sent whenever the host sent nothing else for
+10 ms. The viewer ignores it: it only keeps the viewer's Wi-Fi out of power
+save. The viewer sends a punch on the same rule, the other way. See
+ADR 0023.
+
 ### Receiver rules
 - A frame is complete when all `packet_count` data packets are there, arrived
   or rebuilt. Parity for a frame already delivered is ignored, not counted as
@@ -295,6 +307,7 @@ protocol version, `fp` first 8 bytes of the fingerprint (hex), `ip`, `port`.
 Advisory only: trust comes from the pinned fingerprint, never from discovery.
 
 ## Changelog
+- v12 — M4: keep-awake datagram host → viewer (`"GLKA"`); packet marking (no format change).
 - v11 — M4: NACK datagram (`"GLNK"`), `RESENT` flag (bit 2) on resent video packets.
 - v10 — M4: FEC on video (`fec_groups`, `fec_parity` in the header, parity packets), `ReceiverReport` (22).
 - v9 — M5c: `FileRate` (21): file speed adapts to the picture instead of a fixed 60 Mbps.

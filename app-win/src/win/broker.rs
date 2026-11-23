@@ -455,6 +455,12 @@ pub fn run(
             c.nacks,
             c.packets_resent
         );
+        let _ = writeln!(
+            r,
+            "  network (M4): video marked for Wi-Fi priority: {} | keep-awakes sent {}",
+            qos_word(c.qos),
+            c.keepalives
+        );
         let _ = writeln!(r, "{}", fmt_line("helper -> service", &hop.summary()));
         let _ = writeln!(
             r,

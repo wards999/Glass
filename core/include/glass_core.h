@@ -526,6 +526,16 @@
 #define GLASS_HOLD_US 500000
 
 /**
+ * A limit the stream isn't using still rises after this long calm (µs)...
+ */
+#define GLASS_IDLE_CALM_US 3000000
+
+/**
+ * ...by 5 % this often (µs): from 20 Mbps to no limit in about 25 s.
+ */
+#define GLASS_IDLE_STEP_US 500000
+
+/**
  * Never below this: text and fine detail go soft (bits/s).
  */
 #define GLASS_MIN_BPS 8e6

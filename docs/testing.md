@@ -10,6 +10,17 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 13 (rate control comes back after the weak link)
+Protocol v14, as before: update all three machines, and the service on QUIETPC.
+1. As test 12: play, click "Weak Wi-Fi test" for about a minute, then off,
+   and keep playing for at least another minute.
+2. Expected: within about 30 s of turning it off, the Mac's "rate control
+   (M5)" line says "no limit now" and the PC's frame rate goes back to
+   twice the Mac's refresh (about 100+ fps sent).
+3. Check the whole PC screen still shows in full screen (the chat panel on
+   the right).
+4. Send both results.
+
 ## M5 test 12 (the whole PC screen on the Mac; rate control's climb)
 Protocol v14, as before: update all three machines, and the service on QUIETPC.
 1. Connect from the Mac: the whole PC screen shows in full screen,

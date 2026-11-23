@@ -25,6 +25,10 @@ pub const CONGESTED_US: u32 = 15_000;
 pub const WORRIED_US: u32 = 6_000;
 /// After backing off, no ramp-up for this long (µs).
 pub const HOLD_US: u64 = 500_000;
+/// A limit the stream isn't using still rises after this long calm (µs)...
+pub const IDLE_CALM_US: u64 = 3_000_000;
+/// ...by 5 % this often (µs): from 20 Mbps to no limit in about 25 s.
+pub const IDLE_STEP_US: u64 = 500_000;
 /// Never below this: text and fine detail go soft (bits/s).
 pub const MIN_BPS: f64 = 8e6;
 /// At or above this it's no limit (bits/s).
@@ -38,6 +42,9 @@ pub struct VideoRateControl {
     base_since: u64,
     last_bad: u64,
     hold_until: u64,
+    /// Since when nothing worried it (µs), and the last idle rise.
+    calm_since: u64,
+    idle_up_at: u64,
     last_sent: Option<Option<u32>>,
     last_sent_at: u64,
     pub backoffs: u32,
@@ -72,18 +79,32 @@ impl VideoRateControl {
             let t = self.target.map_or(at, |t| t.min(at));
             self.target = Some(t);
             self.hold_until = now_us + HOLD_US;
+            self.calm_since = now_us;
             self.backoffs += 1;
             let t = t as u32;
             if self.lowest_bps == 0 || t < self.lowest_bps {
                 self.lowest_bps = t;
             }
-        } else if over <= WORRIED_US && now_us >= self.hold_until {
-            // Raise a limit only while it's being used (the encoder near
-            // it): on a still screen it stays, so the next motion doesn't
-            // burst at full rate. Past the top, no limit.
-            if let Some(t) = self.target.filter(|&t| received_bps >= t * 0.5) {
-                let up = t * 1.05;
-                self.target = (up < MAX_BPS).then_some(up);
+        } else if over > WORRIED_US {
+            self.calm_since = now_us;
+        } else if now_us >= self.hold_until {
+            // Raise a limit quickly while it's being used (the encoder near
+            // it). One that isn't (a still screen, a quiet game) rises too,
+            // but slowly and only after a calm spell: m5-test12 sat at a
+            // 22.8 Mbps limit for 100 s after the weak link had gone, the
+            // host held at the viewer's refresh, because a 60 fps pool table
+            // used too little of it to count. Past the top, no limit.
+            if let Some(t) = self.target {
+                let used = received_bps >= t * 0.5;
+                let idle_ok = now_us.saturating_sub(self.calm_since) >= IDLE_CALM_US
+                    && now_us.saturating_sub(self.idle_up_at) >= IDLE_STEP_US;
+                if used || idle_ok {
+                    if !used {
+                        self.idle_up_at = now_us;
+                    }
+                    let up = t * 1.05;
+                    self.target = (up < MAX_BPS).then_some(up);
+                }
             }
         }
         self.report(now_us)
@@ -202,6 +223,22 @@ mod tests {
         let last = *sent.last().unwrap();
         assert!(last == 0 || last >= 85_000_000, "{sent:?}");
         assert!(c.backoffs >= 1 && c.lowest_bps == 17_000_000);
+    }
+
+    /// m5-test12: after the weak link, a quiet picture using a third of the
+    /// limit. It must still come off, slowly.
+    #[test]
+    fn an_unused_limit_still_goes_once_calm() {
+        let mut c = VideoRateControl::default();
+        run(&mut c, 0, 50, |_| 3_000, |_, _| 45e6, |_| 0);
+        run(&mut c, 50, 1, |_| 30_000, |_, _| 24e6, |_| 0);
+        assert_eq!(c.limit(), 20_400_000);
+        // 7 Mbps used: not "used", but calm. Nothing for the first 3 s...
+        run(&mut c, 51, 30, |_| 3_000, |_, _| 7e6, |_| 0);
+        assert!(c.limit() <= 21_500_000, "{}", c.limit());
+        // ...then 5 % every 0.5 s: no limit within about 30 s more.
+        run(&mut c, 81, 300, |_| 3_000, |_, _| 7e6, |_| 0);
+        assert_eq!(c.limit(), 0);
     }
 
     #[test]

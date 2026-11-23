@@ -883,6 +883,18 @@ typedef struct {
    */
   uint32_t not_sent;
   uint8_t not_sent_why;
+  /**
+   * File data over the whole session, each way (bytes).
+   */
+  uint64_t bytes_out;
+  uint64_t bytes_in;
+  /**
+   * How long copies were moving (µs), and the lowest and highest speed
+   * set meanwhile (bytes/s; 0 if none moved).
+   */
+  uint64_t busy_us;
+  uint64_t rate_lo;
+  uint64_t rate_hi;
 } GLASS_ClipProgress;
 
 /**

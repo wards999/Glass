@@ -231,7 +231,19 @@ public final class ClipboardSync: NSObject, NSPasteboardItemDataProvider {
     public static func summary(_ p: GLASS_ClipProgress, other: String) -> String {
         let why = p.not_sent_why == 1 ? " (last: over 10 000 files)"
             : p.not_sent_why == 2 ? " (last: a file couldn\u{2019}t be read)" : ""
-        return "text and pictures: \(p.items_sent) sent to the \(other), \(p.items_received) received | files: \(p.files_offered) copies offered, \(p.files_sent) pasted on the \(other), \(p.files_received) pasted here | not offered: \(p.not_sent)\(why)"
+        return "text and pictures: \(p.items_sent) sent to the \(other), \(p.items_received) received | files: \(p.files_offered) copies offered, \(p.files_sent) pasted on the \(other), \(p.files_received) pasted here | not offered: \(p.not_sent)\(why)\(dataLine(p))"
+    }
+
+    /// File data moved, how long it took and the speeds set (same wording
+    /// as `ClipProgress::data_line` in core).
+    static func dataLine(_ p: GLASS_ClipProgress) -> String {
+        let all = p.bytes_out + p.bytes_in
+        if all == 0 { return "" }
+        let mb = { (b: UInt64) in Double(b) / 1e6 }
+        let secs = Double(p.busy_us) / 1e6
+        let avg = secs > 0 ? mb(all) / secs : 0
+        let f = { (x: Double) in String(format: "%.1f", x) }
+        return " | file data: \(f(mb(p.bytes_out))) MB sent, \(f(mb(p.bytes_in))) MB received in \(f(secs)) s (\(f(avg)) MB/s), speed set \(f(mb(p.rate_lo)))\u{2013}\(f(mb(p.rate_hi))) MB/s"
     }
 
     /// The Settings switch (on unless turned off).

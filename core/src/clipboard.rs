@@ -448,6 +448,36 @@ pub struct ClipProgress {
     /// (`NotSent`: 1 too many files, 2 unreadable).
     pub not_sent: u32,
     pub not_sent_why: u8,
+    /// File data over the whole session, each way (bytes).
+    pub bytes_out: u64,
+    pub bytes_in: u64,
+    /// How long copies were moving (µs), and the lowest and highest speed
+    /// set meanwhile (bytes/s; 0 if none moved).
+    pub busy_us: u64,
+    pub rate_lo: u64,
+    pub rate_hi: u64,
+}
+
+impl ClipProgress {
+    /// The results line's file data part (same wording on the Mac), if any
+    /// moved: " | file data: 1073.7 MB sent, 0.0 MB received in 45.2 s
+    /// (23.7 MB/s), speed set 4.1–60.0 MB/s".
+    pub fn data_line(&self) -> Option<String> {
+        let all = self.bytes_out + self.bytes_in;
+        if all == 0 {
+            return None;
+        }
+        let mb = |b: u64| b as f64 / 1e6;
+        let secs = self.busy_us as f64 / 1e6;
+        let avg = if secs > 0.0 { mb(all) / secs } else { 0.0 };
+        Some(format!(
+            " | file data: {:.1} MB sent, {:.1} MB received in {secs:.1} s ({avg:.1} MB/s), speed set {:.1}–{:.1} MB/s",
+            mb(self.bytes_out),
+            mb(self.bytes_in),
+            mb(self.rate_lo),
+            mb(self.rate_hi),
+        ))
+    }
 }
 
 enum Job {
@@ -514,6 +544,13 @@ struct Counts {
     files_received: AtomicU32,
     not_sent: AtomicU32,
     not_sent_why: AtomicU32,
+    bytes_out: AtomicU64,
+    bytes_in: AtomicU64,
+    busy_us: AtomicU64,
+    rate_lo: AtomicU64,
+    rate_hi: AtomicU64,
+    /// When the speed was last set (µs), for `busy_us`.
+    rate_at: AtomicU64,
 }
 
 /// Clipboard state for one session, both ways.
@@ -666,6 +703,21 @@ impl ClipLink {
     pub fn set_rate(&self, bytes_per_s: u64) {
         let r = bytes_per_s.clamp(FILE_RATE_MIN, FILE_RATE_MAX);
         self.rate.store(r, Ordering::Relaxed);
+        // For the results: how long copies moved, and the speeds used.
+        let n = &self.n;
+        let now = crate::clock::now_us();
+        let last = n.rate_at.swap(now, Ordering::Relaxed);
+        if self.moving() {
+            if last > 0 {
+                let d = now.saturating_sub(last).min(1_000_000);
+                n.busy_us.fetch_add(d, Ordering::Relaxed);
+            }
+            n.rate_hi.fetch_max(r, Ordering::Relaxed);
+            let lo = n.rate_lo.load(Ordering::Relaxed);
+            if lo == 0 || r < lo {
+                n.rate_lo.store(r, Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn rate(&self) -> u64 {
@@ -720,6 +772,11 @@ impl ClipLink {
             files_received: c(&n.files_received),
             not_sent: c(&n.not_sent),
             not_sent_why: c(&n.not_sent_why) as u8,
+            bytes_out: l(&n.bytes_out),
+            bytes_in: l(&n.bytes_in),
+            busy_us: l(&n.busy_us),
+            rate_lo: l(&n.rate_lo),
+            rate_hi: l(&n.rate_hi),
         }
     }
 
@@ -879,6 +936,7 @@ impl ClipLink {
                         offset += want as u64;
                         sent += want as u64;
                         self.n.out_done.store(sent, Ordering::Relaxed);
+                        self.n.bytes_out.fetch_add(want as u64, Ordering::Relaxed);
                         let rate = self.rate.load(Ordering::Relaxed).max(FILE_RATE_MIN);
                         due += Duration::from_micros(want as u64 * 1_000_000 / rate);
                         let now = Instant::now();
@@ -1120,6 +1178,9 @@ impl ClipLink {
         i.written += d.data.len() as u64;
         self.n
             .in_done
+            .fetch_add(d.data.len() as u64, Ordering::Relaxed);
+        self.n
+            .bytes_in
             .fetch_add(d.data.len() as u64, Ordering::Relaxed);
         self.finish_if_done(rx);
         true
@@ -1395,6 +1456,8 @@ mod tests {
         assert_eq!(std::fs::read(note).unwrap(), b"hello");
         let p = rx.progress();
         assert_eq!((p.in_done, p.files_received), (p.in_total, 1));
+        assert_eq!(p.bytes_in, p.in_total);
+        assert!(p.data_line().is_some_and(|l| l.contains("MB received")));
 
         // A piece out of order fails the next fetch and removes its folder.
         let one = vec![Entry {

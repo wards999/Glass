@@ -114,8 +114,9 @@ pub fn summary(p: &glass_core::clipboard::ClipProgress, other: &str) -> String {
             LAST_FAIL.lock().unwrap_or_else(|e| e.into_inner())
         )
     };
+    let data = p.data_line().unwrap_or_default();
     format!(
-        "text and pictures: {} sent to the {other}, {} received | files: {} copies offered, {} pasted on the {other}, {} pasted here | not offered: {}{why} | changes seen here: {}{fails}",
+        "text and pictures: {} sent to the {other}, {} received | files: {} copies offered, {} pasted on the {other}, {} pasted here | not offered: {}{why} | changes seen here: {}{data}{fails}",
         p.items_sent,
         p.items_received,
         p.files_offered,

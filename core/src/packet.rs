@@ -369,9 +369,11 @@ struct Slot {
     total: usize,
     first_us: u64,
     last_us: u64,
-    /// When it was first and last asked for (0: never), and how often.
+    /// When it was first and last asked for (0: never).
     nack_first: u64,
     nack_last: u64,
+    /// A resent packet helped complete it.
+    resent_used: bool,
     /// From FrameInfo, once accepted.
     encode_us: u32,
     input_seq: u32,
@@ -403,6 +405,7 @@ impl Slot {
             last_us: 0,
             nack_first: 0,
             nack_last: 0,
+            resent_used: false,
             encode_us: 0,
             input_seq: 0,
             bits: vec![0; WORDS],
@@ -449,6 +452,7 @@ impl Slot {
         self.parity = h.fec_parity;
         self.got = 0;
         self.arrived = 0;
+        self.resent_used = false;
         self.total = 0;
         self.first_us = now_us;
         self.last_us = now_us;
@@ -650,6 +654,7 @@ impl Reassembler {
             s.got += 1;
             if resent {
                 self.stats.resent += 1;
+                s.resent_used = true;
             } else {
                 s.arrived += 1;
             }
@@ -892,7 +897,10 @@ impl Reassembler {
     fn accept(&mut self, si: usize) -> bool {
         let id = self.slots[si].frame_id;
         self.next_expected = Some(id.wrapping_add(1));
-        let nacked = self.slots[si].nack_first != 0;
+        // Saved by a NACK only if a resend completed it (m4-test6: 6 asks
+        // were all answered by the originals arriving late, and the
+        // results still said "5 frames saved").
+        let nacked = self.slots[si].resent_used;
         self.release(si);
         let s = &mut self.slots[si];
         if s.count > s.arrived {
@@ -1368,6 +1376,26 @@ mod tests {
         // The loss report still sees the original loss.
         assert_eq!(s.data_missing, 1);
         assert!(!r.needs_keyframe());
+    }
+
+    #[test]
+    fn a_late_original_is_not_a_save() {
+        let mut h = Host::new(-1.0);
+        let mut r = Reassembler::new();
+        feed(&mut r, &h.send(0, true, &frame_data(0, 100)));
+        let mut p1 = h.send(1, false, &frame_data(1, 5_000));
+        let slow = p1.remove(2);
+        feed(&mut r, &p1);
+        feed(&mut r, &h.send(2, false, &frame_data(2, 100)));
+        assert_eq!(nacks(&mut r, 20_000).len(), 1);
+        // The original turns up before the resend: the resend is a duplicate.
+        assert_eq!(feed(&mut r, &[slow]).len(), 2);
+        feed(&mut r, &h.resend(1, &[2]));
+        let s = r.stats;
+        assert_eq!(
+            (s.nacks, s.resent, s.frames_nacked, s.duplicates),
+            (1, 0, 0, 1)
+        );
     }
 
     #[test]

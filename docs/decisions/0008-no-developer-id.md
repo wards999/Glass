@@ -51,6 +51,7 @@ each update.
   - Sessions write a running log every 10 s
     (`%LOCALAPPDATA%\Glass\logs`), so a killed session still leaves its
     numbers.
+    The Mac does the same in `~/Library/Logs/Glass` (since m4-test9).
 
 **Both**
 - Check every new feature against this ADR before choosing an approach. If

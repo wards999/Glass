@@ -269,6 +269,8 @@ private final class HostSessionRun {
 
     func run() -> String {
         let started = GlassClock.nowUs()
+        let log = SessionLog(kind: "host")
+        _ = log.due(started)
         let viewer = q.sync { s.viewer }
         // 4:4:4 from the start unless the viewer prefers 4:2:0.
         configure(mode: viewer.mode, allow444: viewer.caps & UInt8(GLASS_CAP_PREFER_420) == 0)
@@ -323,6 +325,11 @@ private final class HostSessionRun {
                 no444 = true
                 configure(mode: current.mode, allow444: false)
             }
+            // The running log: a later session or a crash can't lose it.
+            if log.due(GlassClock.nowUs()) {
+                if clipTimer != nil { clipSummary = ClipboardSync.summary(q.sync { s.clipProgress }, other: "viewer") }
+                log.write(q.sync { report(started: started, reason: SessionLog.running, counters: s.counters, running: true) })
+            }
             Thread.sleep(forTimeInterval: 0.1)
         }
         cursorTimer.cancel()
@@ -337,10 +344,14 @@ private final class HostSessionRun {
             s.close()
             return c
         }
-        return report(started: started, reason: reason, counters: counters)
+        let text = report(started: started, reason: reason, counters: counters)
+        log.write(text)
+        return text
     }
 
-    private func report(started: UInt64, reason: String, counters: GLASS_HostCounters) -> String {
+    /// `running`: a report while the session goes on (on `q`; leaves out
+    /// the sharpness probe, whose numbers another queue is adding to).
+    private func report(started: UInt64, reason: String, counters: GLASS_HostCounters, running: Bool = false) -> String {
         let o = runner.options
         let t = totals
         let d = runner.display
@@ -349,7 +360,9 @@ private final class HostSessionRun {
         let chroma = [1: "4:2:0", 2: "4:2:2", 3: "4:4:4"][t.producedChroma ?? 0] ?? "?"
         var out = [runner.bannerText]
         out.append("Host: Mac display \(d.width)x\(d.height) @ \(d.fps) Hz\(o.testPattern ? " (test pattern)" : "") | HEVC \(o.mbps) Mbps | encoder \(t.hardware ? "hardware" : "SOFTWARE")\(t.lowLatency ? ", low-latency rate control" : "") | encoded chroma \(chroma)")
-        out.append("Session with \u{201C}\(s.peerName)\u{201D} (\(s.peerAddress)) ended after \(String(format: "%.1f", secs)) s (\(reason))")
+        out.append(running
+            ? "Session with \u{201C}\(s.peerName)\u{201D} (\(s.peerAddress)) still running after \(String(format: "%.1f", secs)) s"
+            : "Session with \u{201C}\(s.peerName)\u{201D} (\(s.peerAddress)) ended after \(String(format: "%.1f", secs)) s (\(reason))")
         out.append("  streamed: " + history.joined(separator: " -> "))
         if no444 { out.append("  NOTE: the encoder produced 4:2:0 when asked for 4:4:4, so this session switched to 4:2:0.") }
         out.append(String(format: "  frames sent %ld (%.1f fps), IDRs %ld (idle re-sends %ld), viewer keyframe requests %ld, not sent (viewer not ready) %ld",
@@ -366,7 +379,7 @@ private final class HostSessionRun {
         out.append(t.send.line("send (packetise)"))
         out.append(t.interval.line("capture interval"))
         out.append("  stale frames skipped (encoder still busy, newest frame wins): \(t.stale)")
-        if !t.psnrY.isEmpty {
+        if !running, !t.psnrY.isEmpty {
             func p50(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
             let good = t.psnrY.filter { $0 >= 45 }.count
             out.append(String(format: "  sharpness (PSNR vs source, %ld frames): luma p50 %.1f dB min %.1f | chroma p50 %.1f dB min %.1f | luma >= 45 dB in %.0f%%",

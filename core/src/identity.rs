@@ -399,6 +399,17 @@ impl Device {
         cache.clone()
     }
 
+    /// Paired devices to show the user: all but this device itself. (A
+    /// device can pair with itself, connecting to its own address while
+    /// testing: QUIETPC22 listed "QUIETPC22" among its paired devices.)
+    pub fn listed_peers(&self) -> Vec<Peer> {
+        let me = self.fingerprint();
+        self.peers()
+            .into_iter()
+            .filter(|p| p.fingerprint != me)
+            .collect()
+    }
+
     /// The paired device with this fingerprint, if it has `role`.
     pub fn peer_with(&self, fp: &Fingerprint, role: u8) -> Option<Peer> {
         self.peers()

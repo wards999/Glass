@@ -10,6 +10,19 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M4 test 9 (Mac session logs, a tidier Mac window, paired devices)
+1. On the Mac, share and view for over 10 s. `~/Library/Logs/Glass` gets a
+   `host-…txt` / `viewer-…txt` that updates every 10 s while the session
+   runs ("still running after N s") and holds the final results at the end.
+   The newest 20 are kept. Console.app shows them under Log Reports.
+2. The Mac's sharing card no longer has Show Results / Clarity Test Card.
+   Settings has Session results and a new "Clarity test card" button.
+3. Settings > Paired devices on QUIETPC22 no longer lists QUIETPC22
+   itself, and each row shows the device's id. Two rows with one name are
+   an old identity: Forget the one that's not current (the Mac's Settings
+   shows "this Mac · id …" at the bottom; on a PC, the last line of
+   Settings).
+
 ## M4 test 8 (a progress panel while the Mac pastes files)
 1. View the Mac from QUIETPC22. Copy a big file (1 GB) on QUIETPC22, and
    paste it in Finder on the Mac (through the viewer, or on the Mac itself).

@@ -6,6 +6,8 @@ import GlassKit
 /// stays sharp and colours stay clean (4:2:0 smears 1-pixel colour detail).
 /// While it is open the host measures sharpness (PSNR) of what it sends.
 final class TestCardController: NSObject, NSWindowDelegate {
+    /// One card, opened from Settings; sharing tells it what's being sent.
+    static let shared = TestCardController()
     private var window: NSWindow?
     private var observer: Any?
 

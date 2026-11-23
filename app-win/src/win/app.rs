@@ -2016,7 +2016,7 @@ impl GlassApp {
             }
             Dialog::Settings => {
                 let mut s = self.settings.clone();
-                let peers: Vec<Peer> = self.device.peers();
+                let peers: Vec<Peer> = self.device.listed_peers();
                 let mut forget = None;
                 let mut open_results = false;
                 // A panel under the gear (like the Mac's popover), not a
@@ -2175,6 +2175,12 @@ impl GlassApp {
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 0.0;
                                 ui.label(RichText::new(truncate(&peer.name, 32)).color(p.strong));
+                                // The id tells apart two with one name (an
+                                // old identity from an earlier install).
+                                let id = format!(
+                                    "id {}",
+                                    glass_core::identity::fingerprint_short(&peer.fingerprint)
+                                );
                                 let mut roles = Vec::new();
                                 if peer.roles & ROLE_VIEWER != 0 {
                                     roles.push("can view this PC");
@@ -2182,6 +2188,7 @@ impl GlassApp {
                                 if peer.roles & ROLE_HOST != 0 {
                                     roles.push("this PC can view it");
                                 }
+                                roles.push(&id);
                                 ui.label(RichText::new(roles.join(" \u{00B7} ")).size(12.5).color(p.weak));
                             });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

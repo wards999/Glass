@@ -1073,7 +1073,8 @@ void glass_device_free(GLASS_DeviceHandle *d);
 void glass_device_fingerprint(const GLASS_DeviceHandle *d, uint8_t *out);
 
 /**
- * Number of paired devices (re-read from disk).
+ * Number of paired devices to show (re-read from disk; not this device
+ * itself).
  *
  * # Safety
  * `d` must come from `glass_device_open`.

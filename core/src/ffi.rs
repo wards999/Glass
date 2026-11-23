@@ -301,13 +301,14 @@ pub unsafe extern "C" fn glass_device_fingerprint(d: *const DeviceHandle, out: *
     std::ptr::copy_nonoverlapping((*d).0.fingerprint().as_ptr(), out, 32);
 }
 
-/// Number of paired devices (re-read from disk).
+/// Number of paired devices to show (re-read from disk; not this device
+/// itself).
 ///
 /// # Safety
 /// `d` must come from `glass_device_open`.
 #[no_mangle]
 pub unsafe extern "C" fn glass_device_peer_count(d: *const DeviceHandle) -> u32 {
-    (*d).0.peers().len() as u32
+    (*d).0.listed_peers().len() as u32
 }
 
 /// Paired device `index`: writes its fingerprint (32 bytes) to `fp_out` and
@@ -325,7 +326,7 @@ pub unsafe extern "C" fn glass_device_peer(
     name: *mut c_char,
     name_len: usize,
 ) -> u8 {
-    let peers = (*d).0.peers();
+    let peers = (*d).0.listed_peers();
     let Some(p) = peers.get(index as usize) else {
         return 0;
     };

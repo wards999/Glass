@@ -83,6 +83,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private var keyMonitor: Any?
     private var finished = false
     private let started = GlassClock.nowUs()
+    /// The running log (main thread).
+    private let log = SessionLog(kind: "viewer")
     private var windowStart = GlassClock.nowUs()
     private var lastOverlay: UInt64 = 0
     private let iso = keyboardIsISO()
@@ -585,6 +587,13 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             lastOverlay = now
             updateOverlay(now)
         }
+        // The running log, every 10 s (a crash or a later session can't
+        // lose it).
+        if now - started >= SessionLog.every, log.due(now) {
+            let st = client.stats
+            lock.withLock { finalStats = st }
+            log.write(report(SessionLog.running))
+        }
     }
 
     private func present(_ pb: CVPixelBuffer, _ t: FrameTiming) {
@@ -704,6 +713,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             LiveViewer.closing.removeAll { $0 === w }
         }
         let text = report(reason)
+        log.write(text)
         DispatchQueue.main.async { self.onFinish(text) }
     }
 
@@ -716,7 +726,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             let st = finalStats
             let s = session
             var out = [banner, systemInfo()]
-            out.append("Live: \(client.hostName) \(client.host):\(client.port) (paired, encrypted)  \(streamDesc), \(String(format: "%.1f", secs)) s (ended: \(reason))")
+            out.append("Live: \(client.hostName) \(client.host):\(client.port) (paired, encrypted)  \(streamDesc), \(String(format: "%.1f", secs)) s (\(reason == SessionLog.running ? reason : "ended: \(reason)"))")
             out.append(String(format: "  received %ld frames (%.1f fps), submitted %ld, presented %ld (%.1f fps), superseded %ld, decode errors %ld",
                               s.frames, Double(s.frames) / secs, submittedCount, s.presented, Double(s.presented) / secs, superseded, decodeErrors))
             out.append(String(format: "  FEC (M4): rebuilt %llu lost packets in %llu frames | NACK: %llu asks, %llu packets resent, %llu frames saved | packet loss seen %.2f%%",

@@ -95,7 +95,7 @@ fn devices() -> Result<(), Box<dyn std::error::Error>> {
         d.name,
         fingerprint_short(&d.fingerprint())
     );
-    let peers = d.peers();
+    let peers = d.listed_peers();
     if peers.is_empty() {
         println!("No paired devices. Run host.cmd and connect from the Mac to pair.");
     }

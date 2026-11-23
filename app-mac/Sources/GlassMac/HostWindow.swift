@@ -20,13 +20,11 @@ final class HostController: NSObject {
     private var screenRow: NSStackView!
     private var accessRow: NSStackView!
     private var permNote: NSTextField!
-    private var resultsButton: NSButton!
     private var runner: HostRunner?
     private let advertiser = GlassAdvertiser()
-    private var lastReport: String?
     private var stopped = false
     private var permissionTimer: Timer?
-    private let testCard = TestCardController()
+    private var testCard: TestCardController { .shared }
 
     override init() {
         super.init()
@@ -132,15 +130,9 @@ final class HostController: NSObject {
         accessRow = permissionRow("Accessibility is needed for the other device\u{2019}s mouse and keyboard.", #selector(openAccess))
         permNote = text("After allowing Screen Recording, quit Glass (\u{2318}Q) and open it again.", size: 11)
 
-        let results = NSButton(title: "Show Results", target: self, action: #selector(copyResults))
-        results.controlSize = .small
-        results.isEnabled = false
-        resultsButton = results
-        let card = NSButton(title: "Clarity Test Card", target: self, action: #selector(showTestCard))
-        card.controlSize = .small
-        let buttons = NSStackView(views: [results, card, NSView()])
-
-        let views: [NSView] = [sep, addrRow, box, statusLabel, streamLabel, screenRow, accessRow, permNote, buttons]
+        // Session results and the clarity test card are in Settings, as on
+        // the PC (not on the main window).
+        let views: [NSView] = [sep, addrRow, box, statusLabel, streamLabel, screenRow, accessRow, permNote]
         for v in views { detail.addArrangedSubview(v) }
         detail.orientation = .vertical
         detail.alignment = .leading
@@ -188,10 +180,8 @@ final class HostController: NSObject {
                 print(report)
                 recordResults(report)
                 guard let self, !self.stopped else { return }
-                self.lastReport = report
-                self.resultsButton.isEnabled = true
                 self.streamLabel.isHidden = true
-                self.statusLabel.stringValue = "Session ended. Show Results to copy them. Waiting for the next viewer."
+                self.statusLabel.stringValue = "Session ended (its results are in Settings). Waiting for the next viewer."
                 self.onStatus("Waiting for a viewer\u{2026}")
             }
             runner = r
@@ -227,12 +217,4 @@ final class HostController: NSObject {
         }
     }
 
-    @objc private func copyResults() {
-        guard let r = lastReport else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(r, forType: .string)
-        showResults(r)
-    }
-
-    @objc private func showTestCard() { testCard.show() }
 }

@@ -358,6 +358,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let resultsButton = NSButton(title: "Last session\u{2019}s results\u{2026}", target: self,
                                      action: #selector(showLastResults))
         resultsButton.bezelStyle = .rounded
+        let cardButton = NSButton(title: "Show the clarity test card", target: self,
+                                  action: #selector(showTestCard))
+        cardButton.bezelStyle = .rounded
+        let cardNote = NSTextField(wrappingLabelWithString: "Fine text, coloured text and 1-pixel lines on this Mac\u{2019}s screen, to compare with what the other device shows while it views this Mac.")
+        cardNote.font = .systemFont(ofSize: 11)
+        cardNote.textColor = .secondaryLabelColor
         // A visible way out (Esc and a click outside work too).
         let closeX = NSButton(image: NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Close") ?? NSImage(),
                               target: self, action: #selector(closeSettingsTapped))
@@ -369,7 +375,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                                heading("When viewing, start in"), radios,
                                heading("Colour"), colour, note,
                                heading("Clipboard"), clipboard, clipNote,
-                               heading("Session results"), resultsButton, heading("Paired devices")]
+                               heading("Session results"), resultsButton,
+                               heading("Clarity test card"), cardButton, cardNote,
+                               heading("Paired devices")]
         let peers = GlassDevice.shared?.peers ?? []
         if peers.isEmpty {
             let none = NSTextField(labelWithString: "None yet.")
@@ -383,6 +391,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             var roles: [String] = []
             if p.roles & 2 != 0 { roles.append("can view this Mac") }
             if p.roles & 1 != 0 { roles.append("this Mac can view it") }
+            // The id tells apart two with one name (an old identity).
+            roles.append("id \(p.shortID)")
             let detail = NSTextField(labelWithString: roles.joined(separator: " \u{00B7} "))
             detail.font = .systemFont(ofSize: 11)
             detail.textColor = .secondaryLabelColor
@@ -435,9 +445,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         UserDefaults.standard.set(sender.selectedSegment == 1, forKey: "fullColour")
     }
 
+    @objc private func showTestCard() {
+        closeSettings()
+        TestCardController.shared.show()
+    }
+
     @objc private func showLastResults() {
         closeSettings()
-        showResults(lastSessionResults ?? "No session yet since Glass started.")
+        showResults(lastSessionResults ?? SessionLog.latest() ?? "No session yet.")
     }
 
     @objc private func pickClipboard(_ sender: NSSegmentedControl) {

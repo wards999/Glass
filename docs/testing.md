@@ -10,6 +10,17 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 14 (lag: frames straight to the Mac's display)
+Protocol v14, as before: update all three machines, and the service on QUIETPC.
+1. Play pool for about a minute with the stats showing, as usual. The
+   bar's handle now hides unless the pointer is near the top.
+2. Hide the stats (⌃⌥⌘S) and play another two minutes, keeping the pointer
+   away from the top. This is the part that counts.
+3. Send both results. The Mac's "presented by" line now says how many
+   frames went straight to the display; "present" and "input → screen"
+   are the numbers to compare with test 13 (20.3 and 49.3 ms).
+4. Say whether it feels less laggy.
+
 ## M5 test 13 (rate control comes back after the weak link)
 Protocol v14, as before: update all three machines, and the service on QUIETPC.
 1. As test 12: play, click "Weak Wi-Fi test" for about a minute, then off,

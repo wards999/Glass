@@ -52,12 +52,19 @@ final class LiveStats {
     var frames = 0
     var presented = 0
     var bytes = 0
+    /// Frames on screen at the refresh they were presented for (macOS put
+    /// the layer straight on the display), and a refresh or more later
+    /// (through the window compositor).
+    var onTime = 0
+    var later = 0
 
     func reset() {
         for s in [encode, network, queue, decode, wait, present, total, interval, input] { s.reset() }
         frames = 0
         presented = 0
         bytes = 0
+        onTime = 0
+        later = 0
     }
 }
 
@@ -661,14 +668,17 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         // The newest frame goes a few ms before the next refresh. Every
         // refresh schedules its own (m5-test4: when one ran late, the next
         // refresh saw it still pending and skipped: 51.5 fps shown of 60).
-        let wait = link.targetTimestamp - CACurrentMediaTime() - presentLead
+        let target = link.targetTimestamp
+        refreshPeriod = link.targetTimestamp - link.timestamp
+        let wait = target - CACurrentMediaTime() - presentLead
         if wait > 0.0005 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in self?.presentNow() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in self?.presentNow(for: target) }
         } else {
-            presentNow()
+            presentNow(for: target)
         }
         pollCursor()
         tickBar()
+        tickHandle()
         let changes = client.infoChanges
         if changes != seenChanges {
             seenChanges = changes
@@ -715,26 +725,49 @@ final class LiveViewer: NSObject, NSWindowDelegate {
 
     /// Presents the newest decoded frame, if there's a new one (main
     /// thread).
-    private func presentNow() {
+    private func presentNow(for target: CFTimeInterval) {
         guard !finished else { return }
         let item: (CVPixelBuffer, FrameTiming)? = lock.withLock {
             defer { latest = nil }
             return latest
         }
         guard let item else { return }
-        present(item.0, item.1)
+        present(item.0, item.1, for: target)
+    }
+
+    /// The display's refresh interval (s), from the display link.
+    private var refreshPeriod: CFTimeInterval = 1.0 / 60
+
+    /// The bar's handle shows only while the pointer is near the top (or
+    /// the bar is open), and for the first seconds: anything drawn over the
+    /// picture makes macOS composite the window, a refresh later (M5).
+    private var handleSeenUs: UInt64 = 0
+
+    private func tickHandle() {
+        guard let handle, let bar, bar.isHidden, let w = window else { return }
+        let now = GlassClock.nowUs()
+        let p = view.convert(w.mouseLocationOutsideOfEventStream, from: nil)
+        let nearTop = view.bounds.contains(p) && p.y > view.bounds.height - 64
+        if nearTop || now - started < 5_000_000 { handleSeenUs = now }
+        let show = now - handleSeenUs < 1_500_000
+        if handle.isHidden == show { handle.isHidden = !show }
     }
 
     @discardableResult
-    private func present(_ pb: CVPixelBuffer, _ t: FrameTiming) -> Bool {
+    private func present(_ pb: CVPixelBuffer, _ t: FrameTiming, for target: CFTimeInterval) -> Bool {
         guard let drawable = layer.nextDrawable(), let cb = renderer.queue.makeCommandBuffer() else { return false }
         renderer.encode(pb, to: drawable.texture, in: cb, fit: true)
         let submitted = GlassClock.nowUs()
         lock.withLock { submittedCount += 1 }
         let client = self.client
+        // On time: shown at the refresh it was presented for. A refresh
+        // later: the window compositor took it (m5-test13: present 20 ms
+        // p50, 5 ms early plus a whole refresh).
+        let onTimeBy = target + refreshPeriod / 2
         drawable.addPresentedHandler { [weak self] d in
             guard let self, d.presentedTime > 0 else { return }
             let shown = GlassClock.us(fromMediaTime: d.presentedTime)
+            let onTime = d.presentedTime < onTimeBy
             // First frame showing a newer input: input -> screen.
             let sentAt = t.inputSeq != 0 ? client.inputSentUs(t.inputSeq) : nil
             self.lock.withLock {
@@ -742,6 +775,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 if newInput { self.lastInputMeasured = t.inputSeq }
                 for s in [self.session, self.recent] {
                     s.presented += 1
+                    if onTime { s.onTime += 1 } else { s.later += 1 }
                     s.wait.push(span(submitted, t.decodeEnd))
                     s.present.push(span(shown, submitted))
                     if t.captureLocal > 0 { s.total.push(span(shown, t.captureLocal)) }
@@ -785,7 +819,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 : "input → screen    (move or type to measure)"
             var lines = [
                 "Glass  \(client.hostName) \(client.host)  \(streamDesc)  [\(pcStyleModifiers ? "⌘→Win ⌃→Ctrl" : "⌘→Ctrl ⌃→Win")]",
-                String(format: "shown %.0f fps  received %.0f fps  %.1f Mbps", Double(r.presented) / secs, Double(r.frames) / secs, Double(r.bytes) * 8 / secs / 1e6),
+                String(format: "shown %.0f fps  received %.0f fps  %.1f Mbps  direct %ld%%", Double(r.presented) / secs, Double(r.frames) / secs, Double(r.bytes) * 8 / secs / 1e6, r.onTime * 100 / max(r.onTime + r.later, 1)),
                 totalLine,
                 inputLine,
                 "  encode \(p50(r.encode)) | network \(p50(r.network)) | queue \(p50(r.queue)) | decode \(p50(r.decode)) | wait \(p50(r.wait)) | present \(p50(r.present))   (p50 ms)",
@@ -932,7 +966,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             if !noticesSeen.isEmpty {
                 out.append("  PC notices: \(noticesSeen.sorted().map { $0 == UInt8(GLASS_NOTICE_INPUT_BLOCKED_ELEVATED) ? "input blocked by an admin window" : "UAC prompt / lock screen" }.joined(separator: ", "))")
             }
-            out.append("  decoder: \(usingHardware ? "hardware" : "SOFTWARE") | presented by: \(presentPath)")
+            let shownAll = max(s.onTime + s.later, 1)
+            out.append("  decoder: \(usingHardware ? "hardware" : "SOFTWARE") | presented by: \(presentPath) | on screen at its own refresh \(s.onTime * 100 / shownAll)% (straight to the display), a refresh later \(s.later * 100 / shownAll)% (through the compositor: stats, the bar or its handle showing)")
             out.append("  clipboard: \(clipSummary)")
             out.append(s.encode.line("encode (host)"))
             out.append(s.network.line("network"))

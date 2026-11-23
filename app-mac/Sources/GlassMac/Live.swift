@@ -277,13 +277,14 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     /// Stats are off unless chosen (bar or ⌃⌥⌘S); the choice is kept.
     private var statsHidden = !UserDefaults.standard.bool(forKey: "showStats")
 
-    /// The weak-link test mode, ⌃⌥⌘L: a pretend 15 Mbps bottleneck on
+    /// The weak-link test mode, in the bar: a pretend 15 Mbps bottleneck on
     /// what arrives (logged in the results with its times).
     static let testLinkMbps: UInt32 = 15
 
     func toggleTestLink() {
         client.testLink = client.testLink == 0 ? Self.testLinkMbps : 0
         lastOverlay = 0 // show it at once
+        updateBar()
     }
 
     func toggleOverlay() {
@@ -579,7 +580,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         let status = "\(client.hostName)  ·  \(i.width)x\(i.height)  ·  \(client.is444 ? "4:4:4" : "4:2:0")  ·  round trip \(Int((Double(st.last_rtt_us) / 1000).rounded())) ms"
         lastBarUpdate = GlassClock.nowUs()
         bar?.update(mode: i.mode, fullColour: client.is444, fullScreen: window.styleMask.contains(.fullScreen),
-                    statsShown: !statsHidden, pcKeys: pcStyleModifiers, status: status)
+                    statsShown: !statsHidden, pcKeys: pcStyleModifiers, testLinkMbps: client.testLink, status: status)
     }
 
     private func barCommand(_ c: ControlBar.Command) {
@@ -600,6 +601,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 pcStyleModifiers.toggle()
                 UserDefaults.standard.set(pcStyleModifiers, forKey: "pcStyleModifiers")
             }
+        case .testLink:
+            toggleTestLink()
         case .disconnect:
             window.performClose(nil)
         }
@@ -755,7 +758,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 inputLine,
                 "  encode \(p50(r.encode)) | network \(p50(r.network)) | queue \(p50(r.queue)) | decode \(p50(r.decode)) | wait \(p50(r.wait)) | present \(p50(r.present))   (p50 ms)",
                 "lost \(st.rx.frames_lost)  skipped \(st.rx.frames_skipped)  keyframe req \(st.keyframe_requests)  decode err \(decodeErrors)  RTT \(String(format: "%.1f", Double(st.last_rtt_us) / 1e3)) ms  input events \(st.input_events)",
-                "⌃⌥⌘F full screen · ⌃⌥⌘S hide stats · ⌃⌥⌘L test weak Wi-Fi · ⌃⌥⌘W disconnect · ⌃⌥⌘Q quit",
+                "⌃⌥⌘F full screen · ⌃⌥⌘S hide stats · ⌃⌥⌘W disconnect · ⌃⌥⌘Q quit",
             ]
             if audioLatencyMs > 0 {
                 lines.insert(String(format: "sound   %.0f ms + the output's %.0f ms (picture p50 %.0f ms)",
@@ -763,7 +766,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             }
             if let n = noticeText(st.host_notice) { lines.insert(n, at: 0) }
             let test = client.testLink
-            if test > 0 { lines.insert("TEST: weak Wi-Fi, \(test) Mbps (⌃⌥⌘L to end)", at: 0) }
+            if test > 0 { lines.insert("TEST: weak Wi-Fi, \(test) Mbps (turn off in the bar)", at: 0) }
             if let f = files { lines.insert(f, at: 0) }
             if now - windowStart >= 2_000_000 {
                 recent.reset()
@@ -774,7 +777,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         overlay.stringValue = text
         // A blocking notice, the test mode and files on their way show even
         // when the stats are hidden.
-        let testOn = client.testLink > 0 ? "TEST: weak Wi-Fi, \(client.testLink) Mbps (⌃⌥⌘L to end)" : nil
+        let testOn = client.testLink > 0 ? "TEST: weak Wi-Fi, \(client.testLink) Mbps (turn off in the bar)" : nil
         let notice = noticeText(st.host_notice) ?? testOn ?? files
         if statsHidden {
             overlay.isHidden = notice == nil

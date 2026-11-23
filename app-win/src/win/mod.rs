@@ -327,6 +327,19 @@ impl Drop for FineTimer {
     }
 }
 
+/// The encoder's bitrate for a viewer's limit: coarse steps (each change
+/// costs a keyframe with FFmpeg's NVENC), the largest at or under the limit,
+/// never above ours.
+fn bitrate_step(limit: i64, ours: i64) -> i64 {
+    const STEPS: [i64; 8] = [80, 60, 40, 30, 20, 15, 10, 8];
+    STEPS
+        .iter()
+        .map(|m| m * 1_000_000)
+        .find(|&b| b <= limit && b <= ours)
+        .unwrap_or(8_000_000)
+        .min(ours)
+}
+
 /// The results' word for `qos::QOS_*`.
 pub(crate) fn qos_word(q: u32) -> &'static str {
     match q as u8 {
@@ -374,6 +387,14 @@ struct HostRun {
     rate_now: i64,
     rate_lo: i64,
     rate_changes: u32,
+    /// The frame-rate lever: the full rate, how often it changed, and how
+    /// often it went down to the viewer's refresh; the video rate (bits/s,
+    /// smoothed) and when the last frame went.
+    full_hz: u32,
+    fps_changes: u32,
+    fps_lowered: u32,
+    avg_bps: f64,
+    last_out_us: u64,
     t0: u64,
     last_capture: u64,
     last_gap: u64,
@@ -462,6 +483,11 @@ impl HostRun {
             rate_now: 0,
             rate_lo: 0,
             rate_changes: 0,
+            full_hz: 0,
+            fps_changes: 0,
+            fps_lowered: 0,
+            avg_bps: 0.0,
+            last_out_us: 0,
             t0: clock::now_us(),
             last_capture: 0,
             last_gap: u64::MAX,
@@ -493,6 +519,12 @@ impl HostRun {
         self.frame_id = self.frame_id.wrapping_add(1);
         match session.send_frame(&f, data) {
             Ok(true) => {
+                if self.last_out_us > 0 {
+                    let dt = out.saturating_sub(self.last_out_us).clamp(1_000, 1_000_000) as f64;
+                    let inst = data.len() as f64 * 8.0 * 1e6 / dt;
+                    self.avg_bps += (inst - self.avg_bps) * 0.05;
+                }
+                self.last_out_us = out;
                 let at = out.saturating_sub(self.t0);
                 if self.big.len() < 5 || data.len() > self.big.last().map_or(0, |b| b.1) {
                     self.big.push((at, data.len(), encode_us, key));
@@ -1077,15 +1109,26 @@ fn run_session<V: ViewerLink>(
     // refresh, without the load of everything (165 fps: m4b-test2's full
     // queue). 90 % of the interval.
     let viewer_hz = session.viewer().refresh_hz as u32;
-    let send_hz = if viewer_hz == 0 {
+    let full_hz = if viewer_hz == 0 {
         fps
     } else {
         (viewer_hz * 2).min(fps.max(1))
     };
-    let min_gap = 900_000 / send_hz.max(1) as u64;
+    // Under a viewer's limit, its own refresh (half): the first, free lever.
+    let low_hz = if viewer_hz == 0 {
+        fps
+    } else {
+        viewer_hz.min(fps.max(1))
+    };
+    let mut send_hz = full_hz;
+    let mut min_gap = 900_000 / send_hz.max(1) as u64;
+    let ours = a.mbps as i64 * 1_000_000;
+    let mut limit: Option<i64> = None;
+    let mut last_step_us = 0u64;
     let mut last_sent = 0u64;
     let mut held: Option<u64> = None;
     run.send_hz = send_hz;
+    run.full_hz = full_hz;
     // 1 ms timer resolution for the session: Windows' default is 15.6 ms,
     // so the cap's "send the held frame in 1 ms" took 16 ms and frames went
     // at 29 fps instead of 60 (m5-test1). Per process on Windows 11.
@@ -1126,25 +1169,61 @@ fn run_session<V: ViewerLink>(
             }
         }
         pending_idr |= session.take_keyframe_request();
-        // Rate control (M5): the viewer's limit, never above ours.
-        if let Some(limit) = session.take_video_rate() {
-            let ours = a.mbps as i64 * 1_000_000;
-            let bps = if limit == 0 {
+        // Rate control (M5): the viewer's limit, never above ours. FFmpeg's
+        // NVENC makes a keyframe at every bitrate change (m5-test10: 68 IDRs
+        // for 63 changes, each at the worst moment), so the first lever is
+        // the frame rate: twice the viewer's refresh down to its refresh,
+        // half the bitrate, no keyframe, nothing visible lost. Only if that
+        // isn't enough, the bitrate, in coarse steps, at most one down a
+        // second and one up per 5 s.
+        if let Some(l) = session.take_video_rate() {
+            limit = (l > 0).then_some((l as i64).min(ours));
+        }
+        {
+            let now = clock::now_us();
+            let use_bps = run.avg_bps as i64;
+            let want_hz = match limit {
+                Some(l) if use_bps > 0 && l < use_bps * 9 / 10 => low_hz,
+                Some(l) if send_hz == low_hz && l < use_bps * 2 => low_hz,
+                _ => full_hz,
+            };
+            if want_hz != send_hz {
+                send_hz = want_hz;
+                min_gap = 900_000 / send_hz.max(1) as u64;
+                run.fps_changes += 1;
+                if send_hz == low_hz && full_hz != low_hz {
+                    run.fps_lowered += 1;
+                }
+            }
+            // At the viewer's refresh, what it still needs from the encoder.
+            let step = match limit {
+                Some(l) if send_hz == low_hz => bitrate_step(l, ours),
+                _ => ours,
+            };
+            let cur = if run.rate_now == 0 {
                 ours
             } else {
-                (limit as i64).min(ours)
+                run.rate_now
             };
-            if bps != run.rate_now {
-                enc.set_bitrate(bps);
+            let since = now.saturating_sub(last_step_us);
+            let ok = if step < cur {
+                since >= 1_000_000
+            } else {
+                since >= 5_000_000
+            };
+            if step != cur && ok {
+                last_step_us = now;
+                enc.set_bitrate(step);
                 run.rate_changes += 1;
-                run.rate_now = bps;
+                run.rate_now = step;
                 run.rate_lo = if run.rate_lo == 0 {
-                    bps
+                    step
                 } else {
-                    run.rate_lo.min(bps)
+                    run.rate_lo.min(step)
                 };
             }
         }
+        run.send_hz = send_hz;
         // The viewer switched colour (4:2:0 <-> 4:4:4); view modes need a
         // virtual display, which a PC host doesn't have yet (M7).
         if let Some((_mode, allow)) = session.take_mode_request() {
@@ -1340,7 +1419,7 @@ fn host_report<V: ViewerLink>(
         }
         let _ = writeln!(
             r,
-            "  rate control (M5): bitrate {} | {} changes{}",
+            "  rate control (M5): bitrate {} | {} changes{} | frame rate lowered to the viewer's refresh {} times",
             if run.rate_changes == 0 || run.rate_now == (a.mbps as i64 * 1_000_000) {
                 format!(
                     "{:.0} Mbps (no limit from the viewer)",
@@ -1357,13 +1436,14 @@ fn host_report<V: ViewerLink>(
                 format!(", lowest {:.1} Mbps", run.rate_lo as f64 / 1e6)
             } else {
                 String::new()
-            }
+            },
+            run.fps_lowered
         );
         if run.send_hz > 0 {
             let _ = writeln!(
                 r,
                 "  frame rate (M5): at most {} fps, twice the viewer's screen | {} frames held back (a newer one went instead)",
-                run.send_hz, run.capped
+                run.full_hz.max(run.send_hz), run.capped
             );
         }
         let _ = writeln!(

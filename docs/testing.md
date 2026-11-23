@@ -10,6 +10,18 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 11 (rate control: frame rate first)
+Protocol v14, as before: update all three machines, and the service on QUIETPC.
+1. 3D pool for about 30 s as normal.
+2. Open the control bar (the handle at the top) and click "Weak Wi-Fi
+   test": it turns orange and says "15 Mbps". Keep playing for about a
+   minute. Expected: far fewer bitrate changes and keyframes than in
+   test 10; the picture stays smooth.
+3. Click it again (off). Within a few seconds it climbs back.
+4. Send both results. On the PC, "rate control (M5)" now says how often
+   the frame rate was lowered, and "IDRs" should be close to the bitrate
+   changes, not 68.
+
 ## M5 test 10 (rate control, with the weak-link test mode)
 Protocol v14: update all three machines, and the service on QUIETPC.
 1. 3D pool for about 30 s as normal.

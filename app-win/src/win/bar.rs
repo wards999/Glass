@@ -41,6 +41,8 @@ pub const ID_FULLSCREEN: usize = 120;
 pub const ID_PIN: usize = 121;
 pub const ID_STATS: usize = 123;
 pub const ID_DISCONNECT: usize = 122;
+/// The weak-link test mode on/off (M5), amber while on.
+pub const ID_TEST_LINK: usize = 124;
 
 /// The part of `client` (screen coordinates) that is on `owner`'s monitor:
 /// the handle and the bar stay inside it, so they're never off screen when
@@ -118,6 +120,9 @@ mod look {
     pub const WEAK: (u8, u8, u8) = (139, 149, 163);
     pub const DISABLED: (u8, u8, u8) = (88, 96, 108);
     pub const DANGER: (u8, u8, u8) = (240, 110, 110);
+    /// The test mode while on: hard to miss, so a result isn't mistaken
+    /// for a real link's.
+    pub const TEST: (u8, u8, u8) = (222, 146, 40);
     pub const EDGE: u32 = 0x0048_3E37; // COLORREF 0x00BBGGRR: rgb(55, 62, 72)
 }
 
@@ -283,6 +288,8 @@ impl State {
                         },
                     )
                 }
+            } else if item.on && item.id == ID_TEST_LINK {
+                (Some(look::TEST), look::STRONG)
             } else if item.on {
                 (Some(look::ACCENT), look::STRONG)
             } else {
@@ -536,6 +543,7 @@ impl Bar {
                 item(ID_444, "Full colour \u{00B7} 4:4:4", 2, false),
                 item(ID_FULLSCREEN, "Full screen", 0, false),
                 item(ID_STATS, "Stats", 0, false),
+                item(ID_TEST_LINK, "Weak Wi-Fi test", 0, false),
                 item(ID_PIN, "Pin", 0, false),
                 item(ID_DISCONNECT, "Disconnect", 0, true),
             ];
@@ -601,6 +609,7 @@ impl Bar {
         views_ok: bool,
         fullscreen: bool,
         stats: bool,
+        test_link: u32,
         status: &str,
         host_screen: &str,
     ) {
@@ -629,6 +638,18 @@ impl Bar {
                 }
                 ID_FULLSCREEN => i.label = if fullscreen { "Window" } else { "Full screen" }.into(),
                 ID_STATS => i.on = stats,
+                ID_TEST_LINK => {
+                    i.on = test_link > 0;
+                    i.label = if test_link > 0 {
+                        format!("Weak Wi-Fi test \u{00B7} {test_link} Mbps")
+                    } else {
+                        "Weak Wi-Fi test".into()
+                    };
+                    i.hint = Some(
+                        "Test mode: what arrives goes through a pretend 15 Mbps link, to try rate control. Logged in the results."
+                            .into(),
+                    );
+                }
                 ID_PIN => i.on = self.pinned,
                 _ => {}
             }

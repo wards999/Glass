@@ -6,7 +6,7 @@ import AppKit
 /// Controls never take keyboard focus, so typing keeps going to the host.
 final class ControlBar: NSVisualEffectView {
     enum Command {
-        case view(UInt8), colour(Bool), fullScreen, stats, pcKeys, disconnect
+        case view(UInt8), colour(Bool), fullScreen, stats, pcKeys, testLink, disconnect
     }
 
     var onCommand: (Command) -> Void = { _ in }
@@ -17,6 +17,8 @@ final class ControlBar: NSVisualEffectView {
     private let stats = NSButton()
     private let keys = NSButton()
     private let pin = NSButton()
+    /// The weak-link test mode (M5), orange while on.
+    private let testLink = NSButton()
     private let status = NSTextField(labelWithString: "")
     /// Segment index -> view mode: Fit, More space, Larger, host's screen
     /// (only the host's screen when the host can't do the others).
@@ -67,6 +69,8 @@ final class ControlBar: NSVisualEffectView {
         button(keys, "PC keys", #selector(keysTapped), toggle: true)
         keys.isHidden = hostIsMac // between Macs, ⌘ is ⌘
         keys.toolTip = "On: ⌘ acts as the Windows key and ⌃ as Ctrl. Off: ⌘ acts as Ctrl (⌘C copies)."
+        button(testLink, "Weak Wi-Fi test", #selector(testLinkTapped), toggle: true)
+        testLink.toolTip = "Test mode: what arrives goes through a pretend 15 Mbps link, to try rate control. Logged in the results."
         button(pin, "Pin", #selector(pinTapped), toggle: true)
         let disconnect = NSButton()
         button(disconnect, "Disconnect", #selector(disconnectTapped))
@@ -76,8 +80,8 @@ final class ControlBar: NSVisualEffectView {
         status.lineBreakMode = .byTruncatingTail
         status.setContentCompressionResistancePriority(.init(1), for: .horizontal)
 
-        for c in [views, colour, full, stats, keys, pin, disconnect] as [NSControl] { c.refusesFirstResponder = true }
-        let row = NSStackView(views: [views, colour, full, stats, keys, pin, disconnect, status])
+        for c in [views, colour, full, stats, keys, testLink, pin, disconnect] as [NSControl] { c.refusesFirstResponder = true }
+        let row = NSStackView(views: [views, colour, full, stats, keys, testLink, pin, disconnect, status])
         row.orientation = .horizontal
         row.spacing = 8
         row.edgeInsets = NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 12)
@@ -95,13 +99,18 @@ final class ControlBar: NSVisualEffectView {
 
     override var acceptsFirstResponder: Bool { false }
 
-    func update(mode: UInt8, fullColour: Bool, fullScreen: Bool, statsShown: Bool, pcKeys: Bool, status text: String) {
+    func update(mode: UInt8, fullColour: Bool, fullScreen: Bool, statsShown: Bool, pcKeys: Bool, testLinkMbps: UInt32, status text: String) {
         if let i = modes.firstIndex(of: mode) { views.selectedSegment = i }
         colour.selectedSegment = fullColour ? 1 : 0
         full.title = fullScreen ? "Window" : "Full screen"
         stats.state = statsShown ? .on : .off
         keys.state = pcKeys ? .on : .off
         pin.state = pinned ? .on : .off
+        let testOn = testLinkMbps > 0
+        testLink.state = testOn ? .on : .off
+        testLink.title = testOn ? "Weak Wi-Fi test · \(testLinkMbps) Mbps" : "Weak Wi-Fi test"
+        testLink.bezelColor = testOn ? .systemOrange : nil
+        testLink.contentTintColor = testOn ? .white : nil
         status.stringValue = text
     }
 
@@ -113,6 +122,7 @@ final class ControlBar: NSVisualEffectView {
     @objc private func fullTapped() { onCommand(.fullScreen) }
     @objc private func statsTapped() { onCommand(.stats) }
     @objc private func keysTapped() { onCommand(.pcKeys) }
+    @objc private func testLinkTapped() { onCommand(.testLink) }
     @objc private func pinTapped() { pinned.toggle() }
     @objc private func disconnectTapped() { onCommand(.disconnect) }
 }

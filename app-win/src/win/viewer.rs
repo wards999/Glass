@@ -47,8 +47,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_C, VK_CONTROL, VK_F, VK_L, VK_MENU,
-    VK_Q, VK_R, VK_S, VK_SHIFT, VK_W,
+    GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_C, VK_CONTROL, VK_F, VK_MENU, VK_Q,
+    VK_R, VK_S, VK_SHIFT, VK_W,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -123,8 +123,6 @@ const WM_STREAM_CHANGED: u32 = WM_APP + 3;
 const WM_NEXT_MODE: u32 = WM_APP + 4;
 /// Posted by the keyboard hook: full colour (4:4:4) on/off.
 const WM_TOGGLE_444: u32 = WM_APP + 5;
-/// Ctrl+Alt+Shift+L: the weak-link test mode on/off (M5).
-const WM_TOGGLE_TEST_LINK: u32 = WM_APP + 7;
 /// The test mode's pretend bottleneck (Mbps).
 const TEST_LINK_MBPS: u32 = 15;
 const TIMER_CURSOR: usize = 1;
@@ -839,13 +837,10 @@ fn overlay_text(
     if test > 0 {
         lines.insert(
             0,
-            format!("TEST: weak Wi-Fi, {test} Mbps (Ctrl+Alt+Shift+L to end)"),
+            format!("TEST: weak Wi-Fi, {test} Mbps (turn off in the bar)"),
         );
     }
-    lines.push(
-        "Ctrl+Alt+Shift+S hide stats \u{00B7} +F full screen \u{00B7} +L test weak Wi-Fi \u{00B7} +Q disconnect"
-            .into(),
-    );
+    lines.push("Ctrl+Alt+Shift+S hide stats \u{00B7} +F full screen \u{00B7} +Q disconnect".into());
     lines.join("\n")
 }
 
@@ -1311,6 +1306,7 @@ impl Ui {
             caps & HOST_CAP_VIEW_MODES != 0,
             self.fullscreen,
             self.sh.show_stats.load(Ordering::Relaxed),
+            c.test_link(),
             &status,
             match c.host_os() {
                 HOST_OS_MAC => "Mac's screen",
@@ -1480,6 +1476,16 @@ impl Ui {
                 let on = !self.sh.show_stats.load(Ordering::Relaxed);
                 self.sh.show_stats.store(on, Ordering::Relaxed);
                 save_stats_pref(on);
+                self.tick_stats();
+            }
+            bar::ID_TEST_LINK => {
+                let c = &self.sh.client;
+                let on = c.test_link() == 0;
+                c.set_test_link(if on { TEST_LINK_MBPS } else { 0 });
+                println!(
+                    "Test mode (weak Wi-Fi): {}",
+                    if on { "on, 15 Mbps" } else { "off" }
+                );
                 self.tick_stats();
             }
             bar::ID_PIN => {
@@ -1746,8 +1752,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         Some(WM_TOGGLE_FULLSCREEN)
                     } else if vk == VK_C.0 {
                         Some(WM_TOGGLE_444)
-                    } else if vk == VK_L.0 {
-                        Some(WM_TOGGLE_TEST_LINK)
                     } else if vk == VK_R.0 {
                         Some(WM_NEXT_MODE)
                     } else if vk == VK_Q.0 || vk == VK_W.0 {
@@ -1891,15 +1895,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 c.set_mode(next, sh.allow_444());
                 Some(LRESULT(0))
             }
-            WM_TOGGLE_TEST_LINK => {
-                let on = sh.client.test_link() == 0;
-                sh.client.set_test_link(if on { TEST_LINK_MBPS } else { 0 });
-                println!(
-                    "Test mode (weak Wi-Fi): {}",
-                    if on { "on, 15 Mbps" } else { "off" }
-                );
-                Some(LRESULT(0))
-            }
             WM_TOGGLE_444 => {
                 let want = !sh.want_444.load(Ordering::Relaxed);
                 sh.want_444.store(want, Ordering::Relaxed);
@@ -1996,8 +1991,6 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
                         Some(WM_TOGGLE_FULLSCREEN)
                     } else if vk == VK_C.0 {
                         Some(WM_TOGGLE_444)
-                    } else if vk == VK_L.0 {
-                        Some(WM_TOGGLE_TEST_LINK)
                     } else if vk == VK_S.0 {
                         let _ = PostMessageW(
                             Some(ui.hwnd),

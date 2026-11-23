@@ -695,7 +695,7 @@ impl AudioReceiver {
         let err = (queued.min(self.depth_avg) - self.target_us as f64) / 10_000.0;
         // Input samples per output sample: up to 2 % faster to catch up a
         // backlog (a third of a semitone, briefly), 0.5 % slower at most.
-        self.ratio = 1.0 + (err * 0.005).clamp(-0.005, CATCH_UP_SPEED);
+        self.ratio = 1.0 + (err * 0.01).clamp(-0.005, CATCH_UP_SPEED);
         self.out.clear();
         // Output sample j sits at input position pos + j*ratio, where -1
         // is the previous frame's last sample.

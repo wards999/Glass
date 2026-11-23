@@ -309,6 +309,24 @@ pub fn record(args: &[String]) -> Res<()> {
     Ok(())
 }
 
+/// 1 ms timer resolution while it lives (then back to the default).
+struct FineTimer;
+
+impl FineTimer {
+    fn new() -> Self {
+        // SAFETY: a plain winmm call, undone in Drop.
+        unsafe { windows::Win32::Media::timeBeginPeriod(1) };
+        Self
+    }
+}
+
+impl Drop for FineTimer {
+    fn drop(&mut self) {
+        // SAFETY: matches the timeBeginPeriod in `new`.
+        unsafe { windows::Win32::Media::timeEndPeriod(1) };
+    }
+}
+
 /// The results' word for `qos::QOS_*`.
 pub(crate) fn qos_word(q: u32) -> &'static str {
     match q as u8 {
@@ -973,6 +991,10 @@ fn run_session<V: ViewerLink>(
     let mut last_sent = 0u64;
     let mut held: Option<u64> = None;
     run.send_hz = send_hz;
+    // 1 ms timer resolution for the session: Windows' default is 15.6 ms,
+    // so the cap's "send the held frame in 1 ms" took 16 ms and frames went
+    // at 29 fps instead of 60 (m5-test1). Per process on Windows 11.
+    let _timer = FineTimer::new();
     if let Some(frame) = first.take().filter(|f| f.size == (w, h)) {
         // Encoded now and kept as the last frame; the keyframe the viewer
         // asks for once it's ready resends it (pending_idr stays set).

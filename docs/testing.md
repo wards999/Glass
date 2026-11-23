@@ -10,6 +10,16 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 2 (60 fps for real; one refresh to show it)
+The same 3D pool test.
+1. Smooth? The PC's results: "frames sent" close to 60 fps while the game
+   moves, and fewer "held back".
+2. The Mac's results: "presented by: CAMetalDisplayLink (1 frame)",
+   "present" p50 near 16 ms (was 32), and "capture -> screen" lower than
+   54 ms. Try full screen too (⌃⌥⌘F), with the stats off once you've
+   read them: full screen can skip compositing.
+3. The cue click should still land with the hit ("A/V" a few ms behind).
+
 ## M5 test 1 (frames at the viewer's refresh)
 The same 3D pool test: QUIETPC22 (Glass.exe sharing) viewed from the Mac.
 1. The game should look smoother. Turn the stats on: "shown" should be

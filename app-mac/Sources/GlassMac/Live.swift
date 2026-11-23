@@ -80,6 +80,10 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private var layer: CAMetalLayer!
     private var overlay: NSTextField!
     private var link: CADisplayLink?
+    /// Presents frames with one refresh of latency (M5, m5-test1: with the
+    /// view's display link a frame took two refreshes, 32 ms, to show).
+    private var metalLink: CAMetalDisplayLink?
+    private var presentPath = "display link (2 frames)"
     private var keyMonitor: Any?
     private var finished = false
     private let started = GlassClock.nowUs()
@@ -171,6 +175,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         layer.pixelFormat = .bgra8Unorm
         layer.framebufferOnly = true
         layer.displaySyncEnabled = true
+        // Opaque, so full screen can skip compositing.
+        layer.isOpaque = true
         layer.backgroundColor = NSColor.black.cgColor
         view.onResize = { [weak self] in self?.updateDrawableSize() }
         view.onMouse = { [weak self] e in self?.handleMouse(e) }
@@ -238,6 +244,14 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         let link = view.displayLink(target: self, selector: #selector(tick(_:)))
         link.add(to: .main, forMode: .common)
         self.link = link
+        // Frames go out through a Metal display link asking for one frame
+        // of latency; the view's link above keeps doing the housekeeping.
+        let ml = CAMetalDisplayLink(metalLayer: layer)
+        ml.preferredFrameLatency = 1
+        ml.delegate = self
+        ml.add(to: .main, forMode: .common)
+        metalLink = ml
+        presentPath = "CAMetalDisplayLink (1 frame)"
 
         let t = Thread { self.decodeLoop() }
         t.name = "glass.decode"
@@ -582,11 +596,11 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     // MARK: main thread
 
     @objc private func tick(_ link: CADisplayLink) {
-        let item: (CVPixelBuffer, FrameTiming)? = lock.withLock {
+        let item: (CVPixelBuffer, FrameTiming)? = metalLink != nil ? nil : lock.withLock {
             defer { latest = nil }
             return latest
         }
-        if let item { present(item.0, item.1) }
+        if metalLink == nil, let item { present(item.0, item.1) }
         pollCursor()
         tickBar()
         let changes = client.infoChanges
@@ -633,8 +647,18 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         }
     }
 
-    private func present(_ pb: CVPixelBuffer, _ t: FrameTiming) {
-        guard let drawable = layer.nextDrawable(), let cb = renderer.queue.makeCommandBuffer() else { return }
+    /// The Metal display link's turn: the newest decoded frame, if any, into
+    /// the drawable it gives.
+    fileprivate func metalTick(_ update: CAMetalDisplayLink.Update) {
+        let item: (CVPixelBuffer, FrameTiming)? = lock.withLock {
+            defer { latest = nil }
+            return latest
+        }
+        if let item { present(item.0, item.1, into: update.drawable) }
+    }
+
+    private func present(_ pb: CVPixelBuffer, _ t: FrameTiming, into given: CAMetalDrawable? = nil) {
+        guard let drawable = given ?? layer.nextDrawable(), let cb = renderer.queue.makeCommandBuffer() else { return }
         renderer.encode(pb, to: drawable.texture, in: cb, fit: true)
         let submitted = GlassClock.nowUs()
         lock.withLock { submittedCount += 1 }
@@ -720,6 +744,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         keyMonitor = nil
         link?.invalidate()
         link = nil
+        metalLink?.invalidate()
+        metalLink = nil
         closingReason = reason
         // Free resizing from here on (clears the aspect ratio), so leaving
         // full screen can always work out a window size.
@@ -802,7 +828,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             if !noticesSeen.isEmpty {
                 out.append("  PC notices: \(noticesSeen.sorted().map { $0 == UInt8(GLASS_NOTICE_INPUT_BLOCKED_ELEVATED) ? "input blocked by an admin window" : "UAC prompt / lock screen" }.joined(separator: ", "))")
             }
-            out.append("  decoder: \(usingHardware ? "hardware" : "SOFTWARE")")
+            out.append("  decoder: \(usingHardware ? "hardware" : "SOFTWARE") | presented by: \(presentPath)")
             out.append("  clipboard: \(clipSummary)")
             out.append(s.encode.line("encode (host)"))
             out.append(s.network.line("network"))
@@ -815,5 +841,11 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             out.append(s.interval.line("present interval"))
             return out.joined(separator: "\n")
         }
+    }
+}
+
+extension LiveViewer: CAMetalDisplayLinkDelegate {
+    func metalDisplayLink(_ link: CAMetalDisplayLink, needsUpdate update: CAMetalDisplayLink.Update) {
+        metalTick(update)
     }
 }

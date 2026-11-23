@@ -22,6 +22,12 @@ mod tls;
 
 /// Crate version, e.g. "0.0.1".
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Which build this is: the test-build tag CI builds from (`GLASS_BUILD`),
+/// else "local". In every results banner, so a mismatch shows.
+pub const BUILD: &str = match option_env!("GLASS_BUILD") {
+    Some(b) => b,
+    None => "local",
+};
 
 // LATER(M4): Reed-Solomon FEC over packet groups.
 // LATER(M5): adaptive jitter buffer.

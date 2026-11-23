@@ -54,6 +54,15 @@ unsafe fn set_err(err: *mut i32, v: i32) {
 
 static VERSION_C: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
+/// NUL-terminated build name (`BUILD`: the test-build tag, or "local").
+/// Static; do not free.
+#[no_mangle]
+pub extern "C" fn glass_core_build() -> *const c_char {
+    static B: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    B.get_or_init(|| std::ffi::CString::new(crate::BUILD).unwrap_or_default())
+        .as_ptr()
+}
+
 /// NUL-terminated core version string, e.g. "0.0.1". Static; do not free.
 #[no_mangle]
 pub extern "C" fn glass_core_version() -> *const c_char {

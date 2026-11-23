@@ -411,6 +411,7 @@ pub fn host(args: &[String]) -> Res<()> {
 /// Glass window how it's going through `C:\ProgramData\Glass\status.txt`.
 pub fn agent(args: &[String]) -> Res<()> {
     service::agent_env();
+    open_com_to_desktop();
     let end = Arc::new(std::sync::atomic::AtomicBool::new(false));
     service::watch_end(end.clone());
     let status = Arc::new(std::sync::Mutex::new(service::Status::default()));
@@ -472,6 +473,34 @@ pub fn agent(args: &[String]) -> Res<()> {
         beat.lock().unwrap_or_else(|e| e.into_inner()).write();
     });
     host_with(&a, ui)
+}
+
+/// The agent runs as SYSTEM, and files pasted on this PC come from its
+/// virtual-files object (`vfiles.rs`): by default COM refuses the signed-in
+/// user's Explorer any call into a SYSTEM process, so the paste failed
+/// (m5c-test4). The object only hands out what's on the clipboard, which any
+/// program on this desktop can read anyway, so calls aren't checked.
+fn open_com_to_desktop() {
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoInitializeSecurity, COINIT_MULTITHREADED, EOAC_NONE,
+        RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IDENTIFY,
+    };
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        if let Err(e) = CoInitializeSecurity(
+            None,
+            -1,
+            None,
+            None,
+            RPC_C_AUTHN_LEVEL_DEFAULT,
+            RPC_C_IMP_LEVEL_IDENTIFY,
+            None,
+            EOAC_NONE,
+            None,
+        ) {
+            println!("Couldn't open the clipboard's files to this desktop: {e}");
+        }
+    }
 }
 
 /// Where a host's messages go: the console (`glass host`) or the app's window.

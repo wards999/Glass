@@ -167,10 +167,11 @@ fn find() -> Result<(), Box<dyn std::error::Error>> {
 /// "Glass (Windows) <version> | core <v> | protocol v<n>"
 pub fn banner() -> String {
     format!(
-        "Glass (Windows) {} | core {} | protocol v{}",
+        "Glass (Windows) {} | core {} | protocol v{} | build {}",
         VERSION,
         glass_core::VERSION,
-        glass_core::protocol::PROTOCOL_VERSION
+        glass_core::protocol::PROTOCOL_VERSION,
+        glass_core::BUILD
     )
 }
 

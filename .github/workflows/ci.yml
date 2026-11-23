@@ -20,6 +20,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Shown in every results banner (core BUILD).
+  GLASS_BUILD: ${{ github.ref_name }}
 
 jobs:
   changes:

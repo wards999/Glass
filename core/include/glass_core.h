@@ -812,6 +812,12 @@ typedef struct {
 } GLASS_ClipProgress;
 
 /**
+ * NUL-terminated build name (`BUILD`: the test-build tag, or "local").
+ * Static; do not free.
+ */
+const char *glass_core_build(void);
+
+/**
  * NUL-terminated core version string, e.g. "0.0.1". Static; do not free.
  */
 const char *glass_core_version(void);

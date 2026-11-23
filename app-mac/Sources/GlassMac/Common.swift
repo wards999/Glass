@@ -8,7 +8,7 @@ var appVersion: String {
 }
 
 var banner: String {
-    "Glass (macOS) \(appVersion) | core \(GlassCore.version) | protocol v\(GlassCore.protocolVersion)"
+    "Glass (macOS) \(appVersion) | core \(GlassCore.version) | protocol v\(GlassCore.protocolVersion) | build \(GlassCore.build)"
 }
 
 func systemInfo() -> String {

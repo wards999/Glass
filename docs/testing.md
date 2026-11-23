@@ -10,6 +10,16 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 12 (the whole PC screen on the Mac; rate control's climb)
+Protocol v14, as before: update all three machines, and the service on QUIETPC.
+1. Connect from the Mac: the whole PC screen shows in full screen,
+   including the pool game's chat panel on the right, with thin black bars
+   above and below. Leave and re-enter full screen (⌃⌥⌘F twice): the same.
+2. As test 11: play, click "Weak Wi-Fi test" for about a minute, then off.
+   Expected: the frame rate lowered only a few times (not 18), and far
+   fewer keyframes asked for by the Mac (not 80).
+3. Send both results.
+
 ## M5 test 11 (rate control: frame rate first)
 Protocol v14, as before: update all three machines, and the service on QUIETPC.
 1. 3D pool for about 30 s as normal.

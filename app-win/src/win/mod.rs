@@ -330,13 +330,25 @@ impl Drop for FineTimer {
 /// The encoder's bitrate for a viewer's limit: coarse steps (each change
 /// costs a keyframe with FFmpeg's NVENC), the largest at or under the limit,
 /// never above ours.
+const BITRATE_STEPS: [i64; 8] = [80, 60, 40, 30, 20, 15, 10, 8];
+
 fn bitrate_step(limit: i64, ours: i64) -> i64 {
-    const STEPS: [i64; 8] = [80, 60, 40, 30, 20, 15, 10, 8];
-    STEPS
+    BITRATE_STEPS
         .iter()
         .map(|m| m * 1_000_000)
         .find(|&b| b <= limit && b <= ours)
         .unwrap_or(8_000_000)
+        .min(ours)
+}
+
+/// The next bitrate step above `cur` (bits/s), never above ours.
+fn step_up(cur: i64, ours: i64) -> i64 {
+    BITRATE_STEPS
+        .iter()
+        .rev()
+        .map(|m| m * 1_000_000)
+        .find(|&b| b > cur)
+        .unwrap_or(ours)
         .min(ours)
 }
 
@@ -1182,34 +1194,55 @@ fn run_session<V: ViewerLink>(
         {
             let now = clock::now_us();
             let use_bps = run.avg_bps as i64;
-            let want_hz = match limit {
-                Some(l) if use_bps > 0 && l < use_bps * 9 / 10 => low_hz,
-                Some(l) if send_hz == low_hz && l < use_bps * 2 => low_hz,
-                _ => full_hz,
-            };
-            if want_hz != send_hz {
-                send_hz = want_hz;
-                min_gap = 900_000 / send_hz.max(1) as u64;
-                run.fps_changes += 1;
-                if send_hz == low_hz && full_hz != low_hz {
-                    run.fps_lowered += 1;
-                }
-            }
-            // At the viewer's refresh, what it still needs from the encoder.
-            let step = match limit {
-                Some(l) if send_hz == low_hz => bitrate_step(l, ours),
-                _ => ours,
-            };
             let cur = if run.rate_now == 0 {
                 ours
             } else {
                 run.rate_now
             };
             let since = now.saturating_sub(last_step_us);
+            // Down at once; back up only from the top of the bitrate steps,
+            // with room to spare and 5 s calm (m5-test11: jumping from 60 fps
+            // at ~10 Mbps straight back to the full rate at 80 overflowed the
+            // link 18 times, and each loss cost a keyframe).
+            let want_hz = match limit {
+                Some(l) if use_bps > 0 && l < use_bps * 9 / 10 => low_hz,
+                _ if send_hz == low_hz
+                    && (cur < ours
+                        || since < 5_000_000
+                        || matches!(limit, Some(l) if l < use_bps * 2)) =>
+                {
+                    low_hz
+                }
+                _ => full_hz,
+            };
+            if want_hz != send_hz {
+                send_hz = want_hz;
+                min_gap = 900_000 / send_hz.max(1) as u64;
+                run.fps_changes += 1;
+                last_step_us = now;
+                if send_hz == low_hz && full_hz != low_hz {
+                    run.fps_lowered += 1;
+                }
+            }
+            // At the viewer's refresh, what it still needs from the encoder:
+            // down straight to the step under the limit, up one step at a
+            // time, only with a quarter to spare.
+            let step = match limit {
+                _ if send_hz != low_hz => ours,
+                None => step_up(cur, ours),
+                Some(l) => {
+                    let fits = bitrate_step(l, ours);
+                    if fits < cur {
+                        fits
+                    } else {
+                        step_up(cur, ours).min(bitrate_step(l * 4 / 5, ours).max(cur))
+                    }
+                }
+            };
             let ok = if step < cur {
                 since >= 1_000_000
             } else {
-                since >= 5_000_000
+                since >= 2_000_000
             };
             if step != cur && ok {
                 last_step_us = now;

@@ -186,7 +186,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         window.title = "Glass — \(client.hostName)"
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.fullScreenPrimary]
-        window.contentAspectRatio = NSSize(width: w, height: h)
+        pictureAspect = NSSize(width: w, height: h)
+        window.contentAspectRatio = pictureAspect
         window.backgroundColor = .black
         window.acceptsMouseMovedEvents = true
         window.delegate = self
@@ -319,6 +320,23 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     /// disconnect and the rest.
     func window(_ window: NSWindow, willUseFullScreenPresentationOptions proposedOptions: NSApplication.PresentationOptions = []) -> NSApplication.PresentationOptions {
         [.fullScreen, .hideDock, .hideMenuBar]
+    }
+
+    /// The picture's shape, kept for the window (not used in full screen).
+    private var pictureAspect = NSSize(width: 16, height: 9)
+
+    /// Full screen is the whole screen, whatever the picture's shape: no
+    /// aspect ratio while there (it's restored on the way out).
+    func windowWillEnterFullScreen(_ notification: Notification) {
+        window.resizeIncrements = NSSize(width: 1, height: 1)
+    }
+
+    func window(_ window: NSWindow, willUseFullScreenContentSize proposedSize: NSSize) -> NSSize {
+        proposedSize
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        updateDrawableSize()
     }
 
     /// Switching away (⌘Tab, another window): let go of everything on the PC.
@@ -617,7 +635,12 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         // throws: the m3d-test12/14 crashes).
         guard i.width > 0, i.height > 0, !finished else { return }
         shownInfo = i
-        window.contentAspectRatio = NSSize(width: Int(i.width), height: Int(i.height))
+        pictureAspect = NSSize(width: Int(i.width), height: Int(i.height))
+        // Only in a window: in full screen the aspect ratio made AppKit size
+        // the content 16:9 at the screen's height, wider than a 16:10 Mac
+        // (m5-test11: the right ~10% of the PC's screen off the edge). Full
+        // screen letterboxes instead (fitViewport).
+        if !window.styleMask.contains(.fullScreen) { window.contentAspectRatio = pictureAspect }
         updateDrawableSize()
         cursorGeneration &-= 1 // rescale the pointer on the next poll
         updateBar()
@@ -817,7 +840,9 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private var closingReason: String?
 
     func windowDidExitFullScreen(_ notification: Notification) {
-        if finished { finishClose() }
+        if finished { finishClose(); return }
+        if pictureAspect.width > 0, pictureAspect.height > 0 { window.contentAspectRatio = pictureAspect }
+        updateDrawableSize()
     }
 
     /// Closes the window (once) and hands over the report, after the close

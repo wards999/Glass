@@ -37,8 +37,11 @@
 
 /**
  * Earlier frames repeated in each datagram.
+ * (3: three datagrams lost in a row cost nothing, with no wait for a
+ * resend. With 2, 5 % loss concealed a frame about once a minute once the
+ * buffer stopped hiding ~20 ms of extra delay, m4b-test2.)
  */
-#define GLASS_REDUNDANCY 2
+#define GLASS_REDUNDANCY 3
 
 /**
  * Largest Opus frame kept (bytes): 10 ms at 192 kbps is ~240.
@@ -51,7 +54,7 @@
 #define GLASS_HISTORY 64
 
 /**
- * A whole datagram, at most.
+ * The output buffer's size; a datagram is cut to [`WIRE_LIMIT`].
  */
 #define GLASS_MAX_DATAGRAM (GLASS_HEADER + ((GLASS_REDUNDANCY + 1) * (2 + GLASS_MAX_OPUS)))
 
@@ -1088,6 +1091,18 @@ typedef struct {
    * few ms. Compare with the picture's capture -> screen for A/V sync.
    */
   uint32_t latency_ms;
+  /**
+   * All the sound waiting to be played (ms): the decoded buffer plus
+   * frames not yet decoded. This, not the buffer alone, is held at the
+   * target (m4b-test1: frames queued while the Mac's output started,
+   * and the sound stayed half a second behind the picture).
+   */
+  uint32_t queued_ms;
+  /**
+   * Sound skipped to catch up (ms): after the output was late to start,
+   * or a stall left more than the target waiting.
+   */
+  uint64_t skipped_ms;
 } GLASS_AudioStats;
 
 /**

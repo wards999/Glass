@@ -287,11 +287,11 @@ ADR 0023.
 | 0 | 4 | `"GLAU"` |
 | 4 | 4 | seq of the newest frame (+1 per 10 ms) |
 | 8 | 8 | its capture time, host clock µs (0 = a resend) |
-| 16 | 1 | n frames, newest first: frame k is seq − k (n ≤ 3) |
+| 16 | 1 | n frames, newest first: frame k is seq − k (n ≤ 4; older copies left out if the datagram would exceed 1376 bytes) |
 | 17 | … | n × (len u16, Opus packet) |
 
 Opus: 48 kHz stereo, 10 ms, restricted low-delay. Each datagram repeats
-the 2 frames before its newest. Sealed with the host's key.
+the 3 frames before its newest (2 in m4b-test1). Sealed with the host's key.
 
 ### Audio NACK (viewer → host, 9 bytes)
 

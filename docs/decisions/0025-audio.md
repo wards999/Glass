@@ -23,7 +23,8 @@ Targets (SPEC §2): audio latency ≤ 40 ms, in sync with the picture
   - Opus's own concealment (PLC) covers a frame that never comes.
 - **Transport** (`core/src/audio.rs`): a sealed `"GLAU"` datagram on the
   session's media socket.
-  - Each datagram carries the newest frame plus the 2 before it, so losing
+  - Each datagram carries the newest frame plus the 3 before it (2 at
+    first; see below), so losing
     one or two datagrams in a row costs nothing and adds no delay. That's
     about 600 kbps, small next to video.
   - Longer gaps are asked for again with a `"GLNA"` NACK. The host keeps
@@ -65,6 +66,30 @@ Targets (SPEC §2): audio latency ≤ 40 ms, in sync with the picture
   | random 10 % | 1 | 0 | 20 ms |
   | bursts 1.1 % | 0 | 0 | 20 ms |
   | bursts 3.9 % (heavy) | 1 | 4 | 30 ms |
+
+## Revised after m4b-test1: sound in step with the picture
+In m4b-test1 the sound ran half a second behind. Frames queued while the
+Mac's output started, and only the decoded buffer was held at its target,
+so the backlog stayed for the whole session. Now:
+- **The total is held**, all the sound waiting (decoded and not): 20 ms
+  normally. It can grow after losses, but never past 50 ms (it was 80),
+  so sync holds on bad Wi-Fi too.
+- **Catching up:**
+  - before the output reads, only the newest frames are kept;
+  - a backlog under 100 ms plays up to 2 % faster until it's gone
+    (briefly a third of a semitone; nothing dropped);
+  - a bigger one, after a stall, skips to the newest with a 10 ms fade-in.
+- **3 redundant copies** instead of 2: three datagrams lost in a row cost
+  nothing, with no wait for a resend. That's about 770 kbps. Older copies
+  are left out if a datagram would exceed the socket's size.
+- **Never silent:** when the buffer is about to run dry and the stream is
+  live, Opus conceals a frame instead of leaving a gap.
+- **The trade-off:** a small buffer means a few concealed frames on a bad
+  link. At 5 % random loss that's 3 single frames in 100 s, no gaps. At
+  2 % or less, none.
+- **The A/V line:** the results say how far the sound is behind (or ahead
+  of) the picture, including the output device's own latency. The Mac's
+  overlay shows it live.
 
 ## Steps
 1. Core (this ADR): codec, packets, redundancy, NACK, playout. Done.

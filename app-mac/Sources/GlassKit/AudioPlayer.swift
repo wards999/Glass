@@ -61,6 +61,13 @@ public final class AudioPlayer {
         }
     }
 
+    /// What the output device itself adds (ms): its buffer, and its own
+    /// delay (a few ms built in, 150-250 for Bluetooth). Glass can't
+    /// remove it, but the results say so.
+    public var outputLatencyMs: Double {
+        engine.outputNode.presentationLatency * 1_000
+    }
+
     /// 0 (silent) ... 1.
     public var volume: Float {
         get { gain.pointee }

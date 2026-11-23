@@ -89,8 +89,11 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private let wifi = WifiWatch()
     /// The host's sound (M4b), from when it first comes (main thread).
     private var player: AudioPlayer?
-    /// The sound line, kept for the report after the client closes.
+    /// The sound line, kept for the report after the client closes, and
+    /// the sound's delay (core's part, and the output device's), for A/V.
     private var audioLine = ""
+    private var audioLatencyMs = 0.0
+    private var outputLatencyMs = 0.0
 
     private var windowStart = GlassClock.nowUs()
     private var lastOverlay: UInt64 = 0
@@ -594,6 +597,10 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 player = AudioPlayer(ring: ring)
             }
             audioLine = client.audioLine
+            if let player {
+                audioLatencyMs = Double(client.audioStats.latency_ms)
+                outputLatencyMs = player.outputLatencyMs
+            }
         }
         if now - lastOverlay >= 250_000 {
             lastOverlay = now
@@ -661,6 +668,10 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 "lost \(st.rx.frames_lost)  skipped \(st.rx.frames_skipped)  keyframe req \(st.keyframe_requests)  decode err \(decodeErrors)  RTT \(String(format: "%.1f", Double(st.last_rtt_us) / 1e3)) ms  input events \(st.input_events)",
                 "⌃⌥⌘F full screen · ⌃⌥⌘S hide stats · ⌃⌥⌘W disconnect · ⌃⌥⌘Q quit",
             ]
+            if audioLatencyMs > 0 {
+                lines.insert(String(format: "sound   %.0f ms + the output's %.0f ms (picture p50 %.0f ms)",
+                                    audioLatencyMs, outputLatencyMs, Double(total.p50_us) / 1e3), at: 4)
+            }
             if let n = noticeText(st.host_notice) { lines.insert(n, at: 0) }
             if let f = files { lines.insert(f, at: 0) }
             if now - windowStart >= 2_000_000 {
@@ -752,7 +763,17 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                               Double(st.rx.recovery_us_max) / 1e3))
             out.append("  network (M4): input marked for Wi-Fi priority: \(st.qos == 1 ? "yes" : st.qos == 2 ? "no" : "not yet") | keep-awakes sent \(st.keepalives)")
             out.append("  " + client.spikesLine)
-            if !audioLine.isEmpty { out.append("  " + audioLine) }
+            if !audioLine.isEmpty {
+                out.append("  " + audioLine)
+                // Sound against picture: both from capture on the host.
+                let picture = Double(s.total.summary.p50_us) / 1e3
+                if audioLatencyMs > 0, picture > 0 {
+                    let sound = audioLatencyMs + outputLatencyMs
+                    let d = sound - picture
+                    out.append(String(format: "  A/V (M4b): sound %.0f ms %@ the picture (sound %.0f ms incl. the output's %.0f; picture %.0f ms)",
+                                      abs(d), d >= 0 ? "behind" : "ahead of", sound, outputLatencyMs, picture))
+                }
+            }
             out.append("  " + wifi.line())
             out.append("  packets \(st.rx.packets) | lost frames \(st.rx.frames_lost) | skipped \(st.rx.frames_skipped) | late \(st.rx.late) | dup \(st.rx.duplicates) | bad \(st.rx.bad) | rejected \(st.crypto_bad + st.crypto_replayed) | queue full \(st.queue_full) | keyframe requests \(st.keyframe_requests)")
             out.append(String(format: "  bitrate %.1f Mbps avg | clock sync %@ (best RTT %.2f ms, last %.2f ms)",

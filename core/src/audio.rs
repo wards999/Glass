@@ -37,15 +37,21 @@ pub const FRAME_LEN: usize = FRAME_SAMPLES * CHANNELS;
 pub const FRAME_US: u64 = 10_000;
 pub const BITRATE: i32 = 192_000;
 /// Earlier frames repeated in each datagram.
-pub const REDUNDANCY: usize = 2;
+/// (3: three datagrams lost in a row cost nothing, with no wait for a
+/// resend. With 2, 5 % loss concealed a frame about once a minute once the
+/// buffer stopped hiding ~20 ms of extra delay, m4b-test2.)
+pub const REDUNDANCY: usize = 3;
 /// Largest Opus frame kept (bytes): 10 ms at 192 kbps is ~240.
 pub const MAX_OPUS: usize = 600;
 /// Frames the host keeps for resends (640 ms).
 pub const HISTORY: usize = 64;
 pub const AUDIO_MAGIC: [u8; 4] = *b"GLAU";
 const HEADER: usize = 17;
-/// A whole datagram, at most.
+/// The output buffer's size; a datagram is cut to [`WIRE_LIMIT`].
 pub const MAX_DATAGRAM: usize = HEADER + (REDUNDANCY + 1) * (2 + MAX_OPUS);
+/// Largest datagram before sealing (fits the media socket's 1400 bytes
+/// sealed): older copies are left out rather than go over it.
+pub const WIRE_LIMIT: usize = crate::packet::MAX_DATAGRAM;
 
 /// A received audio datagram.
 #[derive(Debug, Clone, Copy)]
@@ -161,11 +167,16 @@ impl AudioSender {
         slot.len = len;
         let mut frames: [&[u8]; REDUNDANCY + 1] = [&[]; REDUNDANCY + 1];
         let mut n = 0;
+        let mut size = HEADER;
         for k in 0..=REDUNDANCY as u32 {
             let s = seq.wrapping_sub(k);
             let kept = &self.kept[s as usize % HISTORY];
             if kept.seq != s {
                 break; // the stream's first frames
+            }
+            size += 2 + kept.len;
+            if size > WIRE_LIMIT && n > 0 {
+                break; // the newest always goes; older copies only if they fit
             }
             frames[n] = &kept.data[..kept.len];
             n += 1;
@@ -198,6 +209,8 @@ pub struct PcmRing {
     underruns: AtomicU64,
     /// Sound is playing (a stream is on), so running dry is a glitch.
     active: AtomicBool,
+    /// The device has started reading (until then nothing queues up).
+    reading: AtomicBool,
 }
 
 // SAFETY: one writer and one reader, coordinated by head/tail with
@@ -213,6 +226,7 @@ impl PcmRing {
             tail: AtomicUsize::new(0),
             underruns: AtomicU64::new(0),
             active: AtomicBool::new(false),
+            reading: AtomicBool::new(false),
         }
     }
 
@@ -237,6 +251,7 @@ impl PcmRing {
     /// The device's callback: fills `out` (interleaved) at `gain`, with
     /// silence for what isn't there. Never blocks or allocates.
     pub fn read(&self, out: &mut [f32], gain: f32) -> usize {
+        self.reading.store(true, Ordering::Relaxed);
         let cap = self.buf.len();
         let tail = self.tail.load(Ordering::Relaxed);
         let have = self.head.load(Ordering::Acquire) - tail;
@@ -297,6 +312,14 @@ pub struct AudioStats {
     /// smoothed), once clocks are synced: the output device adds its own
     /// few ms. Compare with the picture's capture -> screen for A/V sync.
     pub latency_ms: u32,
+    /// All the sound waiting to be played (ms): the decoded buffer plus
+    /// frames not yet decoded. This, not the buffer alone, is held at the
+    /// target (m4b-test1: frames queued while the Mac's output started,
+    /// and the sound stayed half a second behind the picture).
+    pub queued_ms: u32,
+    /// Sound skipped to catch up (ms): after the output was late to start,
+    /// or a stall left more than the target waiting.
+    pub skipped_ms: u64,
 }
 
 /// The viewer's results line (the same on both platforms).
@@ -305,15 +328,16 @@ pub fn describe(s: &AudioStats) -> String {
         return "sound (M4b): none came".into();
     }
     format!(
-        "sound (M4b): {} frames played ({} rebuilt from a later packet, {} resent; {} asks) | concealed {} | gaps {} | buffer {} ms (target {}) | drift {:+} ppm | latency {} ms + the output's",
+        "sound (M4b): {} frames played ({} rebuilt from a later packet, {} resent; {} asks) | concealed {} | gaps {} | queued {} ms (target {}), skipped {} ms to catch up | drift {:+} ppm | latency {} ms + the output's",
         s.frames,
         s.from_redundancy,
         s.from_resend,
         s.nacks,
         s.concealed,
         s.underruns,
-        s.depth_ms,
+        s.queued_ms,
         s.target_ms,
+        s.skipped_ms,
         s.drift_ppm,
         s.latency_ms
     )
@@ -322,9 +346,16 @@ pub fn describe(s: &AudioStats) -> String {
 const SLOTS: usize = 64;
 const START_TARGET_US: u64 = 30_000;
 const MIN_TARGET_US: u64 = 20_000;
-const MAX_TARGET_US: u64 = 80_000;
+const MAX_TARGET_US: u64 = 50_000;
 /// Conceal the next frame only when the buffer is this low and it hasn't come.
 const LOW_WATER_US: u64 = 5_000;
+/// More than this over the target waiting: skip to the newest sound (the
+/// output was late to start, or a long stall). Less is played slightly
+/// faster until it's gone ([`CATCH_UP_SPEED`]).
+const MAX_EXCESS_US: u64 = 100_000;
+/// Playing up to this much faster (2 %, about a third of a semitone,
+/// briefly) to catch up a backlog: nothing dropped, nothing clicks.
+const CATCH_UP_SPEED: f64 = 0.02;
 
 #[derive(Clone, Copy)]
 struct Slot {
@@ -363,6 +394,8 @@ pub struct AudioReceiver {
     /// `host clock - local clock` (µs), once synced.
     clock_offset: Option<i64>,
     latency_avg: f64,
+    /// Samples (per channel) still to fade in after a catch-up skip.
+    fade_left: usize,
     pub stats: AudioStats,
 }
 
@@ -399,6 +432,7 @@ impl AudioReceiver {
             last_push_us: 0,
             clock_offset: None,
             latency_avg: 0.0,
+            fade_left: 0,
             stats: AudioStats::default(),
         })
     }
@@ -499,6 +533,8 @@ impl AudioReceiver {
             self.target_us = self.target_us.saturating_sub(5_000).max(MIN_TARGET_US);
             self.calm_since_us = now_us;
         }
+        self.catch_up(next);
+        next = self.next.unwrap_or(next);
         loop {
             let level = Self::us(self.ring.level());
             if level >= self.target_us {
@@ -528,7 +564,11 @@ impl AudioReceiver {
                 }
                 self.dec
                     .decode_float(&s.data[..s.len as usize], &mut self.pcm, false)
-            } else if newer && level <= LOW_WATER_US {
+            } else if level <= LOW_WATER_US
+                && (newer || now_us.saturating_sub(self.last_push_us) < 60_000)
+            {
+                // About to run dry while the stream is live: a concealed
+                // frame, never a silent gap.
                 // It really didn't come: conceal (Opus fades it in), no
                 // click, and make room so the next burst is covered.
                 self.stats.concealed += 1;
@@ -541,22 +581,96 @@ impl AudioReceiver {
             let n = n.unwrap_or(0).min(FRAME_SAMPLES);
             next = next.wrapping_add(1);
             self.next = Some(next);
-            self.write_resampled(n, level);
+            let waiting = self.waiting_us(next);
+            self.write_resampled(n, level, waiting);
         }
         let depth = Self::us(self.ring.level());
         self.stats.target_ms = (self.target_us / 1_000) as u32;
         self.stats.depth_ms = (depth / 1_000) as u32;
+        self.stats.queued_ms = ((depth + self.waiting_us(next)) / 1_000) as u32;
         self.stats.underruns = self.ring.underruns();
         self.stats.drift_ppm = ((self.ratio - 1.0) * -1e6) as i32;
+    }
+
+    /// Frames from `next` that are here and could play now, up to the
+    /// first missing one (µs). Frames behind a hole are only waiting for a
+    /// resend or concealment (a few ms): counting them would speed up, or
+    /// skip, exactly when the buffer needs its margin.
+    fn waiting_us(&self, next: u32) -> u64 {
+        let Some(n) = self.newest.filter(|&n| !before(n, next)) else {
+            return 0;
+        };
+        let span = (n.wrapping_sub(next) as usize + 1).min(SLOTS);
+        let here = (0..span as u32)
+            .take_while(|&k| {
+                let s = next.wrapping_add(k);
+                self.slots[s as usize % SLOTS].seq == s
+            })
+            .count();
+        here as u64 * FRAME_US
+    }
+
+    /// Never lets sound queue up behind the picture. Before the device
+    /// reads, only the newest frames are kept; after, more than
+    /// [`MAX_EXCESS_US`] over the target skips ahead to the newest, faded
+    /// in so the jump doesn't click.
+    fn catch_up(&mut self, next: u32) {
+        let Some(newest) = self.newest else {
+            return;
+        };
+        let level = Self::us(self.ring.level());
+        let queued = level + self.waiting_us(next);
+        let reading = self.ring.reading.load(Ordering::Relaxed);
+        let limit = if reading {
+            self.target_us + MAX_EXCESS_US
+        } else {
+            self.target_us
+        };
+        if queued <= limit {
+            return;
+        }
+        // Keep enough undecoded frames to fill up to the target.
+        let keep = self
+            .target_us
+            .saturating_sub(level)
+            .div_ceil(FRAME_US)
+            .max(1) as u32;
+        let to = newest.wrapping_add(1).wrapping_sub(keep);
+        if !before(next, to) {
+            return;
+        }
+        let skipped = to.wrapping_sub(next) as u64;
+        self.next = Some(to);
+        if reading {
+            self.stats.skipped_ms += skipped * FRAME_US / 1_000;
+            self.fade_left = FRAME_SAMPLES;
+        }
+        // The drift control starts from here, not from the backlog.
+        self.depth_avg = self.target_us as f64;
     }
 
     /// Writes `n` decoded samples per channel, resampled by the drift
     /// correction: a buffer fuller than the target plays a little faster
     /// (fewer samples), an emptier one a little slower, ±0.5 % at most.
-    fn write_resampled(&mut self, n: usize, level_us: u64) {
-        self.depth_avg += (level_us as f64 - self.depth_avg) * 0.02;
-        let err = (self.depth_avg - self.target_us as f64) / 10_000.0;
-        self.ratio = 1.0 + err.clamp(-1.0, 1.0) * 0.005; // input samples per output sample
+    ///
+    /// A backlog (frames left waiting after a repaired burst, or a host
+    /// clock faster than this device's) plays up to 2 % faster until it's
+    /// gone: skipping it would be a dropout, keeping it would put the sound
+    /// behind the picture.
+    fn write_resampled(&mut self, n: usize, level_us: u64, waiting_us: u64) {
+        // All the sound waiting (decoded and not) is what puts the sound
+        // behind the picture: hold it at the target. The decode loop keeps
+        // the buffer itself full whenever frames are here, so this only
+        // sets how fast it plays.
+        let queued = (level_us + waiting_us) as f64;
+        self.depth_avg += (queued - self.depth_avg) * 0.02;
+        // Catch up only while the backlog is still there right now: the
+        // average lags, and speeding on after it's gone thins the buffer
+        // just before the next loss.
+        let err = (queued.min(self.depth_avg) - self.target_us as f64) / 10_000.0;
+        // Input samples per output sample: up to 2 % faster to catch up a
+        // backlog (a third of a semitone, briefly), 0.5 % slower at most.
+        self.ratio = 1.0 + (err * 0.005).clamp(-0.005, CATCH_UP_SPEED);
         self.out.clear();
         // Output sample j sits at input position pos + j*ratio, where -1
         // is the previous frame's last sample.
@@ -576,6 +690,20 @@ impl AudioReceiver {
             self.pos += self.ratio;
         }
         self.pos -= n as f64;
+        // After a catch-up skip: fade in over 10 ms, no click.
+        if self.fade_left > 0 {
+            for (j, f) in self.out.chunks_mut(CHANNELS).enumerate() {
+                let done = FRAME_SAMPLES - self.fade_left + j;
+                if done >= FRAME_SAMPLES {
+                    break;
+                }
+                let g = done as f32 / FRAME_SAMPLES as f32;
+                for v in f {
+                    *v *= g;
+                }
+            }
+            self.fade_left = self.fade_left.saturating_sub(self.out.len() / CHANNELS);
+        }
         if n > 0 {
             self.prev
                 .copy_from_slice(&self.pcm[(n - 1) * CHANNELS..n * CHANNELS]);
@@ -613,8 +741,8 @@ mod tests {
         let p = AudioPacket::decode(&last).unwrap();
         assert_eq!((p.seq, p.capture_ts_us), (3, 1_003));
         let seqs: Vec<u32> = p.frames().map(|f| f.0).collect();
-        assert_eq!(seqs, vec![3, 2, 1]);
-        assert!(last.len() < 1_000, "{}", last.len());
+        assert_eq!(seqs, vec![3, 2, 1, 0]);
+        assert!(last.len() <= WIRE_LIMIT, "{}", last.len());
         let r = s.resend(1).unwrap().to_vec();
         let p = AudioPacket::decode(&r).unwrap();
         assert_eq!((p.seq, p.capture_ts_us, p.frames().count()), (1, 0, 1));
@@ -631,9 +759,21 @@ mod tests {
         device_rate: f64,
         nack: bool,
     ) -> (AudioStats, Vec<f32>) {
+        play_from(frames, lose, device_rate, nack, 40)
+    }
+
+    /// As `play`, the device starting to read at `start_ms`.
+    fn play_from(
+        frames: u32,
+        lose: impl Fn(u32) -> bool,
+        device_rate: f64,
+        nack: bool,
+        start_ms: u64,
+    ) -> (AudioStats, Vec<f32>) {
         let mut s = AudioSender::new().unwrap();
         let mut r = AudioReceiver::new().unwrap();
         r.set_rtt(4_000);
+        r.set_clock_offset(Some(0));
         let ring = r.ring();
         let mut heard = Vec::new();
         let mut pull = [0f32; FRAME_LEN / 2];
@@ -666,7 +806,7 @@ mod tests {
                 }
             });
             // The device: a 5 ms pull whenever its clock says so.
-            if ms > 40 && ms < frames as u64 * 10 {
+            if ms > start_ms && ms < frames as u64 * 10 {
                 device_t += device_rate;
             }
             if device_t >= 5.0 {
@@ -724,20 +864,21 @@ mod tests {
 
     #[test]
     fn a_longer_burst_is_resent() {
-        // 30 ms with nothing arriving: redundancy brings back two frames,
-        // a resend the third (at most one concealed, never a gap).
-        let (s, _) = play(500, |f| (200..203).contains(&f), 1.0, true);
+        // 40 ms with nothing arriving: redundancy brings back three
+        // frames; the fourth is concealed at most, never a silent gap.
+        let (s, _) = play(500, |f| (200..204).contains(&f), 1.0, true);
         assert!(s.concealed <= 1 && s.underruns == 0, "{s:?}");
-        assert!(s.nacks >= 1 && s.from_redundancy >= 2, "{s:?}");
-        // After it the buffer is deeper, so the same burst again costs
-        // nothing.
+        assert!(s.from_redundancy >= 3, "{s:?}");
+        // Two such outages: one frame concealed each at most, never a gap,
+        // and the buffer stays small enough for sync.
         let (s, _) = play(
             800,
-            |f| (200..203).contains(&f) || (600..603).contains(&f),
+            |f| (200..204).contains(&f) || (600..604).contains(&f),
             1.0,
             true,
         );
-        assert!(s.concealed <= 1 && s.underruns == 0, "{s:?}");
+        assert!(s.concealed <= 2 && s.underruns == 0, "{s:?}");
+        assert!(s.queued_ms <= 50, "{s:?}");
     }
 
     #[test]
@@ -772,6 +913,50 @@ mod tests {
         }
     }
 
+    /// m4b-test1: the Mac's output started after the sound did, and the
+    /// sound stayed half a second behind for the whole session.
+    #[test]
+    fn a_late_output_doesnt_put_the_sound_behind() {
+        let (s, _) = play_from(1_500, |_| false, 1.0, true, 500);
+        assert!(s.latency_ms <= 45, "{s:?}");
+        assert!(s.queued_ms <= 45, "{s:?}");
+        assert_eq!((s.concealed, s.underruns), (0, 0), "{s:?}");
+    }
+
+    #[test]
+    fn a_stall_is_caught_up_with_a_fade() {
+        // The device stops for 300 ms (a busy Mac), then reads again.
+        let mut s = AudioSender::new().unwrap();
+        let mut r = AudioReceiver::new().unwrap();
+        r.set_clock_offset(Some(0));
+        let ring = r.ring();
+        let mut pull = [0f32; FRAME_LEN / 2];
+        let mut heard = Vec::new();
+        for ms in 0..3_000u64 {
+            let now = ms * 1_000;
+            if ms % 10 == 0 {
+                let d = s.frame(&tone((ms / 10) as u32), now + 1).unwrap().to_vec();
+                r.push(&d, now);
+            }
+            r.tick(now, |_, _| {});
+            let stalled = (1_000..1_300).contains(&ms);
+            if ms > 40 && ms % 5 == 0 && !stalled {
+                ring.read(&mut pull, 1.0);
+                heard.extend_from_slice(&pull);
+            }
+        }
+        let st = r.stats;
+        assert!(st.skipped_ms >= 200, "{st:?}");
+        // Back within a frame or two of the target after the jump, then
+        // catching up the rest.
+        assert!(st.latency_ms <= 60 && st.queued_ms <= 60, "{st:?}");
+        // The jump is faded: no step bigger than the tone makes, except
+        // where the stall cut it off (the device's own gap, not a click
+        // this code made).
+        let w = worst_step(&heard);
+        assert!(w < 0.6, "step {w}");
+    }
+
     #[test]
     fn clock_drift_is_followed_without_gaps() {
         // The viewer's device runs 0.3 % fast, then 0.3 % slow.
@@ -779,6 +964,8 @@ mod tests {
             let (s, _) = play(3_000, |_| false, rate, true);
             assert_eq!((s.concealed, s.underruns), (0, 0), "{rate} {s:?}");
             assert!((15..=45).contains(&s.depth_ms), "{rate} {s:?}");
+            // And the sound never drifts behind the picture.
+            assert!(s.queued_ms <= 50 && s.latency_ms <= 50, "{rate} {s:?}");
         }
     }
 }

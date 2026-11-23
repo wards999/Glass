@@ -10,6 +10,20 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M4b test 2 (sound in sync)
+As M4b test 1. Sound should now be in step with the picture: lips with
+speech, a game's sound with its action.
+1. Turn the stats on (⌃⌥⌘S). The line "sound  X ms + the output's Y ms
+   (picture p50 Z ms)" shows the delays live. X + Y should be close to Z,
+   within about 20 ms.
+2. Check a video with speech, and a game or anything with sharp sounds
+   (clicks, gunshots).
+3. If the output is Bluetooth (AirPods, a speaker), its delay (150–250 ms)
+   shows as "the output's": try the Mac's own speakers or wired
+   headphones to compare.
+4. Send the Mac viewer's results ("sound (M4b)" and "A/V (M4b)" lines) and
+   the PC host's.
+
 ## M4b test 1 (sound: PC → Mac)
 Sound works from a Windows PC sharing with **Glass.exe** to the Mac
 viewing it. The Glass service doesn't send sound yet (step 4), so on

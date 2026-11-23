@@ -179,6 +179,10 @@ public final class GlassClient {
         with(nil) { glass_client_audio_ring($0) }
     }
 
+    public var audioStats: GLASS_AudioStats {
+        with(GLASS_AudioStats()) { glass_client_audio_stats($0) }
+    }
+
     /// "sound (M4b): …", as on the PC.
     public var audioLine: String {
         with("") { p in

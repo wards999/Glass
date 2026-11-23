@@ -68,6 +68,38 @@ pub fn host_dir() -> PathBuf {
     data_dir().join("host")
 }
 
+/// Which build the installed service is (written when it's installed and
+/// when it starts), so the Glass window can say when it's out of date.
+fn build_path() -> PathBuf {
+    data_dir().join("service-build.txt")
+}
+
+fn write_build() {
+    let _ = std::fs::create_dir_all(data_dir());
+    let _ = std::fs::write(
+        build_path(),
+        format!(
+            "build={}\nprotocol={}\n",
+            glass_core::BUILD,
+            glass_core::protocol::PROTOCOL_VERSION
+        ),
+    );
+}
+
+/// The installed service's build and protocol version, if it said.
+pub fn installed_build() -> Option<(String, u8)> {
+    let text = std::fs::read_to_string(build_path()).ok()?;
+    let (mut build, mut proto) = (None, 0);
+    for l in text.lines() {
+        match l.split_once('=') {
+            Some(("build", v)) => build = Some(v.to_string()),
+            Some(("protocol", v)) => proto = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    Some((build?, proto))
+}
+
 pub fn status_path() -> PathBuf {
     data_dir().join("status.txt")
 }
@@ -405,6 +437,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     STOP_EVENT.store(stop.0 as isize, Ordering::Relaxed);
     set_state(SERVICE_RUNNING, 0);
     log("service started");
+    write_build();
     // This PC's identity, for the broker.
     agent_env();
     let mut broker: Option<BrokerRun> = None;
@@ -762,6 +795,7 @@ fn install() -> Res<()> {
     let dst = install_dir();
     println!("Installing the Glass service to {} ...", dst.display());
     stop_service(15);
+    write_build(); // this build is what's being installed
     std::fs::create_dir_all(&dst)?;
     if here != dst {
         for e in std::fs::read_dir(&here)?.flatten() {

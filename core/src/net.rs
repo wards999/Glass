@@ -1096,7 +1096,7 @@ impl std::fmt::Display for ConnectError {
                 "could not connect (is the host running and allowed through its firewall?)"
             }
             ConnectError::Handshake => "connected, but the handshake failed",
-            ConnectError::Version => "host runs a different Glass protocol version",
+            ConnectError::Version => "it runs a different version of Glass: install the same build on both (on a PC with the Glass service, also update the service: Settings > Unattended access)",
             ConnectError::Socket => "could not open a UDP socket",
             ConnectError::NotPaired => "not paired with this host (pair with its PIN first)",
             ConnectError::Refused => "the host refused the connection",

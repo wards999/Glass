@@ -174,6 +174,8 @@ struct GlassApp {
     viewer_on: bool,
     /// The Glass service (unattended access, M3f) and its agent's status.
     svc: super::service::State,
+    /// The installed service's build and protocol, if known.
+    svc_build: Option<(String, u8)>,
     svc_status: Option<super::service::Status>,
     /// The service's sharing is switched off (Share switch).
     svc_off: bool,
@@ -259,6 +261,7 @@ pub fn run(share: bool) -> Res<()> {
                 svc: super::service::state(),
                 svc_status: super::service::Status::read(),
                 svc_off: super::service::sharing_off(),
+                svc_build: super::service::installed_build(),
                 remote: super::service::in_remote_session(),
                 notice: None,
                 sharing: None,
@@ -297,6 +300,18 @@ pub fn run(share: bool) -> Res<()> {
             }
             if app.demo.as_deref() == Some("settings") {
                 app.dialog = Dialog::Settings;
+            }
+            // An older service than this app (=oldservice, and its Settings).
+            if matches!(
+                app.demo.as_deref(),
+                Some("oldservice" | "oldservice-settings")
+            ) {
+                app.svc = super::service::State::Running;
+                app.svc_off = false;
+                app.svc_build = Some(("m5c-test9".into(), 9));
+                if app.demo.as_deref() == Some("oldservice-settings") {
+                    app.dialog = Dialog::Settings;
+                }
             }
             if app.demo.as_deref() == Some("report") {
                 app.dialog = Dialog::Report("Glass copy check: results text".into(), false);
@@ -537,6 +552,18 @@ fn save_report(file: &str, report: &str) {
 // ---------------------------------------------------------------- behaviour
 
 impl GlassApp {
+    /// The installed service's build when it differs from this app's
+    /// (`None`: no service, or it matches).
+    fn svc_out_of_date(&self) -> Option<String> {
+        if self.svc == super::service::State::NotInstalled {
+            return None;
+        }
+        self.svc_build
+            .as_ref()
+            .filter(|(b, _)| b != glass_core::BUILD)
+            .map(|(b, _)| b.clone())
+    }
+
     fn scan(&mut self) {
         self.last_scan = Instant::now();
         if self.demo.is_some() {
@@ -1508,6 +1535,35 @@ impl GlassApp {
             }
             ui.add_space(2.0);
         }
+        if let Some(old) = self.svc_out_of_date() {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    RichText::new(ic('\u{E7BA}', "\u{26A0}"))
+                        .font(icon_font(12.0))
+                        .color(p.danger),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "The Glass service is build {old}, but this app is {}.",
+                        glass_core::BUILD
+                    ))
+                    .size(12.5)
+                    .color(p.text),
+                );
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("Update it").size(12.5).color(p.accent))
+                            .frame(false),
+                    )
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    super::service::run_elevated("install");
+                }
+            });
+        }
         if self.remote {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -1594,9 +1650,10 @@ impl eframe::App for GlassApp {
         }
         if self.last_scan.elapsed() > Duration::from_millis(1500) {
             self.scan();
-            if self.demo.as_deref() != Some("service") {
+            if self.demo.is_none() {
                 self.svc = super::service::state();
                 self.svc_off = super::service::sharing_off();
+                self.svc_build = super::service::installed_build();
             }
             self.svc_status = if self.demo.as_deref() == Some("service") {
                 self.svc_status.clone()
@@ -2027,6 +2084,18 @@ impl GlassApp {
                         .size(12.5)
                         .color(p.weak),
                     );
+                    let old = self.svc_out_of_date();
+                    if svc != super::service::State::NotInstalled {
+                        let (text, color) = match (&old, &self.svc_build) {
+                            (Some(b), _) => (
+                                format!("Service build {b}, but this app is {}: update the service so they match (viewers on a newer protocol are refused until then).", glass_core::BUILD),
+                                p.danger,
+                            ),
+                            (None, Some((b, _))) => (format!("Service build {b}: up to date."), p.weak),
+                            (None, None) => ("Service build: not known (installed before builds were recorded). Update it to be sure.".to_string(), p.warn),
+                        };
+                        ui.label(RichText::new(text).size(12.5).color(color));
+                    }
                     ui.horizontal(|ui| {
                         match svc {
                             super::service::State::NotInstalled => {
@@ -2035,7 +2104,12 @@ impl GlassApp {
                                 }
                             }
                             _ => {
-                                if ui.add(plain_button("Update to this build \u{2026}", p)).clicked() {
+                                let update = if old.is_some() || self.svc_build.is_none() {
+                                    ui.add(accent_button("Update service \u{2026}", p))
+                                } else {
+                                    ui.add(plain_button("Update to this build \u{2026}", p))
+                                };
+                                if update.clicked() {
                                     super::service::run_elevated("install");
                                 }
                                 if ui.add(plain_button("Remove service \u{2026}", p)).clicked() {

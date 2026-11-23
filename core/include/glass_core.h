@@ -61,6 +61,19 @@
 
 #define GLASS_FILE_RATE_MAX 60000000
 
+/**
+ * How far over its quiet baseline any video frame's network time may get
+ * before file data halves (µs), and before it stops speeding up.
+ */
+#define GLASS_FRAME_SLACK_US 5000
+
+#define GLASS_FRAME_WARN_US 2500
+
+/**
+ * How often the viewer steers (µs).
+ */
+#define GLASS_RATE_TICK_US 250000
+
 #define GLASS_ClockSync_WINDOW 16
 
 /**

@@ -62,6 +62,9 @@ impl ClipSync {
     pub fn start(link: Arc<ClipLink>, send_current: bool) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
+        CHANGES.store(0, Ordering::Relaxed);
+        READ_FAILS.store(0, Ordering::Relaxed);
+        LAST_FAIL.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let _ = std::thread::Builder::new()
             .name("glass-clipboard".into())
             .spawn(move || run(link, send_current, s));
@@ -102,9 +105,24 @@ pub fn summary(p: &glass_core::clipboard::ClipProgress, other: &str) -> String {
         2 => " (last: a file couldn't be read, e.g. permissions or a cloud-only file)",
         _ => "",
     };
+    let fails = READ_FAILS.load(Ordering::Relaxed);
+    let fails = if fails == 0 {
+        String::new()
+    } else {
+        format!(
+            " | couldn't read this PC's clipboard {fails} times (last: {})",
+            LAST_FAIL.lock().unwrap_or_else(|e| e.into_inner())
+        )
+    };
     format!(
-        "text and pictures: {} sent to the {other}, {} received | files: {} copies offered, {} pasted on the {other}, {} pasted here | not offered: {}{why}",
-        p.items_sent, p.items_received, p.files_offered, p.files_sent, p.files_received, p.not_sent
+        "text and pictures: {} sent to the {other}, {} received | files: {} copies offered, {} pasted on the {other}, {} pasted here | not offered: {}{why} | changes seen here: {}{fails}",
+        p.items_sent,
+        p.items_received,
+        p.files_offered,
+        p.files_sent,
+        p.files_received,
+        p.not_sent,
+        CHANGES.load(Ordering::Relaxed)
     )
 }
 
@@ -129,6 +147,20 @@ struct Formats {
 enum Copied {
     Item(ClipItem),
     Files(Vec<PathBuf>),
+    /// Files are there but the plain read failed: ask through OLE.
+    FilesViaOle,
+}
+
+/// For the results: clipboard changes noticed, and reads that failed (a
+/// copy that couldn't be read was otherwise silent: m5c-test4, files copied
+/// on a PC with the service never crossed).
+static CHANGES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static READ_FAILS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static LAST_FAIL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+fn note_fail(what: String) {
+    READ_FAILS.fetch_add(1, Ordering::Relaxed);
+    *LAST_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = what;
 }
 
 struct State {
@@ -170,7 +202,7 @@ fn run(link: Arc<ClipLink>, send_current: bool, stop: Arc<AtomicBool>) {
             ..Default::default()
         };
         RegisterClassW(&wc); // fails harmlessly if already registered
-        let Ok(hwnd) = CreateWindowExW(
+        let hwnd = match CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
             w!("Glass clipboard"),
@@ -183,8 +215,15 @@ fn run(link: Arc<ClipLink>, send_current: bool, stop: Arc<AtomicBool>) {
             None,
             Some(inst.into()),
             None,
-        ) else {
-            return;
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                note_fail(format!(
+                    "the clipboard thread couldn't start: {}",
+                    e.message()
+                ));
+                return;
+            }
         };
         let fm = Formats {
             png: RegisterClipboardFormatW(w!("PNG")),
@@ -301,11 +340,13 @@ fn tick(hwnd: HWND) {
     }
     let now = seq();
     if now != seen {
+        CHANGES.fetch_add(1, Ordering::Relaxed);
         match read(&fm) {
             Some(copied) => {
                 seen = now;
                 let item = match &copied {
                     Copied::Item(i) => i.clone(),
+                    Copied::FilesViaOle => unreachable!("read() resolves it"),
                     Copied::Files(p) => ClipItem {
                         kind: CLIP_FILES,
                         data: p
@@ -319,7 +360,7 @@ fn tick(hwnd: HWND) {
                     last = h;
                     match copied {
                         Copied::Files(p) if !from_glass(&p) => link.send_files(p),
-                        Copied::Files(_) => {}
+                        Copied::Files(_) | Copied::FilesViaOle => {}
                         Copied::Item(i) => link.send_item(i),
                     }
                 }
@@ -485,11 +526,19 @@ fn read(fm: &Formats) -> Option<Copied> {
         if has(fm.glass) {
             None // a Glass promise (this one's, or another Glass's on this PC)
         } else if has(CF_HDROP) {
-            GetClipboardData(CF_HDROP)
-                .ok()
-                .and_then(|h| bytes(h))
-                .and_then(|b| drop_files(&b))
-                .map(Copied::Files)
+            match GetClipboardData(CF_HDROP) {
+                Ok(h) => match bytes(h).and_then(|b| drop_files(&b)) {
+                    Some(p) => Some(Copied::Files(p)),
+                    None => {
+                        note_fail("a file list that was empty or unreadable".into());
+                        Some(Copied::FilesViaOle)
+                    }
+                },
+                Err(e) => {
+                    note_fail(format!("the file list: {}", e.message()));
+                    Some(Copied::FilesViaOle)
+                }
+            }
         } else if has(CF_UNICODETEXT) {
             GetClipboardData(CF_UNICODETEXT)
                 .ok()
@@ -534,6 +583,14 @@ fn read(fm: &Formats) -> Option<Copied> {
         let _ = CloseClipboard();
     }
     match got {
+        // The copying app (Explorer) renders the list for OLE callers too.
+        Some(Copied::FilesViaOle) => match ole_files() {
+            Ok(p) => Some(Copied::Files(p)),
+            Err(e) => {
+                note_fail(format!("the file list, also through OLE: {e}"));
+                None
+            }
+        },
         Some(Copied::Item(ClipItem { kind: 0, data })) => dib_to_png(&data).map(|data| {
             Copied::Item(ClipItem {
                 kind: CLIP_PNG,
@@ -542,6 +599,31 @@ fn read(fm: &Formats) -> Option<Copied> {
         }),
         Some(Copied::Item(i)) if i.data.len() > CLIP_MAX => None,
         other => other,
+    }
+}
+
+/// The copied files' list asked for through OLE (the copying app's own data
+/// object), when the plain clipboard read failed.
+fn ole_files() -> Result<Vec<PathBuf>, String> {
+    use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
+    use windows::Win32::System::Ole::{OleGetClipboard, ReleaseStgMedium};
+    unsafe {
+        let d = OleGetClipboard().map_err(|e| e.message())?;
+        let f = FORMATETC {
+            cfFormat: CF_HDROP as u16,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        };
+        let mut m = d.GetData(&f).map_err(|e| e.message())?;
+        let got = if m.tymed == TYMED_HGLOBAL.0 as u32 {
+            bytes(HANDLE(m.u.hGlobal.0)).and_then(|b| drop_files(&b))
+        } else {
+            None
+        };
+        ReleaseStgMedium(&mut m);
+        got.ok_or_else(|| "no file list in it".to_string())
     }
 }
 

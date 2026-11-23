@@ -1,6 +1,6 @@
 # Glass protocol
 
-**Version 8 (M5c).** Clipboard sharing (v8); no connection loops; the host says what it is and can do; view modes and stream changes (v5) on top of v4. Paired devices only: mutual TLS 1.3 on the control
+**Version 9 (M5c).** Clipboard sharing and adaptive file speed (v8, v9); no connection loops; the host says what it is and can do; view modes and stream changes (v5) on top of v4. Paired devices only: mutual TLS 1.3 on the control
 connection, every UDP datagram sealed with AES-128-GCM. LAN, IPv4. This file
 is the source of truth for packet formats and control messages;
 `core/src/protocol.rs`, `packet.rs`, `input.rs`, `seal.rs`, `tls.rs` and
@@ -102,6 +102,7 @@ Framing (inside TLS): `u16 length` (type + body) · `u8 type` · body. Max
 | 18 | FileData | either | `id u32` (the offer being fetched), `index u32` (the entry in its file list), `offset u64`, then up to 60 000 bytes. Each file's bytes come in order, files in list order (folders and empty files have none). The receiver drops the whole fetch on a piece that doesn't continue it. |
 | 19 | FileCancel | either | `id u32`: that offer can't be fetched (the files changed or couldn't be read, or something newer was copied). The receiver drops what arrived. |
 | 20 | FileRequest | either | `id u32`: something was pasted here; send what offer `id` stands for (the PNG as a kind-2 ClipChunk with that id, or the files as `FileData`), or `FileCancel` if it's gone. |
+| 21 | FileRate | viewer → host | `bytes_per_s u32`: how fast file data to the viewer may go. Sent every 0.5 s with the ping. The viewer steers it from its picture: lost frames, late packets, or a round trip 10 ms over the quiet baseline halve it; otherwise it rises by a quarter while a copy is moving (1–60 MB/s). It uses the same speed for its own file data. |
 
 **Offers, not copies.** Pictures and files are sent only when pasted, as Remote Desktop does: the receiver puts a promise on its clipboard (Windows: delayed rendering for pictures, virtual files for files; Mac: lazy pasteboard items), and the request goes when an app asks for the data. Copying without pasting costs a few bytes.
 **File list** (ClipChunk kind 3): `version u8` (1), `count u32` (≤ 10 000), then per entry `dir u8` (1 folder), `size u64`, `path_len u16`, `path` UTF-8: relative to the copy, `/`-separated, folders before what they contain. No size limit: the paste waits as long as the size needs. When fetched, the receiver writes the files under a folder of its own, made safe (no `..` or absolute paths; characters and names Windows can't store are replaced), and hands them to the paste once every byte has arrived. File data is paced by the sender (about 60 Mbps for now).
@@ -249,6 +250,7 @@ protocol version, `fp` first 8 bytes of the fingerprint (hex), `ip`, `port`.
 Advisory only: trust comes from the pinned fingerprint, never from discovery.
 
 ## Changelog
+- v9 — M5c: `FileRate` (21): file speed adapts to the picture instead of a fixed 60 Mbps.
 - v8 — M5c clipboard: `ClipChunk` (17) carries text, and offers of pictures and files, both ways; a paste sends `FileRequest` (20), answered by the picture or `FileData` (18); `FileCancel` (19).
 - v7 — M3d no-loop rule: `Hello` carries who sees the viewer; reject reason 7 = loop. Control messages may now be up to 96 bytes.
 - v6 — M3d: `Welcome` ends with `host_os` and `host_caps`, so the viewer picks its key mapping and offers only what the host can do; `Hello` caps bit 1 asks to start in 4:2:0.

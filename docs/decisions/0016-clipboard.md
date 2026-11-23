@@ -69,7 +69,19 @@ between any pair (PC↔Mac, PC↔PC).
   bytes as `FileData`. TLS already guarantees integrity, so there's no
   separate hash. Sizes are checked and a broken transfer is dropped whole.
 - One sender thread per session. A newer copy replaces anything not yet
-  sent; a request for an older offer gets `FileCancel`. File data is paced at about
+  sent; a request for an older offer gets `FileCancel`.
+- **Speed adapts to the picture (v9, m5c-test8 feedback).** The fixed 60 Mbps
+  made a 1 GB paste take 2 min 20 s, against 2 min 7 s for Remote Desktop.
+  Now the viewer steers it every 0.5 s (`RateControl`): lost frames, late
+  packets, or a round trip 10 ms over the quiet baseline halve it; otherwise
+  it rises by a quarter while a copy is moving, 1–60 MB/s. With nothing
+  moving it drifts back to the start (7.5 MB/s), so a copy never starts at
+  full blast. The viewer sends the speed to the host (`FileRate`) for files
+  going its way.
+- **Pastes stream (Windows).** Each file's contents go to Explorer as a
+  stream that hands over bytes as they arrive, so Explorer's copy window
+  moves with the transfer. The Mac still waits for the whole copy.
+  LATER: file promises. File data is paced at about
   60 Mbps so the picture keeps the network. LATER(M5): pace from the rate
   controller.
 - At most 10 000 files and folders a copy. A copy that can't be listed

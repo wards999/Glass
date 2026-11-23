@@ -9,7 +9,7 @@
 /// announces new stream parameters mid-session (`StreamChange`).
 /// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
 /// datagrams. v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 8;
+pub const PROTOCOL_VERSION: u8 = 9;
 
 /// Most "seen by" ids a `Hello` carries (no-loop rule).
 pub const MAX_SEEN_BY: usize = 8;
@@ -588,11 +588,12 @@ impl<'a> CursorShape<'a> {
 }
 
 // Message types in use: 1-7, 8 (pointer shape), 9-10, 11-14 (pairing),
-// 15-16, 17-20 (clipboard and files).
+// 15-16, 17-21 (clipboard and files).
 const KIND_CLIP: u8 = 17;
 const KIND_FILE_DATA: u8 = 18;
 const KIND_FILE_CANCEL: u8 = 19;
 const KIND_FILE_REQUEST: u8 = 20;
+const KIND_FILE_RATE: u8 = 21;
 /// Bytes of clipboard data per chunk (well inside a 64 KB frame).
 pub const CLIP_CHUNK: usize = 60_000;
 
@@ -700,6 +701,14 @@ pub fn encode_file_request(id: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&id.to_be_bytes());
 }
 
+/// Appends a `FileRate` frame: file data to this side may go at up to
+/// `bytes_per_s` (the viewer steers it from how its picture is doing).
+pub fn encode_file_rate(bytes_per_s: u32, out: &mut Vec<u8>) {
+    out.extend_from_slice(&5u16.to_be_bytes());
+    out.push(KIND_FILE_RATE);
+    out.extend_from_slice(&bytes_per_s.to_be_bytes());
+}
+
 /// Any control-channel message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Message<'a> {
@@ -711,6 +720,8 @@ pub enum Message<'a> {
     FileCancel(u32),
     /// Pasted: send the contents of offer `id`.
     FileRequest(u32),
+    /// Viewer -> host: file data may go at up to this many bytes/s.
+    FileRate(u32),
     /// `PAIR_*` kind and its body.
     Pair {
         kind: u8,
@@ -727,12 +738,12 @@ impl<'a> Message<'a> {
             Message::Clip(ClipChunk::decode_body(b).ok_or(ControlError::Malformed)?)
         } else if kind == KIND_FILE_DATA {
             Message::FileData(FileData::decode_body(b).ok_or(ControlError::Malformed)?)
-        } else if kind == KIND_FILE_CANCEL || kind == KIND_FILE_REQUEST {
-            let id = u32::from_be_bytes(b.try_into().map_err(|_| ControlError::Malformed)?);
-            if kind == KIND_FILE_CANCEL {
-                Message::FileCancel(id)
-            } else {
-                Message::FileRequest(id)
+        } else if kind == KIND_FILE_CANCEL || kind == KIND_FILE_REQUEST || kind == KIND_FILE_RATE {
+            let v = u32::from_be_bytes(b.try_into().map_err(|_| ControlError::Malformed)?);
+            match kind {
+                KIND_FILE_CANCEL => Message::FileCancel(v),
+                KIND_FILE_REQUEST => Message::FileRequest(v),
+                _ => Message::FileRate(v),
             }
         } else if (PAIR_START..=PAIR_CONFIRM).contains(&kind) {
             if !pair_body_ok(kind, b.len()) {

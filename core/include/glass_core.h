@@ -48,9 +48,18 @@
 #define GLASS_FILES_MAX_ENTRIES 10000
 
 /**
- * File data goes at most this fast (bytes/s, about 60 Mbps).
+ * File data's starting speed (bytes/s, about 60 Mbps). The viewer then
+ * steers it (`RateControl`): faster while its picture stays perfect, half
+ * as fast the moment it doesn't.
  */
 #define GLASS_FILE_RATE 7500000
+
+/**
+ * File data never goes slower or faster than this (bytes/s; 8 to 480 Mbps).
+ */
+#define GLASS_FILE_RATE_MIN 1000000
+
+#define GLASS_FILE_RATE_MAX 60000000
 
 #define GLASS_ClockSync_WINDOW 16
 
@@ -175,7 +184,7 @@
  * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
  * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 8
+#define GLASS_PROTOCOL_VERSION 9
 
 /**
  * Most "seen by" ids a `Hello` carries (no-loop rule).

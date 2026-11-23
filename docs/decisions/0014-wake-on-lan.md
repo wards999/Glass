@@ -11,7 +11,7 @@ Wake-on-LAN. The user chose to add only Wake-on-LAN.
 ## Decision
 - New **M3e – Wake-on-LAN** straight after M3d, since it extends the device
   list. The host sends its adapters' MAC addresses when a viewer connects
-  (protocol v9: v8 went to the clipboard, ADR 0016). The viewer keeps them with the paired device. Sleeping paired
+  (protocol v10: v8 and v9 went to the clipboard, ADR 0016). The viewer keeps them with the paired device. Sleeping paired
   devices get a **Wake** button that sends the magic packet, waits for the
   device to reappear, then connects.
 - Glass never changes power or adapter settings itself (the standing rule). It

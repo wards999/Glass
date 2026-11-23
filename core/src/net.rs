@@ -198,7 +198,8 @@ impl ControlReader {
                         | Message::Clip(_)
                         | Message::FileData(_)
                         | Message::FileCancel(_)
-                        | Message::FileRequest(_) => None,
+                        | Message::FileRequest(_)
+                        | Message::FileRate(_) => None,
                     };
                     self.buf.copy_within(n..self.len, 0);
                     self.len -= n;
@@ -603,7 +604,8 @@ impl HostListener {
                         Message::Clip(_)
                         | Message::FileData(_)
                         | Message::FileCancel(_)
-                        | Message::FileRequest(_) => {
+                        | Message::FileRequest(_)
+                        | Message::FileRate(_) => {
                             let relay = lock(&sh.clip_relay);
                             if let Some(to) = relay.as_ref() {
                                 let mut f = Vec::new();
@@ -908,7 +910,8 @@ impl HostSession {
                 Message::Clip(_)
                     | Message::FileData(_)
                     | Message::FileCancel(_)
-                    | Message::FileRequest(_),
+                    | Message::FileRequest(_)
+                        | Message::FileRate(_),
                 n
             )) if n == frame.len()
         );
@@ -1774,6 +1777,7 @@ fn spawn_control(
         let mut sync = ClockSync::default();
         let mut seq = 0u32;
         let mut last_ping = 0u64;
+        let mut file_rate = crate::clipboard::RateControl::default();
         let mut last_kf = 0u64;
         loop {
             if sh.stop.load(Ordering::Relaxed) {
@@ -1795,6 +1799,18 @@ fn spawn_control(
                     client_ts: clock::now_us(),
                 };
                 ok &= send_control(&out, ping).is_ok();
+                // File speed, both ways, from how the picture is doing.
+                let st = sh.rx.load();
+                let r = file_rate.tick(
+                    now,
+                    st.frames_lost + st.late,
+                    sh.last_rtt.load(Ordering::Relaxed),
+                    sh.clip.moving(),
+                );
+                sh.clip.set_rate(r);
+                let mut f = Vec::with_capacity(8);
+                crate::protocol::encode_file_rate(r as u32, &mut f);
+                ok &= out.write_all(&f).is_ok();
             }
             if now.saturating_sub(last_kf) >= KEYFRAME_RETRY_US
                 && sh.want_keyframe.swap(false, Ordering::Relaxed)
@@ -1814,7 +1830,8 @@ fn spawn_control(
                     Message::Clip(_)
                     | Message::FileData(_)
                     | Message::FileCancel(_)
-                    | Message::FileRequest(_) => {
+                    | Message::FileRequest(_)
+                    | Message::FileRate(_) => {
                         sh.clip.on_message(&m);
                     }
                     Message::Control(Control::Pong {

@@ -13,29 +13,31 @@
 //! stream on its local copy. Calls come in on the clipboard thread (it's
 //! the object's COM apartment), which waits meanwhile.
 
-use glass_core::clipboard::{fetch_timeout, safe_path, ClipLink, Fetched, Offer};
+use glass_core::clipboard::{safe_path, ClipLink, Offer};
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use windows::core::{implement, Ref, BOOL, HRESULT, PCWSTR};
+use windows::core::{implement, Ref, BOOL, HRESULT};
 use windows::Win32::Foundation::{
-    GlobalFree, DATA_S_SAMEFORMATETC, DV_E_FORMATETC, E_NOTIMPL, OLE_E_ADVISENOTSUPPORTED, S_OK,
+    GlobalFree, DATA_S_SAMEFORMATETC, DV_E_FORMATETC, E_NOTIMPL, OLE_E_ADVISENOTSUPPORTED,
+    STG_E_ACCESSDENIED, STG_E_INVALIDFUNCTION, STG_E_READFAULT, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{
-    IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, DATADIR_GET,
-    DVASPECT_CONTENT, FORMATETC, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL, TYMED_ISTREAM,
+    IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA,
+    ISequentialStream_Impl, IStream, IStream_Impl, DATADIR_GET, DVASPECT_CONTENT, FORMATETC,
+    LOCKTYPE, STATFLAG, STATSTG, STGC, STGMEDIUM, STGMEDIUM_0, STGTY_STREAM, STREAM_SEEK,
+    STREAM_SEEK_CUR, STREAM_SEEK_END, STREAM_SEEK_SET, TYMED_HGLOBAL, TYMED_ISTREAM,
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::ReleaseStgMedium;
 use windows::Win32::UI::Shell::{
-    SHCreateStdEnumFmtEtc, SHCreateStreamOnFileEx, FD_ATTRIBUTES, FD_FILESIZE, FD_PROGRESSUI,
-    FILEDESCRIPTORW,
+    SHCreateStdEnumFmtEtc, FD_ATTRIBUTES, FD_FILESIZE, FD_PROGRESSUI, FILEDESCRIPTORW,
 };
 
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-const STGM_SHARE_DENY_WRITE: u32 = 0x20;
 
 /// The formats the object offers.
 #[derive(Clone, Copy)]
@@ -69,19 +71,11 @@ pub struct VirtualFiles {
     link: Arc<ClipLink>,
     offer: Offer,
     fm: Formats,
-    /// The folder the copy was fetched into, once it has been.
-    base: Mutex<Option<PathBuf>>,
 }
 
 impl VirtualFiles {
     pub fn object(link: Arc<ClipLink>, offer: Offer, fm: Formats) -> IDataObject {
-        Self {
-            link,
-            offer,
-            fm,
-            base: Mutex::new(None),
-        }
-        .into()
+        Self { link, offer, fm }.into()
     }
 
     /// The file list: names relative to the copy, `\`-separated.
@@ -121,24 +115,29 @@ impl VirtualFiles {
         b
     }
 
-    /// Where file `index` of the list is once the copy is here (fetching
-    /// it the first time).
-    fn file(&self, index: i32) -> Option<PathBuf> {
-        let e = self.offer.entries.get(usize::try_from(index).ok()?)?;
+    /// A stream on file `index` of the list that hands over its bytes as
+    /// they arrive (the first one starts the fetch).
+    fn stream(&self, index: i32) -> Option<IStream> {
+        let index = usize::try_from(index).ok()?;
+        let e = self.offer.entries.get(index)?;
         if e.dir {
             return None;
         }
-        let mut base = self.base.lock().unwrap_or_else(|e| e.into_inner());
-        if base.is_none() {
-            let timeout = fetch_timeout(self.offer.size);
-            if let Some(Fetched::Files(tops)) = self.link.fetch_wait(self.offer.id, timeout) {
-                *base = tops
-                    .first()
-                    .and_then(|t| t.parent())
-                    .map(|p| p.to_path_buf());
+        let base = self.offer.files.first()?.parent()?;
+        let path = base.join(safe_path(&e.path)?);
+        self.link.fetch(self.offer.id);
+        Some(
+            Incoming {
+                link: self.link.clone(),
+                id: self.offer.id,
+                index,
+                path,
+                size: e.size,
+                pos: AtomicU64::new(0),
+                file: Mutex::new(None),
             }
-        }
-        Some(base.as_ref()?.join(safe_path(&e.path)?))
+            .into(),
+        )
     }
 
     fn formats(&self) -> Vec<FORMATETC> {
@@ -187,17 +186,7 @@ impl IDataObject_Impl for VirtualFiles_Impl {
         if f.cfFormat == self.fm.descriptor && hg {
             hglobal(&self.descriptor())
         } else if f.cfFormat == self.fm.contents && f.tymed & TYMED_ISTREAM.0 as u32 != 0 {
-            let path = self.file(f.lindex).ok_or(DV_E_FORMATETC)?;
-            let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain([0]).collect();
-            let stream = unsafe {
-                SHCreateStreamOnFileEx(
-                    PCWSTR(wide.as_ptr()),
-                    STGM_SHARE_DENY_WRITE,
-                    0,
-                    false,
-                    None,
-                )?
-            };
+            let stream = self.stream(f.lindex).ok_or(DV_E_FORMATETC)?;
             Ok(STGMEDIUM {
                 tymed: TYMED_ISTREAM.0 as u32,
                 u: STGMEDIUM_0 {
@@ -277,5 +266,130 @@ impl IDataObject_Impl for VirtualFiles_Impl {
 
     fn EnumDAdvise(&self) -> windows::core::Result<IEnumSTATDATA> {
         Err(OLE_E_ADVISENOTSUPPORTED.into())
+    }
+}
+
+/// One pasted file's contents, read as they arrive: Explorer's copy window
+/// moves with the transfer instead of waiting for all of it.
+#[implement(IStream)]
+struct Incoming {
+    link: Arc<ClipLink>,
+    id: u32,
+    index: usize,
+    path: PathBuf,
+    size: u64,
+    pos: AtomicU64,
+    file: Mutex<Option<std::fs::File>>,
+}
+
+/// A read gives up after this long without a single new byte.
+const STALL: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl ISequentialStream_Impl for Incoming_Impl {
+    fn Read(&self, pv: *mut core::ffi::c_void, cb: u32, pcbread: *mut u32) -> HRESULT {
+        use std::io::{Read, Seek, SeekFrom};
+        let pos = self.pos.load(Ordering::Relaxed);
+        let n = (cb as u64).min(self.size.saturating_sub(pos));
+        let done = |got: u32| {
+            if !pcbread.is_null() {
+                unsafe { *pcbread = got };
+            }
+        };
+        if n == 0 {
+            done(0);
+            return S_FALSE; // the end
+        }
+        // Wait for the bytes (they come in order).
+        let (mut seen, mut since) = (0, std::time::Instant::now());
+        loop {
+            match self.link.file_progress(self.id, self.index) {
+                None => return STG_E_READFAULT, // the transfer failed
+                Some((have, _)) if have >= pos + n => break,
+                Some((have, _)) => {
+                    if have != seen {
+                        (seen, since) = (have, std::time::Instant::now());
+                    } else if since.elapsed() > STALL {
+                        return STG_E_READFAULT;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+        let mut g = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_none() {
+            match std::fs::File::open(&self.path) {
+                Ok(f) => *g = Some(f),
+                Err(_) => return STG_E_READFAULT,
+            }
+        }
+        let f = g.as_mut().unwrap();
+        let buf = unsafe { std::slice::from_raw_parts_mut(pv as *mut u8, n as usize) };
+        if f.seek(SeekFrom::Start(pos)).is_err() || f.read_exact(buf).is_err() {
+            return STG_E_READFAULT;
+        }
+        self.pos.store(pos + n, Ordering::Relaxed);
+        done(n as u32);
+        S_OK
+    }
+
+    fn Write(&self, _: *const core::ffi::c_void, _: u32, _: *mut u32) -> HRESULT {
+        STG_E_ACCESSDENIED
+    }
+}
+
+impl IStream_Impl for Incoming_Impl {
+    fn Seek(&self, mv: i64, origin: STREAM_SEEK, newpos: *mut u64) -> windows::core::Result<()> {
+        let from = match origin {
+            STREAM_SEEK_SET => 0,
+            STREAM_SEEK_CUR => self.pos.load(Ordering::Relaxed) as i64,
+            STREAM_SEEK_END => self.size as i64,
+            _ => return Err(STG_E_INVALIDFUNCTION.into()),
+        };
+        let p = from
+            .checked_add(mv)
+            .filter(|p| *p >= 0)
+            .ok_or(STG_E_INVALIDFUNCTION)? as u64;
+        self.pos.store(p, Ordering::Relaxed);
+        if !newpos.is_null() {
+            unsafe { *newpos = p };
+        }
+        Ok(())
+    }
+    fn SetSize(&self, _: u64) -> windows::core::Result<()> {
+        Err(STG_E_ACCESSDENIED.into())
+    }
+    fn CopyTo(
+        &self,
+        _: Ref<IStream>,
+        _: u64,
+        _: *mut u64,
+        _: *mut u64,
+    ) -> windows::core::Result<()> {
+        Err(E_NOTIMPL.into())
+    }
+    fn Commit(&self, _: &STGC) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn Revert(&self) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn LockRegion(&self, _: u64, _: u64, _: &LOCKTYPE) -> windows::core::Result<()> {
+        Err(STG_E_INVALIDFUNCTION.into())
+    }
+    fn UnlockRegion(&self, _: u64, _: u64, _: u32) -> windows::core::Result<()> {
+        Err(STG_E_INVALIDFUNCTION.into())
+    }
+    fn Stat(&self, st: *mut STATSTG, _: &STATFLAG) -> windows::core::Result<()> {
+        if let Some(st) = unsafe { st.as_mut() } {
+            *st = STATSTG {
+                r#type: STGTY_STREAM.0 as u32,
+                cbSize: self.size,
+                ..Default::default()
+            };
+        }
+        Ok(())
+    }
+    fn Clone(&self) -> windows::core::Result<IStream> {
+        Err(E_NOTIMPL.into())
     }
 }

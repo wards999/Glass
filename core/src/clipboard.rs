@@ -24,7 +24,8 @@
 //! send that back.
 
 use crate::protocol::{
-    encode_file_cancel, encode_file_request, ClipChunk, FileData, Message, CLIP_CHUNK,
+    encode_file_cancel, encode_file_rate, encode_file_request, ClipChunk, FileData, Message,
+    CLIP_CHUNK,
 };
 
 /// Where a link's control messages go: the session's connection, or (in a
@@ -49,8 +50,13 @@ pub const CLIP_PNG_OFFER: u8 = 4;
 pub const CLIP_MAX: usize = 16 << 20;
 /// At most this many files and folders in one copy.
 pub const FILES_MAX_ENTRIES: usize = 10_000;
-/// File data goes at most this fast (bytes/s, about 60 Mbps).
+/// File data's starting speed (bytes/s, about 60 Mbps). The viewer then
+/// steers it (`RateControl`): faster while its picture stays perfect, half
+/// as fast the moment it doesn't.
 pub const FILE_RATE: u64 = 7_500_000;
+/// File data never goes slower or faster than this (bytes/s; 8 to 480 Mbps).
+pub const FILE_RATE_MIN: u64 = 1_000_000;
+pub const FILE_RATE_MAX: u64 = 60_000_000;
 
 /// One clipboard item: `CLIP_*` kind and its bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -295,7 +301,61 @@ pub fn encode_message(m: &Message, out: &mut Vec<u8>) -> bool {
             encode_file_request(*id, out);
             true
         }
+        Message::FileRate(r) => {
+            encode_file_rate(*r, out);
+            true
+        }
         _ => false,
+    }
+}
+
+/// The viewer's steering of file speed (M5c): every half second, from what
+/// it sees of the picture. Lost or late video, or a round trip well above
+/// the quiet baseline, halves the speed; otherwise, while a copy is
+/// actually moving, it rises by a quarter. With nothing moving it drifts
+/// back to [`FILE_RATE`], so a new copy never starts at full blast.
+pub struct RateControl {
+    rate: f64,
+    base_rtt: u32,
+    base_since: u64,
+    last_bad: u64,
+}
+
+impl Default for RateControl {
+    fn default() -> Self {
+        Self {
+            rate: FILE_RATE as f64,
+            base_rtt: u32::MAX,
+            base_since: 0,
+            last_bad: 0,
+        }
+    }
+}
+
+impl RateControl {
+    /// `bad`: video frames lost plus late packets so far; `rtt_us`: the
+    /// latest round trip; `moving`: a copy is going either way. Returns the
+    /// speed to use (bytes/s).
+    pub fn tick(&mut self, now_us: u64, bad: u64, rtt_us: u32, moving: bool) -> u64 {
+        // The quiet baseline: the lowest round trip of the last 10 s.
+        if rtt_us > 0
+            && (rtt_us < self.base_rtt || now_us.saturating_sub(self.base_since) > 10_000_000)
+        {
+            self.base_rtt = rtt_us;
+            self.base_since = now_us;
+        }
+        let worse = bad > self.last_bad
+            || (self.base_rtt != u32::MAX && rtt_us > self.base_rtt.saturating_add(10_000));
+        self.last_bad = bad;
+        if worse {
+            self.rate /= 2.0;
+        } else if moving {
+            self.rate *= 1.25;
+        } else {
+            self.rate += (FILE_RATE as f64 - self.rate) * 0.2;
+        }
+        self.rate = self.rate.clamp(FILE_RATE_MIN as f64, FILE_RATE_MAX as f64);
+        self.rate as u64
     }
 }
 
@@ -424,6 +484,8 @@ pub struct ClipLink {
     wake: Condvar,
     /// Bumped on every new copy: text still being sent stops.
     gen: AtomicU32,
+    /// How fast file data may go (bytes/s; the viewer steers it).
+    rate: AtomicU64,
     sender: Mutex<bool>,
     offer_out: Mutex<Option<OfferOut>>,
     rx: Mutex<Rx>,
@@ -446,6 +508,7 @@ impl ClipLink {
             jobs: Mutex::new(VecDeque::new()),
             wake: Condvar::new(),
             gen: AtomicU32::new(0),
+            rate: AtomicU64::new(FILE_RATE),
             sender: Mutex::new(false),
             offer_out: Mutex::new(None),
             rx: Mutex::new(Rx::default()),
@@ -557,6 +620,43 @@ impl ClipLink {
                 FetchState::Pending if Instant::now() >= until => return None,
                 FetchState::Pending => std::thread::sleep(Duration::from_millis(10)),
             }
+        }
+    }
+
+    /// How fast this side may send file data (bytes/s).
+    pub fn set_rate(&self, bytes_per_s: u64) {
+        let r = bytes_per_s.clamp(FILE_RATE_MIN, FILE_RATE_MAX);
+        self.rate.store(r, Ordering::Relaxed);
+    }
+
+    pub fn rate(&self) -> u64 {
+        self.rate.load(Ordering::Relaxed)
+    }
+
+    /// A copy is going either way.
+    pub fn moving(&self) -> bool {
+        let p = self.progress();
+        (p.in_total > 0 && p.in_done < p.in_total) || (p.out_total > 0 && p.out_done < p.out_total)
+    }
+
+    /// How much of file `index` of offer `id` is here so far, and its size,
+    /// while a paste fetches it (a paste streams it as it comes). `None` if
+    /// the fetch failed or isn't this offer's.
+    pub fn file_progress(&self, id: u32, index: usize) -> Option<(u64, u64)> {
+        let rx = lock(&self.rx);
+        let o = rx.offer.as_ref().filter(|o| o.offer.id == id)?;
+        let e = o.entries.get(index)?;
+        let size = if e.dir { 0 } else { e.size };
+        match &o.state {
+            Some(FetchState::Failed) => None,
+            Some(FetchState::Done(_)) => Some((size, size)),
+            None => Some((0, size)),
+            Some(FetchState::Pending) => match rx.inbound.as_ref().filter(|i| i.id == id) {
+                Some(i) if index < i.next => Some((size, size)),
+                Some(i) if index == i.next => Some((i.written, size)),
+                Some(_) => Some((0, size)),
+                None => Some((0, size)),
+            },
         }
     }
 
@@ -710,7 +810,8 @@ impl ClipLink {
                 let total: u64 = entries.iter().map(|e| e.size).sum();
                 self.n.out_done.store(0, Ordering::Relaxed);
                 self.n.out_total.store(total, Ordering::Relaxed);
-                let start = Instant::now();
+                // Paced: each piece is due `len / rate` after the last.
+                let mut due = Instant::now();
                 let mut sent = 0u64;
                 let mut buf = vec![0u8; CLIP_CHUNK];
                 for (index, (e, src)) in entries.iter().zip(sources.iter()).enumerate() {
@@ -739,10 +840,13 @@ impl ClipLink {
                         offset += want as u64;
                         sent += want as u64;
                         self.n.out_done.store(sent, Ordering::Relaxed);
-                        // Paced: never ahead of FILE_RATE.
-                        let due = Duration::from_micros(sent * 1_000_000 / FILE_RATE);
-                        if let Some(wait) = due.checked_sub(start.elapsed()) {
-                            std::thread::sleep(wait);
+                        let rate = self.rate.load(Ordering::Relaxed).max(FILE_RATE_MIN);
+                        due += Duration::from_micros(want as u64 * 1_000_000 / rate);
+                        let now = Instant::now();
+                        if due > now {
+                            std::thread::sleep(due - now);
+                        } else if now - due > Duration::from_millis(20) {
+                            due = now; // fell behind: no burst to catch up
                         }
                     }
                 }
@@ -780,6 +884,10 @@ impl ClipLink {
                 if let Some(o) = rx.offer.as_mut().filter(|o| o.offer.id == *id) {
                     o.state = Some(FetchState::Failed);
                 }
+                true
+            }
+            Message::FileRate(r) => {
+                self.set_rate(*r as u64);
                 true
             }
             Message::FileRequest(id) => {
@@ -1101,6 +1209,36 @@ mod tests {
     }
 
     #[test]
+    fn file_speed_follows_the_picture() {
+        let mut r = RateControl::default();
+        let mut t = 0;
+        let mut tick = |r: &mut RateControl, bad, rtt, moving| {
+            t += 500_000;
+            r.tick(t, bad, rtt, moving)
+        };
+        // A quiet network and a copy going: it speeds up to the cap.
+        let mut v = 0;
+        for _ in 0..40 {
+            v = tick(&mut r, 0, 3_000, true);
+        }
+        assert_eq!(v, FILE_RATE_MAX);
+        // The round trip jumps: halved at once.
+        assert_eq!(tick(&mut r, 0, 20_000, true), FILE_RATE_MAX / 2);
+        // A lost frame: halved again.
+        assert_eq!(tick(&mut r, 1, 3_000, true), FILE_RATE_MAX / 4);
+        // Nothing moving: back towards the starting speed, not up.
+        for _ in 0..40 {
+            v = tick(&mut r, 1, 3_000, false);
+        }
+        assert!((v as i64 - FILE_RATE as i64).abs() < 100_000, "{v}");
+        // Never below the floor.
+        for i in 0..40 {
+            v = tick(&mut r, 2 + i, 3_000, true);
+        }
+        assert_eq!(v, FILE_RATE_MIN);
+    }
+
+    #[test]
     fn received_paths_are_made_safe() {
         assert_eq!(safe_path("a/b.txt"), Some(PathBuf::from("a").join("b.txt")));
         assert_eq!(safe_path("../etc/passwd"), None);
@@ -1185,6 +1323,10 @@ mod tests {
                 }));
             }
         }
+        assert_eq!(
+            rx.file_progress(9, 2),
+            Some((big.len() as u64, big.len() as u64))
+        );
         let FetchState::Done(Fetched::Files(tops)) = rx.fetch(9) else {
             panic!("not fetched")
         };

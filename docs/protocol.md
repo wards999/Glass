@@ -280,6 +280,30 @@ Sealed with the host's key. Sent whenever the host sent nothing else for
 save. The viewer sends a punch on the same rule, the other way. See
 ADR 0023.
 
+### Audio (host → viewer; M4b, ADR 0025)
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `"GLAU"` |
+| 4 | 4 | seq of the newest frame (+1 per 10 ms) |
+| 8 | 8 | its capture time, host clock µs (0 = a resend) |
+| 16 | 1 | n frames, newest first: frame k is seq − k (n ≤ 3) |
+| 17 | … | n × (len u16, Opus packet) |
+
+Opus: 48 kHz stereo, 10 ms, restricted low-delay. Each datagram repeats
+the 2 frames before its newest. Sealed with the host's key.
+
+### Audio NACK (viewer → host, 9 bytes)
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `"GLNA"` |
+| 4 | 4 | first missing seq |
+| 8 | 1 | count (1–32) |
+
+The host resends each frame it still keeps (640 ms) as a datagram with one
+frame and capture time 0.
+
 ### Receiver rules
 - A frame is complete when all `packet_count` data packets are there, arrived
   or rebuilt. Parity for a frame already delivered is ignored, not counted as

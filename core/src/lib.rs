@@ -4,6 +4,7 @@
 //! links it as a staticlib through the cbindgen header in `include/glass_core.h`.
 
 pub mod annexb;
+pub mod audio;
 pub mod clipboard;
 pub mod clock;
 pub mod fec;

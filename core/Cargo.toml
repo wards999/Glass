@@ -18,6 +18,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # UDP socket buffer sizes (std has no SO_RCVBUF/SO_SNDBUF).
 socket2 = "0.6"
 spake2 = "0.4"
+# Audio (M4b, ADR 0025): libopus, built from its bundled source, static.
+opus = "0.4"
 
 # Packet marking on Windows (qWAVE, M4 step 4).
 [target.'cfg(windows)'.dependencies]

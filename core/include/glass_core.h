@@ -17,6 +17,44 @@
 
 #define GLASS_NAL_AUD 35
 
+#define GLASS_SAMPLE_RATE 48000
+
+#define GLASS_CHANNELS 2
+
+/**
+ * Samples per channel in one 10 ms frame.
+ */
+#define GLASS_FRAME_SAMPLES 480
+
+/**
+ * Interleaved samples in one frame.
+ */
+#define GLASS_FRAME_LEN (GLASS_FRAME_SAMPLES * GLASS_CHANNELS)
+
+#define GLASS_FRAME_US 10000
+
+#define GLASS_BITRATE 192000
+
+/**
+ * Earlier frames repeated in each datagram.
+ */
+#define GLASS_REDUNDANCY 2
+
+/**
+ * Largest Opus frame kept (bytes): 10 ms at 192 kbps is ~240.
+ */
+#define GLASS_MAX_OPUS 600
+
+/**
+ * Frames the host keeps for resends (640 ms).
+ */
+#define GLASS_HISTORY 64
+
+/**
+ * A whole datagram, at most.
+ */
+#define GLASS_MAX_DATAGRAM (GLASS_HEADER + ((GLASS_REDUNDANCY + 1) * (2 + GLASS_MAX_OPUS)))
+
 /**
  * UTF-8 text.
  */

@@ -261,6 +261,86 @@ fn run(loss: Loss, frames: u32, fixed_fec: Option<f32>, seed: u64, nack: bool) -
     }
 }
 
+/// Audio through the same loss: 10 ms frames, NACKs and resends lost too,
+/// a device pulling 5 ms at a time. (frames, concealed, underruns, target).
+fn run_audio(loss: Loss, secs: u64, seed: u64) -> (u64, u64, u64, u32) {
+    use glass_core::audio::{AudioReceiver, AudioSender, FRAME_LEN};
+    let mut rng = Rng(seed);
+    let mut bad_state = false;
+    let mut lost_now = |rng: &mut Rng| -> bool {
+        match loss {
+            Loss::Random(p) => rng.f() < p,
+            Loss::Burst(g, b, lg, lb) => {
+                bad_state = if bad_state { rng.f() >= b } else { rng.f() < g };
+                rng.f() < if bad_state { lb } else { lg }
+            }
+        }
+    };
+    let mut tx = AudioSender::new().expect("opus");
+    let mut rx = AudioReceiver::new().expect("opus");
+    rx.set_rtt(2 * ONE_WAY_US as u32);
+    let ring = rx.ring();
+    let pcm: Vec<f32> = (0..FRAME_LEN)
+        .map(|i| ((i / 2) as f32 * 0.06).sin() * 0.3)
+        .collect();
+    let mut pull = [0f32; FRAME_LEN / 2];
+    // (arrival ms, datagram) to the viewer; (arrival ms, first, count) to the host.
+    let mut to_viewer: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut to_host: Vec<(u64, u32, u8)> = Vec::new();
+    let one_way_ms = ONE_WAY_US / 1_000;
+    for ms in 0..secs * 1_000 {
+        let now = ms * 1_000;
+        if ms % 10 == 0 {
+            let d = tx.frame(&pcm, now + 1).expect("encode").to_vec();
+            if !lost_now(&mut rng) {
+                to_viewer.push((ms + one_way_ms, d));
+            }
+        }
+        let mut i = 0;
+        while i < to_host.len() {
+            if to_host[i].0 == ms {
+                let (_, first, count) = to_host.swap_remove(i);
+                for q in first..first + count as u32 {
+                    if let Some(d) = tx.resend(q) {
+                        let d = d.to_vec();
+                        if !lost_now(&mut rng) {
+                            to_viewer.push((ms + one_way_ms, d));
+                        }
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        let mut i = 0;
+        while i < to_viewer.len() {
+            if to_viewer[i].0 == ms {
+                let (_, d) = to_viewer.swap_remove(i);
+                rx.push(&d, now);
+            } else {
+                i += 1;
+            }
+        }
+        let mut asked = Vec::new();
+        rx.tick(now, |first, count| asked.push((first, count)));
+        for (first, count) in asked {
+            if !lost_now(&mut rng) {
+                to_host.push((ms + one_way_ms, first, count));
+            }
+        }
+        if ms > 50 && ms % 5 == 0 {
+            ring.read(&mut pull, 1.0);
+        }
+    }
+    let s = rx.stats;
+    (
+        s.frames + s.concealed,
+        s.concealed,
+        s.underruns,
+        s.target_ms,
+    )
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let check = args.iter().any(|a| a == "--check");
@@ -331,11 +411,33 @@ fn main() {
             failed = true;
         }
     }
+    println!();
+    println!("Audio (M4b): Opus 10 ms frames, 2 redundant copies, NACK, a 4 ms round trip");
+    println!(
+        "{:<26} {:>9} {:>11} {:>10} {:>12}",
+        "loss", "frames", "concealed", "gaps", "buffer (ms)"
+    );
+    let secs = (frames as u64 / 60).max(10);
+    for (i, &loss) in scenarios.iter().enumerate() {
+        let (n, concealed, gaps, target) = run_audio(loss, secs, 0x51ED_2701 ^ i as u64);
+        println!(
+            "{:<26} {:>9} {:>5} ({:>4.2}%) {:>10} {:>12}",
+            loss.name(),
+            n,
+            concealed,
+            concealed as f64 * 100.0 / n.max(1) as f64,
+            gaps,
+            target
+        );
+        if matches!(loss, Loss::Random(p) if p == 0.05) && (concealed > 0 || gaps > 0) {
+            failed = true;
+        }
+    }
     if check {
         if failed {
-            eprintln!("FAIL: frames were lost at 5% random loss");
+            eprintln!("FAIL: video frames or audio were lost at 5% random loss");
             std::process::exit(1);
         }
-        println!("ok: no frame lost at 5% random loss");
+        println!("ok: no video frame lost and no audio concealed at 5% random loss");
     }
 }

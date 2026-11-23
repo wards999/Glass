@@ -9,7 +9,7 @@
 /// announces new stream parameters mid-session (`StreamChange`).
 /// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
 /// datagrams. v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 9;
+pub const PROTOCOL_VERSION: u8 = 10;
 
 /// Most "seen by" ids a `Hello` carries (no-loop rule).
 pub const MAX_SEEN_BY: usize = 8;
@@ -41,8 +41,12 @@ pub struct VideoPacketHeader {
     pub frame_id: u32,
     pub packet_index: u16,
     pub packet_count: u16,
-    /// FEC group info. Always 0 until M4 defines the layout.
-    pub fec_group: u32,
+    /// FEC (M4): the frame's data packets are in `fec_groups` interleaved
+    /// groups (packet i in group i mod groups), each with `fec_parity`
+    /// parity packets after the data: `packet_index` from `packet_count` up.
+    /// 0 and 0: no FEC.
+    pub fec_groups: u8,
+    pub fec_parity: u8,
     /// Host capture timestamp, microseconds on the host clock.
     pub capture_ts_us: u64,
 }
@@ -51,7 +55,7 @@ pub struct VideoPacketHeader {
 pub enum HeaderError {
     TooShort,
     BadVersion(u8),
-    /// packet_count == 0 or packet_index >= packet_count.
+    /// packet_count == 0 or packet_index past the data and parity packets.
     BadIndex,
 }
 
@@ -63,7 +67,7 @@ impl VideoPacketHeader {
         if buf.len() < Self::SIZE {
             return Err(HeaderError::TooShort);
         }
-        if self.packet_count == 0 || self.packet_index >= self.packet_count {
+        if !self.index_ok() {
             return Err(HeaderError::BadIndex);
         }
         buf[0] = PROTOCOL_VERSION;
@@ -73,7 +77,9 @@ impl VideoPacketHeader {
         buf[4..8].copy_from_slice(&self.frame_id.to_be_bytes());
         buf[8..10].copy_from_slice(&self.packet_index.to_be_bytes());
         buf[10..12].copy_from_slice(&self.packet_count.to_be_bytes());
-        buf[12..16].copy_from_slice(&self.fec_group.to_be_bytes());
+        buf[12] = self.fec_groups;
+        buf[13] = self.fec_parity;
+        buf[14..16].copy_from_slice(&[0, 0]); // reserved
         buf[16..24].copy_from_slice(&self.capture_ts_us.to_be_bytes());
         Ok(())
     }
@@ -94,13 +100,28 @@ impl VideoPacketHeader {
             frame_id: u32_at(4),
             packet_index: u16_at(8),
             packet_count: u16_at(10),
-            fec_group: u32_at(12),
+            fec_groups: buf[12],
+            fec_parity: buf[13],
             capture_ts_us: u64::from_be_bytes(buf[16..24].try_into().unwrap()),
         };
-        if h.packet_count == 0 || h.packet_index >= h.packet_count {
+        if !h.index_ok() {
             return Err(HeaderError::BadIndex);
         }
         Ok(h)
+    }
+
+    /// Data and parity packets in this packet's frame.
+    pub fn total_packets(&self) -> usize {
+        self.packet_count as usize + self.fec_groups as usize * self.fec_parity as usize
+    }
+
+    /// A parity packet (FEC), not data.
+    pub fn is_parity(&self) -> bool {
+        self.packet_index >= self.packet_count
+    }
+
+    fn index_ok(&self) -> bool {
+        self.packet_count > 0 && (self.packet_index as usize) < self.total_packets()
     }
 }
 
@@ -311,6 +332,13 @@ pub enum Control {
     StreamChange {
         info: StreamInfo,
     },
+    /// Client -> host, every 0.25 s (M4): data packets the viewer expected
+    /// since the last report and how many of them didn't arrive (rebuilt by
+    /// FEC or not). The host sizes its FEC from it.
+    ReceiverReport {
+        expected: u32,
+        missing: u32,
+    },
 }
 
 /// Largest encoded control message (including the 2-byte length).
@@ -338,6 +366,7 @@ impl Control {
             Control::HostNotice { .. } => 10,
             Control::SetMode { .. } => 15,
             Control::StreamChange { .. } => 16,
+            Control::ReceiverReport { .. } => 22,
         }
     }
 
@@ -370,6 +399,10 @@ impl Control {
                 }
             }
             Control::SetMode { mode, allow_444 } => put(&[mode, allow_444 as u8]),
+            Control::ReceiverReport { expected, missing } => {
+                put(&expected.to_be_bytes());
+                put(&missing.to_be_bytes());
+            }
             Control::StreamChange { info } => {
                 put(&[info.codec, info.chroma, info.mode, 0]);
                 put(&info.width.to_be_bytes());
@@ -456,6 +489,7 @@ impl Control {
             9 | 10 => 1,
             15 => 2,
             16 => 10,
+            22 => 8,
             _ => return Err(ControlError::Malformed),
         };
         if b.len() != want {
@@ -503,6 +537,10 @@ impl Control {
                     height: u16_at(6),
                     fps: u16_at(8),
                 },
+            },
+            22 => Control::ReceiverReport {
+                expected: u32_at(0),
+                missing: u32_at(4),
             },
             _ => Control::Bye,
         };
@@ -588,7 +626,7 @@ impl<'a> CursorShape<'a> {
 }
 
 // Message types in use: 1-7, 8 (pointer shape), 9-10, 11-14 (pairing),
-// 15-16, 17-21 (clipboard and files).
+// 15-16, 17-21 (clipboard and files), 22 (receiver report).
 const KIND_CLIP: u8 = 17;
 const KIND_FILE_DATA: u8 = 18;
 const KIND_FILE_CANCEL: u8 = 19;
@@ -783,6 +821,10 @@ mod tests {
                 mode: MODE_FIT,
                 allow_444: false,
             },
+            Control::ReceiverReport {
+                expected: 1234,
+                missing: 56,
+            },
             Control::StreamChange {
                 info: StreamInfo {
                     codec: 1,
@@ -947,7 +989,8 @@ mod tests {
             frame_id: 0xDEAD_BEEF,
             packet_index: 41,
             packet_count: 42,
-            fec_group: 0,
+            fec_groups: 2,
+            fec_parity: 3,
             capture_ts_us: 0x0123_4567_89AB_CDEF,
         }
     }
@@ -989,7 +1032,9 @@ mod tests {
     fn rejects_bad_index() {
         let mut buf = [0u8; VideoPacketHeader::SIZE];
         let mut h = sample();
-        h.packet_index = h.packet_count;
+        h.packet_index = h.packet_count + 5; // the last parity packet: fine
+        h.encode(&mut buf).unwrap();
+        h.packet_index = h.packet_count + 6; // past it
         assert_eq!(h.encode(&mut buf), Err(HeaderError::BadIndex));
         sample().encode(&mut buf).unwrap();
         buf[10..12].copy_from_slice(&0u16.to_be_bytes());

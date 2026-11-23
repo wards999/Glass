@@ -77,6 +77,11 @@
 #define GLASS_ClockSync_WINDOW 16
 
 /**
+ * At most this many shards (data + parity) in one group.
+ */
+#define GLASS_MAX_SHARDS 256
+
+/**
  * `HostEventC::kind`.
  */
 #define GLASS_HOST_EVENT_PAIRING_PIN 1
@@ -181,6 +186,17 @@
 
 
 
+/**
+ * At most this many data packets in one FEC group.
+ */
+#define GLASS_FEC_GROUP_MAX 64
+
+/**
+ * The loss to protect against before the viewer has said how lossy the
+ * link is.
+ */
+#define GLASS_FEC_LOSS_START 0.02
+
 #define GLASS_PIN_LIFETIME_US 120000000
 
 #define GLASS_WRONG_PER_PIN 3
@@ -197,7 +213,7 @@
  * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
  * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 9
+#define GLASS_PROTOCOL_VERSION 10
 
 /**
  * Most "seen by" ids a `Hello` carries (no-loop rule).
@@ -643,7 +659,7 @@ typedef struct {
   uint64_t bytes;
   uint64_t duplicates;
   /**
-   * Packets for frames older than the last delivered one.
+   * Data packets for frames older than the last delivered one.
    */
   uint64_t late;
   /**
@@ -652,13 +668,25 @@ typedef struct {
   uint64_t bad;
   uint64_t frames;
   /**
-   * Frames that never completed (a packet was lost).
+   * Frames that never completed (packets were lost beyond what FEC
+   * could rebuild).
    */
   uint64_t frames_lost;
   /**
    * Complete frames discarded while waiting for an IDR after a loss.
    */
   uint64_t frames_skipped;
+  /**
+   * Data packets rebuilt by FEC, and frames that needed it.
+   */
+  uint64_t recovered;
+  uint64_t frames_recovered;
+  /**
+   * Data packets in frames that completed or were lost, and how many of
+   * them didn't arrive (rebuilt or not): the loss the host's FEC follows.
+   */
+  uint64_t data_expected;
+  uint64_t data_missing;
 } GLASS_ReassemblyStats;
 
 /**
@@ -814,6 +842,15 @@ typedef struct {
    * UDP datagrams that failed authentication or were replays.
    */
   uint64_t rejected_datagrams;
+  /**
+   * FEC parity packets among `packets_sent` (M4).
+   */
+  uint64_t parity_packets;
+  /**
+   * The viewer's latest reported packet loss, parts per million (the FEC
+   * follows it).
+   */
+  uint32_t loss_ppm;
 } GLASS_HostCounters;
 
 /**

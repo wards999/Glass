@@ -10,6 +10,19 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M4 test 1 (FEC: lost packets rebuilt)
+Protocol v10: update all three machines, and the service on QUIETPC.
+1. View QUIETPC from QUIETPC22, and the Mac from QUIETPC22, for a few
+   minutes each, on Wi-Fi, doing ordinary things (scrolling, dragging
+   windows, a video).
+2. If you can, make the Wi-Fi worse: walk the laptop further away, or run a
+   big download on the same network.
+3. Send the viewer results (Settings > Session results). The new line is
+   `FEC (M4): rebuilt N lost packets in M frames | packet loss seen X%`.
+   Compare `lost frames` and `keyframe requests` with before: m5c-test9 had
+   2 lost frames and 6 keyframe requests in 231 s.
+4. The host's results have `FEC (M4): N parity packets (X% of packets)`.
+
 ## M3f test 2 (the service keeps the connection, ADR 0017)
 The service changed a lot. Update it on QUIETPC first: from the new zip, run
 `glass-cli service install` as administrator, or use Settings > Unattended

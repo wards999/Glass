@@ -332,6 +332,11 @@ pub struct HostCounters {
     pub input: InputCounters,
     /// UDP datagrams that failed authentication or were replays.
     pub rejected_datagrams: u64,
+    /// FEC parity packets among `packets_sent` (M4).
+    pub parity_packets: u64,
+    /// The viewer's latest reported packet loss, parts per million (the FEC
+    /// follows it).
+    pub loss_ppm: u32,
 }
 
 /// Called on the host's UDP thread for every input action, in order.
@@ -365,6 +370,8 @@ struct HostShared {
     mode_req: AtomicU32,
     /// Clipboard and files, both ways (M5c).
     clip: Arc<crate::clipboard::ClipLink>,
+    /// The viewer's packet loss, parts per million (M4: sizes the FEC).
+    loss_ppm: AtomicU32,
     /// Pass the viewer's clipboard messages to a helper instead (ADR 0017).
     clip_relay: Mutex<Option<crate::clipboard::FrameWriter>>,
 }
@@ -565,6 +572,7 @@ impl HostListener {
                 ch.writer.clone(),
             )))),
             clip_relay: Mutex::new(None),
+            loss_ppm: AtomicU32::new(0),
         });
         let mut threads = Vec::new();
 
@@ -611,6 +619,17 @@ impl HostListener {
                         Message::Control(Control::KeyframeRequest) => {
                             sh.keyframe_requests.fetch_add(1, Ordering::Relaxed);
                             sh.keyframe.store(true, Ordering::Relaxed);
+                        }
+                        Message::Control(Control::ReceiverReport { expected, missing }) => {
+                            // Up fast, down slowly: FEC follows a worsening
+                            // link at once and relaxes over a few seconds.
+                            if expected > 0 {
+                                let now = (missing as f64 / expected as f64 * 1e6).min(1e6);
+                                let old = sh.loss_ppm.load(Ordering::Relaxed) as f64;
+                                let w = if now > old { 0.5 } else { 0.1 };
+                                let v = old + (now - old) * w;
+                                sh.loss_ppm.store(v as u32, Ordering::Relaxed);
+                            }
                         }
                         Message::Control(Control::SetMode { mode, allow_444 }) => {
                             let v = 1 << 16 | (allow_444 as u32) << 8 | mode as u32;
@@ -840,12 +859,17 @@ impl HostSession {
         let c = &mut self.counters;
         let sealer = &mut self.sealer;
         let wire = &mut self.wire;
+        // FEC sized to the loss the viewer reports (M4).
+        self.packetiser.fec_loss = self.shared.loss_ppm.load(Ordering::Relaxed) as f32 / 1e6;
+        let mut sent = 0u64;
         let n = self.packetiser.send_frame(f, data, |pkt| {
             let len = sealer.seal(pkt, wire);
             c.bytes_sent += len as u64;
+            sent += 1;
             udp.send_to(&wire[..len], peer).map(|_| ())
         })?;
-        c.packets_sent += n as u64;
+        c.packets_sent += sent;
+        c.parity_packets += sent - n as u64;
         c.frames_sent += 1;
         Ok(true)
     }
@@ -935,6 +959,7 @@ impl HostSession {
             keyframe_requests: self.shared.keyframe_requests.load(Ordering::Relaxed),
             input: *lock(&self.shared.input),
             rejected_datagrams: self.shared.rejected.load(Ordering::Relaxed),
+            loss_ppm: self.shared.loss_ppm.load(Ordering::Relaxed),
             ..self.counters
         }
     }
@@ -1160,7 +1185,7 @@ struct CursorState {
 
 #[derive(Default)]
 struct AtomicRx {
-    v: [AtomicU64; 8],
+    v: [AtomicU64; 12],
 }
 
 impl AtomicRx {
@@ -1174,6 +1199,10 @@ impl AtomicRx {
             s.frames,
             s.frames_lost,
             s.frames_skipped,
+            s.recovered,
+            s.frames_recovered,
+            s.data_expected,
+            s.data_missing,
         ];
         for (slot, v) in self.v.iter().zip(a) {
             slot.store(v, Ordering::Relaxed);
@@ -1191,6 +1220,10 @@ impl AtomicRx {
             frames: l(5),
             frames_lost: l(6),
             frames_skipped: l(7),
+            recovered: l(8),
+            frames_recovered: l(9),
+            data_expected: l(10),
+            data_missing: l(11),
         }
     }
 }
@@ -1808,6 +1841,7 @@ fn spawn_control(
         let mut last_ping = 0u64;
         let mut file_rate = crate::clipboard::RateControl::default();
         let mut last_rate = 0u64;
+        let mut last_report = (0u64, 0u64);
         let mut last_kf = 0u64;
         loop {
             if sh.stop.load(Ordering::Relaxed) {
@@ -1836,6 +1870,13 @@ fn spawn_control(
                 let st = sh.rx.load();
                 let lo = sh.frame_lo.swap(u32::MAX, Ordering::Relaxed);
                 let hi = sh.frame_hi.swap(0, Ordering::Relaxed);
+                // What arrived of the video since the last report (M4 FEC).
+                let rep = Control::ReceiverReport {
+                    expected: (st.data_expected - last_report.0).min(u32::MAX as u64) as u32,
+                    missing: (st.data_missing - last_report.1).min(u32::MAX as u64) as u32,
+                };
+                last_report = (st.data_expected, st.data_missing);
+                ok &= send_control(&out, rep).is_ok();
                 let r = file_rate.tick(
                     now,
                     st.frames_lost + st.late,

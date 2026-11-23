@@ -1,6 +1,6 @@
 # Glass protocol
 
-**Version 9 (M5c).** Clipboard sharing and adaptive file speed (v8, v9); no connection loops; the host says what it is and can do; view modes and stream changes (v5) on top of v4. Paired devices only: mutual TLS 1.3 on the control
+**Version 10 (M4).** FEC on video and receiver reports (v10); clipboard sharing and adaptive file speed (v8, v9); no connection loops; the host says what it is and can do; view modes and stream changes (v5) on top of v4. Paired devices only: mutual TLS 1.3 on the control
 connection, every UDP datagram sealed with AES-128-GCM. LAN, IPv4. This file
 is the source of truth for packet formats and control messages;
 `core/src/protocol.rs`, `packet.rs`, `input.rs`, `seal.rs`, `tls.rs` and
@@ -102,6 +102,7 @@ Framing (inside TLS): `u16 length` (type + body) · `u8 type` · body. Max
 | 18 | FileData | either | `id u32` (the offer being fetched), `index u32` (the entry in its file list), `offset u64`, then up to 60 000 bytes. Each file's bytes come in order, files in list order (folders and empty files have none). The receiver drops the whole fetch on a piece that doesn't continue it. |
 | 19 | FileCancel | either | `id u32`: that offer can't be fetched (the files changed or couldn't be read, or something newer was copied). The receiver drops what arrived. |
 | 20 | FileRequest | either | `id u32`: something was pasted here; send what offer `id` stands for (the PNG as a kind-2 ClipChunk with that id, or the files as `FileData`), or `FileCancel` if it's gone. |
+| 22 | ReceiverReport | viewer → host | `expected u32`, `missing u32`: every 0.25 s, the video data packets the viewer expected since the last report, and how many didn't arrive (rebuilt by FEC or not). The host sizes FEC from it (up fast, down slowly). |
 | 21 | FileRate | viewer → host | `bytes_per_s u32`: how fast file data to the viewer may go. Sent every 0.25 s. The viewer steers it from its picture: any video frame whose network time is 5 ms over the quiet baseline, a lost frame, late packets, or a round trip 10 ms over its baseline halve it; 2.5 ms over holds it; otherwise it rises by 15 % while a copy is moving (1–60 MB/s). It uses the same speed for its own file data. |
 
 **Offers, not copies.** Pictures and files are sent only when pasted, as Remote Desktop does: the receiver puts a promise on its clipboard (Windows: delayed rendering for pictures, virtual files for files; Mac: lazy pasteboard items), and the request goes when an app asks for the data. Copying without pasting costs a few bytes.
@@ -212,7 +213,9 @@ Header (24 bytes):
 | 4 | 4 | frame_id | +1 per sent frame, wraps |
 | 8 | 2 | packet_index | must be `< packet_count` |
 | 10 | 2 | packet_count | must be `> 0` |
-| 12 | 4 | fec_group | 0 until M4 defines the layout |
+| 12 | 1 | fec_groups | FEC: the frame's data packets are in this many interleaved groups (0 = no FEC) |
+| 13 | 1 | fec_parity | parity packets per group |
+| 14 | 2 | reserved | 0 |
 | 16 | 8 | capture_ts_us | host clock, µs, when the captured frame arrived |
 
 Payload: a chunk of the frame's **logical payload**, which is
@@ -232,15 +235,35 @@ The logical payload is cut into chunks of exactly **1352** bytes
 goes in the packet with `packet_index = i`, so a receiver can place packets at
 `i × 1352` in any order.
 
+### FEC (M4, v10)
+- A frame has `packet_count` data packets, then `fec_groups × fec_parity`
+  parity packets: `packet_index` from `packet_count` up, group `g`'s parity
+  rows at `packet_count + g × fec_parity + j`.
+- Data packet `i` is in group `i mod fec_groups`, so a run of consecutive
+  losses is spread over the groups. Groups hold at most 64 data packets.
+- Parity is systematic Reed–Solomon over GF(2^8) (polynomial `0x11D`), with
+  a Cauchy matrix. Row `j` over the group's `t`-th data packet has the
+  coefficient `1 / ((k + j) XOR t)`, for a group of `k` data packets. The
+  data payloads count as `MAX_PAYLOAD` (1352) bytes long, the last one
+  zero-padded. Parity payloads are exactly 1352 bytes.
+- The receiver rebuilds a group as soon as it holds as many of the group's
+  packets (data plus parity) as it has data packets. A rebuilt last packet
+  takes its length from the frame's `frame_len`.
+- The host sizes `fec_parity` from the viewer's `ReceiverReport`s: the
+  smallest count such that a group loses more than that about 1 in 10 000
+  times at 1.5 × the reported loss + 0.5 %, at least 1.
+
 ### Receiver rules
-- A frame is complete when all `packet_count` packets have arrived.
+- A frame is complete when all `packet_count` data packets are there, arrived
+  or rebuilt. Parity for a frame already delivered is ignored, not counted as
+  late; a data packet of the frame just delivered (FEC got there first) was
+  only reordered.
 - Frames are delivered in `frame_id` order. When a frame completes, any older
   incomplete frame is lost; packets for frames older than the last delivered
   one are ignored.
 - After any loss (and at start), frames are withheld until an IDR completes.
 
 ## Not yet defined
-- FEC group layout (M4)
 - Resolution negotiation (M7)
 
 ## Discovery (mDNS / DNS-SD)
@@ -250,6 +273,7 @@ protocol version, `fp` first 8 bytes of the fingerprint (hex), `ip`, `port`.
 Advisory only: trust comes from the pinned fingerprint, never from discovery.
 
 ## Changelog
+- v10 — M4: FEC on video (`fec_groups`, `fec_parity` in the header, parity packets), `ReceiverReport` (22).
 - v9 — M5c: `FileRate` (21): file speed adapts to the picture instead of a fixed 60 Mbps.
 - v8 — M5c clipboard: `ClipChunk` (17) carries text, and offers of pictures and files, both ways; a paste sends `FileRequest` (20), answered by the picture or `FileData` (18); `FileCancel` (19).
 - v7 — M3d no-loop rule: `Hello` carries who sees the viewer; reject reason 7 = loop. Control messages may now be up to 96 bytes.

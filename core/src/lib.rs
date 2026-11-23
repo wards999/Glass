@@ -6,6 +6,7 @@
 pub mod annexb;
 pub mod clipboard;
 pub mod clock;
+pub mod fec;
 pub mod ffi;
 pub mod identity;
 pub mod input;

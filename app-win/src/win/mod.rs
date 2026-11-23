@@ -1067,6 +1067,13 @@ fn run_session<V: ViewerLink>(
             c.bytes_sent as f64 * 8.0 / secs / 1e6,
             c.packets_sent
         );
+        let _ = writeln!(
+            r,
+            "  FEC (M4): {} parity packets ({:.1}% of packets) | the viewer's latest reported loss {:.2}%",
+            c.parity_packets,
+            c.parity_packets as f64 * 100.0 / c.packets_sent.max(1) as f64,
+            c.loss_ppm as f64 / 1e4
+        );
     } else {
         let _ = writeln!(
             r,

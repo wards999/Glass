@@ -446,6 +446,13 @@ pub fn run(
             c.packets_sent
         );
         let _ = writeln!(r, "{}", fmt_line("send (packetise)", &send_ring.summary()));
+        let _ = writeln!(
+            r,
+            "  FEC (M4): {} parity packets ({:.1}% of packets) | the viewer's latest reported loss {:.2}%",
+            c.parity_packets,
+            c.parity_packets as f64 * 100.0 / c.packets_sent.max(1) as f64,
+            c.loss_ppm as f64 / 1e4
+        );
         let _ = writeln!(r, "{}", fmt_line("helper -> service", &hop.summary()));
         let _ = writeln!(
             r,

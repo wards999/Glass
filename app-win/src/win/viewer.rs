@@ -560,6 +560,13 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
     );
     let _ = writeln!(
         out,
+        "  FEC (M4): rebuilt {} lost packets in {} frames | packet loss seen {:.2}%",
+        st.rx.recovered,
+        st.rx.frames_recovered,
+        st.rx.data_missing as f64 * 100.0 / st.rx.data_expected.max(1) as f64
+    );
+    let _ = writeln!(
+        out,
         "  bitrate {:.1} Mbps avg | clock sync {} (best RTT {:.2} ms, last {:.2} ms)",
         r.bytes as f64 * 8.0 / secs / 1e6,
         if st.clock_valid { "ok" } else { "NOT SYNCED" },

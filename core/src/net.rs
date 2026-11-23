@@ -1281,6 +1281,8 @@ struct ClientShared {
     /// looked (µs; lowest and highest; IDRs left out, they're big).
     frame_lo: AtomicU32,
     frame_hi: AtomicU32,
+    frame_sum: AtomicU64,
+    frame_n: AtomicU32,
     clock_rtt: AtomicU32,
     last_rtt: AtomicU32,
     host_notice: std::sync::atomic::AtomicU8,
@@ -1531,6 +1533,8 @@ impl Client {
             clock_offset: AtomicI64::new(0),
             frame_lo: AtomicU32::new(u32::MAX),
             frame_hi: AtomicU32::new(0),
+            frame_sum: AtomicU64::new(0),
+            frame_n: AtomicU32::new(0),
             clock_rtt: AtomicU32::new(0),
             last_rtt: AtomicU32::new(0),
             host_notice: std::sync::atomic::AtomicU8::new(0),
@@ -1811,6 +1815,8 @@ fn spawn_receiver(
                     let d = f.last_packet_us.saturating_sub(sent).min(u32::MAX as u64) as u32;
                     sh.frame_lo.fetch_min(d, Ordering::Relaxed);
                     sh.frame_hi.fetch_max(d, Ordering::Relaxed);
+                    sh.frame_sum.fetch_add(d as u64, Ordering::Relaxed);
+                    sh.frame_n.fetch_add(1, Ordering::Relaxed);
                 }
                 if !sh.queue.push(meta, f.data) {
                     sh.queue_full.fetch_add(1, Ordering::Relaxed);
@@ -1874,6 +1880,8 @@ fn spawn_control(
                 let st = sh.rx.load();
                 let lo = sh.frame_lo.swap(u32::MAX, Ordering::Relaxed);
                 let hi = sh.frame_hi.swap(0, Ordering::Relaxed);
+                let sum = sh.frame_sum.swap(0, Ordering::Relaxed);
+                let n = sh.frame_n.swap(0, Ordering::Relaxed);
                 // What arrived of the video since the last report (M4 FEC).
                 // Saturating: a reordered packet takes one back off the
                 // missing count, which can go below the last report's
@@ -1891,7 +1899,7 @@ fn spawn_control(
                     now,
                     st.frames_lost + st.late,
                     sh.last_rtt.load(Ordering::Relaxed),
-                    (lo != u32::MAX).then_some((lo, hi)),
+                    (n > 0).then(|| (lo, (sum / n as u64).min(u32::MAX as u64) as u32, hi)),
                     sh.clip.moving(),
                 );
                 sh.clip.set_rate(r);

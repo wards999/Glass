@@ -309,22 +309,27 @@ pub fn encode_message(m: &Message, out: &mut Vec<u8>) -> bool {
     }
 }
 
-/// How far over its quiet baseline any video frame's network time may get
-/// before file data halves (µs), and before it stops speeding up.
-pub const FRAME_SLACK_US: u32 = 5_000;
-pub const FRAME_WARN_US: u32 = 2_500;
+/// How far the *average* video frame's network time may rise over its quiet
+/// baseline before file data halves (µs), and before it stops speeding up.
+/// A single frame only counts once it is [`FRAME_SPIKE_US`] over: lone Wi-Fi
+/// blips of a few ms are routine, copy or no copy (m5c-test10 halved on any
+/// frame 5 ms over and pinned a 1.3 GB copy near the floor for 17 min).
+pub const FRAME_SLACK_US: u32 = 4_000;
+pub const FRAME_WARN_US: u32 = 2_000;
+pub const FRAME_SPIKE_US: u32 = 30_000;
 /// How often the viewer steers (µs).
 pub const RATE_TICK_US: u64 = 250_000;
 
 /// The viewer's steering of file speed (M5c), every [`RATE_TICK_US`], from
 /// what it sees of the picture. The video frames' own network time is the
-/// main signal: as soon as any frame of the last tick took more than
-/// [`FRAME_SLACK_US`] over the quiet baseline, the speed halves. So do a
-/// lost frame, late packets, or a round trip 10 ms over its baseline. Over
-/// [`FRAME_WARN_US`] it holds. Otherwise, while a copy is moving, it rises
-/// by 15 %. With nothing moving it drifts back to [`FILE_RATE`], so a new
-/// copy never starts at full blast. (m5c-test9: steering by the round trip
-/// alone, twice a second, let frames queue to 26 ms p99 behind a copy.)
+/// main signal. When file data fills the queue every frame waits, so the
+/// average of the last tick rises: more than [`FRAME_SLACK_US`] over the
+/// quiet baseline (the lowest tick average of the last 10 s) halves the
+/// speed, and so does one frame [`FRAME_SPIKE_US`] over, a lost frame, late
+/// packets, or a round trip 10 ms over its baseline. Over [`FRAME_WARN_US`]
+/// it holds. Otherwise, while a copy is moving, it rises by 15 %. With
+/// nothing moving it drifts back to [`FILE_RATE`], so a new copy never
+/// starts at full blast.
 pub struct RateControl {
     rate: f64,
     base_rtt: u32,
@@ -349,15 +354,16 @@ impl Default for RateControl {
 
 impl RateControl {
     /// `bad`: video frames lost plus late packets so far; `rtt_us`: the
-    /// latest round trip; `frames`: the lowest and highest network time of
-    /// the video frames since the last tick (µs), if any came; `moving`: a
-    /// copy is going either way. Returns the speed to use (bytes/s).
+    /// latest round trip; `frames`: the lowest, average and highest network
+    /// time of the video frames since the last tick (µs), if any came;
+    /// `moving`: a copy is going either way. Returns the speed to use
+    /// (bytes/s).
     pub fn tick(
         &mut self,
         now_us: u64,
         bad: u64,
         rtt_us: u32,
-        frames: Option<(u32, u32)>,
+        frames: Option<(u32, u32, u32)>,
         moving: bool,
     ) -> u64 {
         // Quiet baselines: the lowest of the last 10 s.
@@ -366,24 +372,23 @@ impl RateControl {
             self.base_rtt = rtt_us;
             self.base_rtt_since = now_us;
         }
-        if let Some((lo, _)) = frames {
-            if lo < self.base_frame || fresh(self.base_frame_since) {
-                self.base_frame = lo;
+        if let Some((_, avg, _)) = frames {
+            if avg < self.base_frame || fresh(self.base_frame_since) {
+                self.base_frame = avg;
                 self.base_frame_since = now_us;
             }
         }
-        let over = |slack: u32| {
-            frames.is_some_and(|(_, hi)| {
-                self.base_frame != u32::MAX && hi > self.base_frame.saturating_add(slack)
-            })
-        };
+        let base = self.base_frame;
+        let over = |d: u32, slack: u32| base != u32::MAX && d > base.saturating_add(slack);
+        let (avg, hi) = frames.map_or((0, 0), |(_, a, h)| (a, h));
         let worse = bad > self.last_bad
             || (self.base_rtt != u32::MAX && rtt_us > self.base_rtt.saturating_add(10_000))
-            || over(FRAME_SLACK_US);
+            || over(avg, FRAME_SLACK_US)
+            || over(hi, FRAME_SPIKE_US);
         self.last_bad = bad;
         if worse {
             self.rate /= 2.0;
-        } else if moving && !over(FRAME_WARN_US) {
+        } else if moving && !over(avg, FRAME_WARN_US) {
             self.rate *= 1.15;
         } else if !moving {
             self.rate += (FILE_RATE as f64 - self.rate) * 0.1;
@@ -1250,27 +1255,34 @@ mod tests {
             t += RATE_TICK_US;
             r.tick(t, bad, rtt, frames, moving)
         };
-        let calm = Some((3_000, 4_000));
-        // A quiet network and a copy going: it speeds up to the cap.
+        // Typical Wi-Fi: frames 3–3.5 ms, with a lone one 5.5 ms slower.
+        let calm = Some((3_000, 3_500, 9_000));
+        // A quiet network and a copy going: it speeds up to the cap, the
+        // lone slow frames notwithstanding (m5c-test10 halved on them).
         let mut v = 0;
         for _ in 0..60 {
             v = tick(&mut r, 0, 3_000, calm, true);
         }
         assert_eq!(v, FILE_RATE_MAX);
-        // One frame 6 ms slower than the quiet ones: halved at once.
+        // The average frame 4.5 ms slower (data queued ahead): halved.
         assert_eq!(
-            tick(&mut r, 0, 3_000, Some((3_000, 9_100)), true),
+            tick(&mut r, 0, 3_000, Some((7_000, 8_000, 9_000)), true),
             FILE_RATE_MAX / 2
         );
-        // 3 ms slower: held, not raised.
+        // 2.5 ms slower on average: held, not raised.
         assert_eq!(
-            tick(&mut r, 0, 3_000, Some((3_000, 6_000)), true),
+            tick(&mut r, 0, 3_000, Some((5_000, 6_000, 7_000)), true),
             FILE_RATE_MAX / 2
+        );
+        // One frame 30 ms over: halved.
+        assert_eq!(
+            tick(&mut r, 0, 3_000, Some((3_000, 3_600, 34_000)), true),
+            FILE_RATE_MAX / 4
         );
         // The round trip jumps: halved.
-        assert_eq!(tick(&mut r, 0, 20_000, calm, true), FILE_RATE_MAX / 4);
+        assert_eq!(tick(&mut r, 0, 20_000, calm, true), FILE_RATE_MAX / 8);
         // A lost frame: halved again.
-        assert_eq!(tick(&mut r, 1, 3_000, calm, true), FILE_RATE_MAX / 8);
+        assert_eq!(tick(&mut r, 1, 3_000, calm, true), FILE_RATE_MAX / 16);
         // Nothing moving: back towards the starting speed, not up.
         for _ in 0..80 {
             v = tick(&mut r, 1, 3_000, None, false);

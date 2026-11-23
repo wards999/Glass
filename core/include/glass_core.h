@@ -62,12 +62,17 @@
 #define GLASS_FILE_RATE_MAX 60000000
 
 /**
- * How far over its quiet baseline any video frame's network time may get
- * before file data halves (µs), and before it stops speeding up.
+ * How far the *average* video frame's network time may rise over its quiet
+ * baseline before file data halves (µs), and before it stops speeding up.
+ * A single frame only counts once it is [`FRAME_SPIKE_US`] over: lone Wi-Fi
+ * blips of a few ms are routine, copy or no copy (m5c-test10 halved on any
+ * frame 5 ms over and pinned a 1.3 GB copy near the floor for 17 min).
  */
-#define GLASS_FRAME_SLACK_US 5000
+#define GLASS_FRAME_SLACK_US 4000
 
-#define GLASS_FRAME_WARN_US 2500
+#define GLASS_FRAME_WARN_US 2000
+
+#define GLASS_FRAME_SPIKE_US 30000
 
 /**
  * How often the viewer steers (µs).

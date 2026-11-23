@@ -74,19 +74,23 @@ between any pair (PC↔Mac, PC↔PC).
   made a 1 GB paste take 2 min 20 s, against 2 min 7 s for Remote Desktop.
   Now the viewer steers it every 0.25 s (`RateControl`). The main signal is
   the video frames' own network time (from the host's send time, through
-  clock sync, to their last packet): any frame 5 ms over the quiet baseline
-  halves the speed, 2.5 ms over holds it. A lost frame, late packets or a
-  round trip 10 ms over its baseline also halve it. Otherwise it rises by
-  15 % while a copy is moving, 1–60 MB/s. (m5c-test9 steered by the round
-  trip alone, twice a second: much faster than before, but frames queued to
-  26 ms p99 behind the copy.)
+  clock sync, to their last packet). Each tick it takes the frames' average:
+  4 ms over the quiet baseline (the lowest tick average of the last 10 s)
+  halves the speed, 2 ms over holds it. A single frame halves it only when
+  30 ms over. A lost frame, late packets or a round trip 10 ms over its
+  baseline also halve it. Otherwise it rises by 15 % while a copy is moving,
+  1–60 MB/s. With nothing moving it drifts back to the start (7.5 MB/s), so
+  a copy never starts at full blast. The viewer sends the speed to the host
+  (`FileRate`) for files going its way.
+  - m5c-test9 steered by the round trip alone, twice a second: much faster
+    than before, but frames queued to 26 ms p99 behind the copy.
+  - m5c-test10 halved on any single frame 5 ms over the baseline. Lone Wi-Fi
+    blips that size are routine, so a 1.3 GB copy (m4-test3) sat near the
+    1 MB/s floor and took 17 min. Since m4-test4 it watches the average.
 - In the service, the clipboard helper's messages go to the viewer's
   connection from the clipboard pipe's own thread, never through the loop
   that forwards video frames. In m5c-test9 a frame waited 58 ms there behind
-  a file chunk. With nothing
-  moving it drifts back to the start (7.5 MB/s), so a copy never starts at
-  full blast. The viewer sends the speed to the host (`FileRate`) for files
-  going its way.
+  a file chunk.
 - **Pastes stream (Windows).** Each file's contents go to Explorer as a
   stream that hands over bytes as they arrive, so Explorer's copy window
   moves with the transfer. The Mac still waits for the whole copy.

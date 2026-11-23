@@ -10,6 +10,7 @@ pub mod ffi;
 pub mod identity;
 pub mod input;
 pub mod keymap;
+pub mod media_link;
 pub mod net;
 pub mod packet;
 pub mod pairing;

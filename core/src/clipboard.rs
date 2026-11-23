@@ -26,7 +26,10 @@
 use crate::protocol::{
     encode_file_cancel, encode_file_request, ClipChunk, FileData, Message, CLIP_CHUNK,
 };
-use crate::tls::TlsWriter;
+
+/// Where a link's control messages go: the session's connection, or (in a
+/// helper, ADR 0017) the pipe to the broker. False if it's gone.
+pub type FrameWriter = Box<dyn Fn(&[u8]) -> bool + Send + Sync>;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -278,6 +281,24 @@ pub fn fetch_timeout(size: u64) -> Duration {
     Duration::from_secs(30 + size / (FILE_RATE / 2))
 }
 
+/// A clipboard message (17–20) as its frame again, for passing it on
+/// unchanged. False for any other message.
+pub fn encode_message(m: &Message, out: &mut Vec<u8>) -> bool {
+    match m {
+        Message::Clip(c) => c.encode(out),
+        Message::FileData(d) => d.encode(out),
+        Message::FileCancel(id) => {
+            encode_file_cancel(*id, out);
+            true
+        }
+        Message::FileRequest(id) => {
+            encode_file_request(*id, out);
+            true
+        }
+        _ => false,
+    }
+}
+
 // ---- The link: one per session --------------------------------------------
 
 /// Something the other side copied and offers: put a promise of it on the
@@ -398,7 +419,7 @@ struct Counts {
 
 /// Clipboard state for one session, both ways.
 pub struct ClipLink {
-    w: Option<TlsWriter>,
+    w: Option<FrameWriter>,
     jobs: Mutex<VecDeque<Job>>,
     wake: Condvar,
     /// Bumped on every new copy: text still being sent stops.
@@ -418,8 +439,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl ClipLink {
-    /// `w`: the session's control connection (`None` in tests).
-    pub(crate) fn new(w: Option<TlsWriter>) -> Self {
+    /// `w`: where its messages go (`None` in tests).
+    pub fn new(w: Option<FrameWriter>) -> Self {
         Self {
             w,
             jobs: Mutex::new(VecDeque::new()),
@@ -436,7 +457,7 @@ impl ClipLink {
     }
 
     fn write(&self, frame: &[u8]) -> bool {
-        self.w.as_ref().is_none_or(|w| w.write_all(frame).is_ok())
+        self.w.as_ref().is_none_or(|w| w(frame))
     }
 
     fn push(self: &Arc<Self>, job: Job) {

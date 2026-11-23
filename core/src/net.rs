@@ -79,6 +79,11 @@ fn send_control(w: &TlsWriter, msg: Control) -> io::Result<()> {
     w.write_all(&buf[..n])
 }
 
+/// A clipboard link's writer onto a session's connection.
+fn frame_writer(w: TlsWriter) -> crate::clipboard::FrameWriter {
+    Box::new(move |f: &[u8]| w.write_all(f).is_ok())
+}
+
 fn send_pair(w: &TlsWriter, kind: u8, body: &[u8]) -> io::Result<()> {
     let mut b = Vec::with_capacity(body.len() + 3);
     if !encode_pair(kind, body, &mut b) {
@@ -344,6 +349,8 @@ struct HostShared {
     mode_req: AtomicU32,
     /// Clipboard and files, both ways (M5c).
     clip: Arc<crate::clipboard::ClipLink>,
+    /// Pass the viewer's clipboard messages to a helper instead (ADR 0017).
+    clip_relay: Mutex<Option<crate::clipboard::FrameWriter>>,
 }
 
 /// One connected viewer. Dropping it ends the session (and releases any
@@ -538,7 +545,10 @@ impl HostListener {
             input: Mutex::new(InputCounters::default()),
             rejected: AtomicU64::new(0),
             mode_req: AtomicU32::new(0),
-            clip: Arc::new(crate::clipboard::ClipLink::new(Some(ch.writer.clone()))),
+            clip: Arc::new(crate::clipboard::ClipLink::new(Some(frame_writer(
+                ch.writer.clone(),
+            )))),
+            clip_relay: Mutex::new(None),
         });
         let mut threads = Vec::new();
 
@@ -594,7 +604,16 @@ impl HostListener {
                         | Message::FileData(_)
                         | Message::FileCancel(_)
                         | Message::FileRequest(_) => {
-                            sh.clip.on_message(&m);
+                            let relay = lock(&sh.clip_relay);
+                            if let Some(to) = relay.as_ref() {
+                                let mut f = Vec::new();
+                                if crate::clipboard::encode_message(&m, &mut f) {
+                                    to(&f);
+                                }
+                            } else {
+                                drop(relay);
+                                sh.clip.on_message(&m);
+                            }
                         }
                         Message::Control(Control::Bye) => {
                             return Err(io::ErrorKind::ConnectionAborted.into())
@@ -871,6 +890,29 @@ impl HostSession {
 
     pub fn clip_progress(&self) -> crate::clipboard::ClipProgress {
         self.shared.clip.progress()
+    }
+
+    /// Passes the viewer's clipboard messages to `to` (a clipboard helper
+    /// running as the signed-in user, ADR 0017) instead of this session's
+    /// own link; `None` stops.
+    pub fn relay_clipboard(&self, to: Option<crate::clipboard::FrameWriter>) {
+        *lock(&self.shared.clip_relay) = to;
+    }
+
+    /// Sends a clipboard message from that helper to the viewer, unchanged.
+    /// Refused (false) unless it's exactly one clipboard message.
+    pub fn send_clip_frame(&self, frame: &[u8]) -> bool {
+        let ok = matches!(
+            Message::decode(frame),
+            Ok((
+                Message::Clip(_)
+                    | Message::FileData(_)
+                    | Message::FileCancel(_)
+                    | Message::FileRequest(_),
+                n
+            )) if n == frame.len()
+        );
+        ok && self.out.write_all(frame).is_ok()
     }
 
     pub fn counters(&self) -> HostCounters {
@@ -1420,7 +1462,9 @@ impl Client {
             stop: AtomicBool::new(false),
             connected: AtomicBool::new(true),
             host_bye: AtomicBool::new(false),
-            clip: Arc::new(crate::clipboard::ClipLink::new(Some(ch.writer.clone()))),
+            clip: Arc::new(crate::clipboard::ClipLink::new(Some(frame_writer(
+                ch.writer.clone(),
+            )))),
             want_keyframe: AtomicBool::new(false),
             keyframe_requests: AtomicU32::new(0),
             queue_full: AtomicU64::new(0),

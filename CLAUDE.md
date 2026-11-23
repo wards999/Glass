@@ -8,7 +8,7 @@ This repo builds **Glass**, a two-way low-latency remote desktop between a Windo
 Check every change against both; say in the results how a milestone moved them.
 
 ## How to work
-- Work **one milestone at a time** (SPEC.md §9). Don't start the next until the current one runs end-to-end and `docs/results/Mx.md` is written with measured numbers.
+- Work **one round at a time** (SPEC.md §9, ADR 0028): build a round's pieces one by one, then test them together. Don't start the next round until the current one runs end-to-end and each milestone's `docs/results/Mx.md` is written with measured numbers.
 - End each milestone (and each re-test) with a **test build**: push a tag `mN-testK` (e.g. `m2-test1`). CI publishes a prerelease with the Windows zip and Mac dmg (`docs/testing.md`). Put that milestone's test steps in the release notes and `docs/testing.md`; the user runs them and sends back the results.
 - Prefer the simplest thing that works for the current milestone; leave `// LATER(Mx):` notes rather than building ahead.
 - Record any significant design decision as a short ADR in `docs/decisions/NNNN-title.md`.

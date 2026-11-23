@@ -9,7 +9,7 @@ on:
     branches: [main]
     # Test builds: push a tag like m1-test1 to publish a prerelease with the
     # Windows zip and Mac dmg.
-    tags: ['m*-test*']
+    tags: ['m*-test*', 'r*-test*']
     paths-ignore: ['docs/**', '**/*.md']
   pull_request:
     paths-ignore: ['docs/**', '**/*.md']

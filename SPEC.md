@@ -561,7 +561,8 @@ then Wi-Fi robustness, sound and smoothness, which both use cases need, then
 gaming (use case B). Earlier reorders: ADR 0007 (use case A first), ADR 0009
 (security straight after M3), ADR 0015 (the Windows service moved up),
 ADR 0018 (audio before smoothness), ADR 0019 (refresh matching and the
-Windows virtual display into M5).
+Windows virtual display into M5), ADR 0028 (what's left tested in three
+rounds).
 
 ### Done
 
@@ -608,10 +609,17 @@ speakers while it's viewed.
   - A/V sync measured on real Wi-Fi and corrected (target ±20 ms).
 - LATER: the microphone (viewer → host).
 
-### Still to do, in order
+### Still to do, in three rounds (ADR 0028)
+Each round's pieces are built and checked one at a time, each with its own
+line in the results, then tested together in one session both ways
+(PC → Mac and Mac → PC, a game with sound). Tags: `rN-testK`.
 
-1. **M4 close-out.** Real numbers from m4-test12 or later, PC ↔ PC and
-   PC ↔ Mac on Wi-Fi:
+**First, a check:** can Glass use an existing signed IddCx driver for the
+Windows virtual display (ADR 0008, ADR 0019)? If not, a fallback is chosen
+before Round 2.
+
+**Round 1 – Sound and smoothness, both directions.**
+1. **M4 close-out.** Real numbers, PC ↔ PC and PC ↔ Mac on Wi-Fi:
    - frames lost and saved by NACK;
    - hitches after a loss;
    - Wi-Fi priority marking accepted;
@@ -620,29 +628,21 @@ speakers while it's viewed.
 
    Then `docs/results/M4.md` is closed.
 2. **M4b – Audio**, steps 3 and 4 (above).
-3. **M5 – Smoothness**, tuned with sound playing:
-   - **Frames at the viewer's refresh** (step 1 built in m5-test1: the host
-     sends at most one frame per refresh of the viewer's screen, the newest). The host captures and encodes at
-     the refresh the viewer reports in `Hello`, never faster than it can
-     show. The viewer presents in step with its screen.
+3. **M5 – Smoothness**, the rest (built so far: frames at twice the
+   viewer's refresh, presentation just before each refresh, pacing, rate
+   control with the frame rate as its first lever, and worst moments in
+   the results):
+   - **Send timing locked to the viewer's refresh.**
    - **A Frame rate choice in the bar** (and its default in Settings):
      Auto, or a cap of 120 / 60 / 30, offering only what the viewer's
      screen can show.
-   - **A virtual display on a Windows host** (vendor-signed IddCx driver,
-     ADR 0019) at exactly the viewer's size and refresh, streamed 1:1.
-     The Mac host's virtual display at the viewer's refresh too.
-   - **The jitter buffer and presentation:** an adaptive jitter buffer,
-     display-linked presentation, and clock drift tracking.
-   - **Rate control:** delay-based congestion control and adaptive bitrate
-     with the Auto resolution ladder (§5e, §6b). Its budget covers FEC,
-     NACK resends, sound and file transfers.
-   - **Pacing:** packets paced on their own thread (deferred from M4 step 2).
+   - **The Windows viewer's presentation** in step with its screen, like
+     the Mac's.
    - **Sound on its own socket**, marked as voice, if the A/V numbers ask
      for it (ADR 0025).
    - **Frame-interval metrics** against the §5c pacing target.
-   - **Baselines:** StarDesk measured before it (§5d), and comparisons
-     against StarDesk and Moonlight after.
-4. **M3e – Wake-on-LAN** (ADR 0014; not started).
+   - **Comparisons** against StarDesk and Moonlight.
+4. **M3e – Wake-on-LAN** (ADR 0014).
    - Wake a sleeping paired machine from the device list. The host sends
      its adapters' MAC addresses when a viewer connects (a protocol bump).
    - A Wake button for paired devices that aren't on the network: the
@@ -650,34 +650,46 @@ speakers while it's viewed.
    - Guidance for enabling it, without changing settings.
    - The honest limit: reliable over Ethernet; most PCs can't wake over
      Wi-Fi, and a Mac only through a Bonjour Sleep Proxy.
-5. **M5b – Gaming: feel** (use case B):
-   - relative mouse mode;
-   - a game-mode overlay;
-   - even cadence (vsync-locked sampling, cadence-error metric, a frame-cap
-     hint; §5c);
-   - measured with a real Steam game, played with mouse and keyboard;
-   - the opt-in low-latency Wi-Fi toggle (§5d), if M5 still shows AWDL
-     spikes.
-6. **M7 – Clarity (rest):** a scene-change burst and still-region refinement
-   on the Windows host.
-7. **M8 – Extras:**
-   - **A direct NVENC SDK path.** It would also allow reference-frame
-     invalidation instead of a keyframe after a loss, if M4's hitch numbers
-     ask for it (ADR 0022).
+
+**Round 2 – The Windows host's picture.** All of these change how the PC
+captures and encodes.
+1. **A virtual display on a Windows host** (ADR 0019) at exactly the
+   viewer's size and refresh, streamed 1:1; the Mac host's virtual display
+   at the viewer's refresh too.
+2. **Auto resolution:** the resolution ladder of §5e, stepped by rate
+   control after the frame rate and bitrate.
+3. **M7 – Clarity (rest):** a scene-change burst and still-region
+   refinement on the Windows host.
+4. **M8 – Extras:**
+   - **A direct NVENC SDK path:** bitrate changes without a keyframe, and
+     reference-frame invalidation instead of a keyframe after a loss
+     (ADR 0022).
    - **The MTU probe** (DF bit, falling back to 1200-byte datagrams) with a
      warning when a VPN routes local traffic (ADR 0023).
-8. **M9 – iPad viewer** (future): `core` built for iOS and the Mac viewer's
-   Swift pieces; touch mapped to pointer gestures; keyboards and the Pencil.
-   Viewer only.
-9. **M10 – Android viewer** (future, maybe): `core` via JNI, MediaCodec,
-   touch and keyboard. Viewer only.
-10. **M11 – Game controllers** (future; ADR 0013):
-    - controllers on the viewer, sent as button and axis state at
-      ≥ 250 Hz;
-    - a Windows host presents a virtual Xbox 360 pad through ViGEmBus (an
-      optional one-time install), a Mac host a virtual HID gamepad if macOS
-      allows;
-    - rumble goes back to the viewer's controller.
+
+**Round 3 – M5b, gaming feel** (use case B), tuned against Round 2's
+picture:
+- relative mouse mode;
+- a game-mode overlay;
+- even cadence (vsync-locked sampling, cadence-error metric, a frame-cap
+  hint; §5c);
+- measured with a real Steam game, played with mouse and keyboard;
+- the opt-in low-latency Wi-Fi toggle (§5d), if the numbers still show
+  AWDL spikes.
+
+**Later, each its own milestone:**
+- **M9 – iPad viewer** (future): `core` built for iOS and the Mac viewer's
+  Swift pieces; touch mapped to pointer gestures; keyboards and the Pencil.
+  Viewer only.
+- **M10 – Android viewer** (future, maybe): `core` via JNI, MediaCodec,
+  touch and keyboard. Viewer only.
+- **M11 – Game controllers** (future; ADR 0013):
+  - controllers on the viewer, sent as button and axis state at
+    ≥ 250 Hz;
+  - a Windows host presents a virtual Xbox 360 pad through ViGEmBus (an
+    optional one-time install), a Mac host a virtual HID gamepad if macOS
+    allows;
+  - rumble goes back to the viewer's controller.
 
 ### Open items carried forward
 From closed milestones; picked up when they fit, or when a test shows them.

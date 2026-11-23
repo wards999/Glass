@@ -383,7 +383,9 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 send: { [client] in client.sendClipboard($0) },
                 takeText: { [client] in client.takeClipboard() },
                 takeOffer: { [client] in client.takeOffer() },
-                fetch: { [client] in client.fetch($0) }))
+                fetch: { [client] in client.fetch($0) },
+                progress: { [client] in client.clipProgress },
+                peer: client.hostName))
         }
         guard let clip else { return }
         clip.poll()

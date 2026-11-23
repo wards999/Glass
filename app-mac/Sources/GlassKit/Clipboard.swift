@@ -39,9 +39,15 @@ public final class ClipboardSync: NSObject, NSPasteboardItemDataProvider {
         public var takeOffer: () -> Offer?
         /// 0 still coming, 1 done (with the picture or file paths), 2 failed.
         public var fetch: (UInt32) -> (UInt8, Item?)
+        /// How far a paste's files have come, for the progress panel.
+        public var progress: (() -> GLASS_ClipProgress)?
+        /// The other side's name, for the progress panel.
+        public var peer: String
         public init(send: @escaping (Item) -> Void, takeText: @escaping () -> Item?,
-                    takeOffer: @escaping () -> Offer?, fetch: @escaping (UInt32) -> (UInt8, Item?)) {
+                    takeOffer: @escaping () -> Offer?, fetch: @escaping (UInt32) -> (UInt8, Item?),
+                    progress: (() -> GLASS_ClipProgress)? = nil, peer: String = "") {
             self.send = send; self.takeText = takeText; self.takeOffer = takeOffer; self.fetch = fetch
+            self.progress = progress; self.peer = peer
         }
     }
 
@@ -189,12 +195,30 @@ public final class ClipboardSync: NSObject, NSPasteboardItemDataProvider {
         if let got { return got }
         guard let o = offer else { return nil }
         waiting = true
-        defer { waiting = false }
+        // Files: a panel once it takes a moment (Finder is stuck until
+        // they're all here, with a beachball).
+        var panel: PastePanel?
+        defer {
+            waiting = false
+            panel?.close()
+        }
+        let start = Date()
+        var shown = Date.distantPast
         let limit = Date(timeIntervalSinceNow: 30 + Double(o.size) / 3_750_000) // fetch_timeout
         while Date() < limit {
             let (state, item) = ep.fetch(o.id)
             if state == 1 { got = item; return item }
             if state == 2 { return nil }
+            if o.kind == UInt8(GLASS_CLIP_FILES), let progress = ep.progress,
+               Date().timeIntervalSince(start) > 0.3, Date().timeIntervalSince(shown) > 0.25 {
+                if panel == nil {
+                    panel = PastePanel(peer: ep.peer)
+                    panel?.show()
+                }
+                let p = progress()
+                panel?.update(done: p.in_done, total: max(p.in_total, o.size))
+                shown = Date()
+            }
             RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.02))
         }
         return nil

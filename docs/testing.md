@@ -10,6 +10,15 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M4 test 8 (a progress panel while the Mac pastes files)
+1. View the Mac from QUIETPC22. Copy a big file (1 GB) on QUIETPC22, and
+   paste it in Finder on the Mac (through the viewer, or on the Mac itself).
+2. Finder still beachballs until the file is all there (macOS can't do
+   better for Cmd+V), but a panel now appears at the top of the Mac's
+   screen: "Pasting from “QUIETPC22”…", a bar, MB, %, speed, time left.
+   It shows in the viewer's picture too, and closes when the paste is done.
+3. The same with the Mac viewing QUIETPC: copy on QUIETPC, paste on the Mac.
+
 ## M4 test 7 (Stop sharing keeps Allow connections on)
 1. View the Mac from QUIETPC22, then on the Mac press Stop Sharing in the
    Glass window. The session ends, QUIETPC22 doesn't reconnect by itself,

@@ -93,10 +93,16 @@ between any pair (PC↔Mac, PC↔PC).
   a file chunk.
 - **Pastes stream (Windows).** Each file's contents go to Explorer as a
   stream that hands over bytes as they arrive, so Explorer's copy window
-  moves with the transfer. The Mac still waits for the whole copy.
-  LATER: file promises. File data is paced at about
-  60 Mbps so the picture keeps the network. LATER(M5): pace from the rate
-  controller.
+  moves with the transfer.
+- **The Mac can't stream a paste.** Finder's Cmd+V reads the files
+  synchronously and shows a beachball until they're all here (m4-test6:
+  1.37 GB, 44 s). File promises would avoid that, but developers report
+  that Finder doesn't honour them on paste, only on drops. So while a paste
+  waits, Glass shows a small floating panel at the top of the screen: from
+  whom, MB so far, %, speed, time left, and "Finder waits until it's all
+  here". It appears after 0.3 s, on host and viewer alike, and the viewer
+  sees it in the picture too. LATER: dragging from the viewer onto the
+  Mac's desktop, with file promises, for a real Finder progress window.
 - At most 10 000 files and folders a copy. A copy that can't be listed
   (too many, or a file that can't be read, e.g. a cloud-only file) isn't
   offered; the results say why.

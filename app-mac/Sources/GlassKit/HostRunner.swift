@@ -295,7 +295,9 @@ private final class HostSessionRun {
                 send: { [self] item in q.async { [self] in s.sendClipboard(item) } },
                 takeText: { [self] in q.sync { s.takeClipboard() } },
                 takeOffer: { [self] in q.sync { s.takeOffer() } },
-                fetch: { [self] id in q.sync { s.fetch(id) } }))
+                fetch: { [self] id in q.sync { s.fetch(id) } },
+                progress: { [self] in q.sync { s.clipProgress } },
+                peer: s.peerName))
             let t = DispatchSource.makeTimerSource(queue: .main)
             t.schedule(deadline: .now(), repeating: .milliseconds(150))
             t.setEventHandler { sync.poll() }

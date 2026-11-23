@@ -541,8 +541,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private func endSession() {
         if let v = viewer {
             v.stop("ended from the Glass window")
-        } else if hostController != nil {
-            stopSharing()
+        } else if let h = hostController {
+            // Only the viewer goes: Allow Connections stays on.
+            h.endSession()
         }
     }
 

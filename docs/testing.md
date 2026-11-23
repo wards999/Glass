@@ -10,6 +10,15 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M4 test 7 (Stop sharing keeps Allow connections on)
+1. View the Mac from QUIETPC22, then on the Mac press Stop Sharing in the
+   Glass window. The session ends, QUIETPC22 doesn't reconnect by itself,
+   and Allow Connections stays on: connecting again works without
+   switching anything back on.
+2. The same with QUIETPC as host (the service), and with Glass.exe sharing.
+3. The NACK line now counts a frame as saved only if a resent packet
+   completed it.
+
 ## M4 test 6 (NACK: lost packets asked for again)
 Protocol v11: update all three machines, and the service on QUIETPC.
 1. As M4 test 1: a few minutes on Wi-Fi with ordinary use and a video,

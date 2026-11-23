@@ -1337,17 +1337,17 @@ impl GlassApp {
         }
     }
 
-    /// Ends the session this window is in: the one being viewed here, or the
-    /// one viewing this PC (sharing stays on).
     /// The session bar's button. Viewing: Disconnect (leave). Being
-    /// viewed: Stop sharing, the same as switching Allow connections off
-    /// (one idea per side; reconnecting a paired device right after an
-    /// "end only this visit" made the difference meaningless).
+    /// viewed: Stop sharing ends only that viewer's session; Allow
+    /// connections stays on (the user's call, m4-test6). The host says Bye,
+    /// so the viewer doesn't reconnect by itself.
     fn end_session(&mut self) {
         if self.viewing.is_some() {
             disconnect_viewer();
-        } else if self.sharing.is_some() || self.svc == super::service::State::Running {
-            self.toggle_share();
+        } else if self.sharing.is_some() {
+            self.end_session.store(true, Ordering::Relaxed);
+        } else if self.svc == super::service::State::Running {
+            let _ = super::service::request_end();
         }
     }
 

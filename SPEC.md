@@ -553,36 +553,155 @@ display queue, which M5 removes.
 
 ## 9. Milestones
 
-PC → Mac was built first through M3. From there the order follows §0: use
-case A (the PC views the Mac, text always sharp) comes next, then Wi-Fi
-robustness and smoothness, which both use cases need, then gaming (use case B).
-Milestone names are kept stable so earlier results and ADRs still match; the
-numbers give the order. (Reordered 2026-11-20, ADR 0007; security moved up
-straight after M3, ADR 0009: from M3 on, a host lets a viewer control the
-machine, so nothing unpaired may connect.)
+Status as of 2026-11-23. Milestone names stay stable so the results
+(`docs/results/Mx.md`), ADRs and test-build tags (`mN-testK`) still match.
+The order follows §0 and the overriding rule (speed, smoothness, sharp text,
+and sound in step with the picture): use case A (the PC views the Mac) first,
+then Wi-Fi robustness, sound and smoothness, which both use cases need, then
+gaming (use case B). Earlier reorders: ADR 0007 (use case A first), ADR 0009
+(security straight after M3), ADR 0015 (the Windows service moved up),
+ADR 0018 (audio before smoothness), ADR 0019 (refresh matching and the
+Windows virtual display into M5).
 
-1. **M0 – Skeleton:** repo layout, `core` crate building for Windows and macOS, Swift app linking `core`, CI build for both.
-2. **M1 – Offline pipeline:** PC captures and encodes to an HEVC file; Mac decodes and renders that file with Metal. Measure encode/decode times.
-3. **M2 – Live stream (unencrypted, LAN):** UDP packetiser, no FEC; live PC video on the Mac. Stats overlay with in-band latency.
-4. **M3 – Input:** mouse and keyboard back-channel, local cursor. Usable PC → Mac remote desktop.
-5. **M6 – Security (moved up, §7):** PIN pairing (SPAKE2) that swaps and pins long-term self-signed certificates; every connection uses mutual TLS 1.3 against the pinned certificate (rustls in `core`, so the Mac uses it through the C ABI); UDP media/input encrypted with AES-128-GCM, keys from the TLS exporter, sequence-number nonces and a replay window; per-direction permissions; optional "ask on the host before each connection"; PIN attempt limits; identities stored with DPAPI on Windows and in a 0600 file on the Mac (Keychain once builds have a stable signing certificate; ADR 0010). mDNS discovery (devices listed by name, typed address still works). Both directions, so M3b's Mac host starts secure.
-6. **M3b – Reverse direction (use case A):** first check whether VideoToolbox can hardware-encode HEVC 4:4:4 on the M4 (decides the clarity approach). Then the Mac host (ScreenCaptureKit + VideoToolbox encode + CGEvent, with Screen Recording/Accessibility permission checks) and the Windows viewer (D3D11VA decode + flip-model swap chain + Raw Input/keyboard hook + local pointer), full screen on the PC. Same protocol, with no changes to `core` beyond bug fixes. Role selection in both apps.
-7. **M3c – Sharp text, Mac → PC (use case A):** (as built, ADR 0012: the viewer picks the view with Ctrl+Alt+Shift+R — the Mac's own screen scaled as before, or a virtual display at the PC's size: "like now" HiDPI (the default: fills the PC screen, no black bars), more space 1×, larger 2× — remembered per Mac; 4:4:4 when the viewer can decode it, NVDEC on NVIDIA PCs since D3D11VA has no 4:4:4 there, else 4:2:0.) Originally: 2560×1440 virtual display on the Mac (`CGVirtualDisplay`, fallback to the physical display), shown 1:1 on the PC; native-resolution negotiation (viewer sends its size in `Hello`); resolution and shape choices with render-don't-shrink on the Mac and GPU scaling elsewhere (§5e), with mid-stream size changes; 4:4:4 or still-region refinement; a clarity test card and PSNR measurement against the §0 still-content target (≤ 150 ms to visually lossless). Pulled forward from M7.
-8. **M3d – Apps on both ends:** a real Windows app replacing host.cmd/connect.cmd: one Glass.exe with a tray icon and a main window (Connect to a Mac / Share this PC), a list of Glass hosts found on the network plus a typed address, PIN dialogs for both pairing directions, paired devices with Forget, status and Show Results with Copy, settings (view mode, key mapping, ask before connecting, start with Windows). While viewing, a small floating handle near the top (faint, draggable sideways, position kept) opens a bar (on both viewers; the top-edge trigger was dropped because it clashed with the remote Mac’s menu bar and macOS’s own full-screen menu bar) with one-click switches for the view (Fit / More space / Larger / host's screen) and colour (4:2:0 fast / 4:4:4 full colour), plus full screen and disconnect; the keyboard shortcuts stay. **Any pair works the same way** (PC→Mac, Mac→PC, PC→PC, Mac→Mac): the host says what it is (Mac or PC) and what it can do (view modes, 4:4:4) when connecting, so the viewer picks the keyboard mapping itself (Ctrl stays Ctrl between two PCs; ⌘ stays ⌘ between two Macs; Ctrl↔⌘ across) and the bar greys out what the host can't do; the Mac viewer also sends its screen size so a Mac host can fit it. PC→PC is tested on two real PCs before M3d is done; Mac→Mac (only one Mac available) is tested automatically in CI (the packaged app hosting a test pattern to its own viewer, keys checked without injecting) and, optionally, against a macOS virtual machine on the Mac. **No connection loops:** a machine can't view itself, and a viewer can't connect to a host that is already viewing it, directly (A↔B) or through other machines (A→B→C→A). Each viewer's `Hello` lists the machines that currently see it (transitively); a host that finds itself on that list refuses with a clear "that would make a loop" message (protocol v7). The command line stays for CI and tests. Mac: a menu-bar icon so sharing runs without a window, the same settings. An app icon for both: one design drawn as SVG, exported to .icns (Mac, with the sizes macOS wants) and .ico (Windows exe, window and tray, with a small-size variant that stays readable at 16 px). Front end for the later Windows SYSTEM service.
-9. **M3e – Wake-on-LAN (ADR 0014):** wake a sleeping paired machine from the device list. When a viewer connects, the host sends the hardware (MAC) addresses of its network adapters (protocol v8); the viewer stores them with the paired device and its last address. Paired devices that aren't on the network show in the list as “sleeping” with a **Wake** button, which sends the standard magic packet (UDP broadcast to port 9, to the subnet broadcast and to the last address) and then waits for the device to reappear, showing progress, and connects when it does. The host side helps the user enable it: Windows detects whether the adapter allows wake from magic packet and says where to turn it on (Device Manager > adapter > Power Management, and the BIOS/UEFI setting), without changing settings itself; the Mac relies on “Wake for network access” (System Settings > Energy/Battery), which Glass checks and links to. Honest limit, shown in the app: wake works reliably over **Ethernet**; most PCs can't wake from sleep over **Wi-Fi**, and a Mac on Wi-Fi wakes only through a Bonjour Sleep Proxy (an Apple TV or HomePod on the network). Waking from fully off (S5) depends on the BIOS. Both directions, any pair.
-10. **M3f – Windows service: unattended access (moved up from M8, ADR 0015):** a small Windows service (`glass-cli service run`, LocalSystem) keeps the viewer's connection (the broker, ADR 0017) and runs two helpers in the PC's console session: a screen helper (`glass-cli agent`, SYSTEM) and a clipboard helper (`glass-cli clip-agent`, the signed-in user). Signing in, Remote Desktop and UAC switch the session; only the helpers restart, so the viewer stays connected. The screen helper shares with DXGI Desktop Duplication, following the input desktop, so the lock screen, sign-in and UAC prompts can be seen and controlled from far away; this PC's identity moves to a protected machine folder so pairings carry over. Installed, updated and removed from the Glass window (Settings > Unattended access) or `glass-cli service install | uninstall`, as administrator: Program Files, a firewall rule on private networks, restart on failure. The window shows the service's status and pairing code and detects Remote Desktop sessions (“Move it to the PC's screen”). LATER: Ctrl+Alt+Del where required (SendSAS), updates through the service without an admin prompt, a Mac LaunchDaemon.
-11. **M4 – Robustness (Wi-Fi, §6b):** NACK retransmission plus adaptive interleaved FEC, reference-frame invalidation / intra refresh instead of IDRs, paced sending on its own thread, QoS marking (qWAVE on Windows, service types on macOS), MTU probe, interface selection, radio keep-awake, receiver reports, Wi-Fi link stats and spike classification, loss simulator with a Gilbert–Elliott burst model fitted to real traces. Both directions. The packet format carries more than one stream (video now, audio next), so audio gets the same loss recovery (ADR 0018).
-11b. **M4b – Audio (pulled forward from M5b, ADR 0018):** the host's sound to the viewer, both directions of use (PC→Mac, Mac→PC): system audio capture (WASAPI loopback; ScreenCaptureKit audio on the Mac), low-latency Opus (10 ms frames), its own small jitter buffer, protected by M4's FEC/NACK, played on the viewer with A/V sync to the picture. Measured: audio latency and glitches under the §6b Wi-Fi loss models. An on/off and volume control in the bar. LATER: microphone (viewer → host).
-12. **M5 – Smoothness:** tuned with audio playing (rate budget, A/V sync); **frames at the viewer's refresh** (the host captures and encodes at the refresh the viewer reports in `Hello`, never faster than it can show; the viewer presents in step with its screen, no uneven 2-or-3-refresh holds); a **Frame rate** choice in the viewer's bar (and its default in Settings): **Auto** (the default: the viewer's refresh, stepping down by itself if the network can't keep up) or a cap of 120 / 60 / 30, offering only what the viewer's screen can show and switching live like Colour, for weak Wi-Fi, a laptop's battery or a busy host GPU; **a virtual display on a Windows host** (moved here from M7, ADR 0019): a vendor-signed open-source IddCx driver adds a screen at exactly the viewer's size and refresh (e.g. 2560x1440 at 165 Hz), streamed 1:1, so text is sharp with no scaling, and motion matches the viewer's refresh; the Mac host's virtual display at the viewer's refresh too, up to what the Mac allows (no fixed 60 Hz); adaptive jitter buffer, display-linked presentation on both viewers, capture rate matched to the viewer's refresh, delay-based congestion control and adaptive bitrate with the Auto resolution ladder (§5e, §6b), clock drift tracking, frame-interval metrics against the §5c pacing target on Wi-Fi. StarDesk baseline measured before it (§5d). Compare against StarDesk and Moonlight.
-13. **M5c – Clipboard and files (both directions):** clipboard sync of text, rich text (RTF/HTML) and images, with a size cap. A **file copied** on one machine is sent in the background and lands on the other machine's clipboard as a real local file, so a normal paste works in Finder, Explorer, mail or chat; files above a limit (default 200 MB, adjustable) wait for the paste and show progress. **Drag and drop** onto the viewer window sends files to the host's Downloads, and the host can send files back. Everything goes over the paired TLS connection on its own channel, paced by M5's rate control so a transfer never stalls the picture on Wi-Fi. An on/off switch on both machines; files carry their name, size and a hash, and partial transfers are discarded. LATER: native "promised file" copy and paste (Windows virtual-file clipboard, macOS file promises) so huge files copy only when pasted. *Built (protocol v8, ADR 0016): text at once; pictures and files only when pasted (Windows virtual files, Mac lazy pasteboard items), no size limit. Still to do: stream huge files while pasting, drag and drop, pacing from M5.*
-14. **M5b – Gaming: feel (use case B):** (audio moved to M4b, ADR 0018) relative mouse mode, game-mode overlay, even cadence (vsync-locked sampling, cadence-error metric, frame-cap hint; §5c). Measured with a real Steam game (§5c), played with mouse and keyboard. Game controllers are split out to M11. The opt-in low-latency Wi-Fi toggle (§5d) goes here if M5 still shows AWDL spikes.
-15. **M7 – Clarity (rest):** (the Windows virtual display moved to M5, ADR 0019) scene-change burst, still-region refinement on the Windows host.
-16. **M8 – Extras:** direct NVENC SDK path, audio for the Mac-host direction.
-17. **M9 – iPad viewer (future):** view and control a Mac or PC host from an iPad. Reuses `core` (Rust, built for iOS) and the Mac viewer's Swift pieces (VideoToolbox decode, Metal, the control bar); touch mapped to pointer gestures (tap = click, two-finger scroll, long press = right click, drag), on-screen and hardware keyboards, Magic Keyboard/trackpad and Pencil as pointer. Pairing and encryption as everywhere. Viewer only: iPadOS can't be remote-controlled.
-18. **M10 – Android viewer (future, maybe):** the same for Android phones and tablets: `core` via JNI, MediaCodec decode, touch and keyboard input. Viewer only.
-19. **M11 – Game controllers (future; split out of M5b, ADR 0013):** controllers on the viewer (GameController framework on the Mac, Xbox/PlayStation/MFi; XInput/GameInput on a Windows viewer) sent as button and axis state over the input channel (≥ 250 Hz); a Windows host presents a virtual Xbox 360 pad through ViGEmBus (optional one-time admin install, detected and explained; Glass works without it), a Mac host a virtual HID gamepad if macOS allows it. Rumble goes back to the viewer's controller. Both directions, any pair.
+### Done
 
-Each milestone ends with a short written result in `docs/results/Mx.md` (what works, measured numbers, known issues).
+| Milestone | What it is | Status | Results |
+|---|---|---|---|
+| **M0** Skeleton | Repo layout; `core` builds for Windows, macOS and Linux; the Swift app links `core` through the C ABI; CI for all three. | Done | M0.md |
+| **M1** Offline pipeline | The PC captures and encodes HEVC to a file; the Mac decodes and draws it with Metal. | Done | M1.md |
+| **M2** Live stream | UDP packetiser; live PC video on the Mac; stats overlay with in-band latency. | Done | M2.md |
+| **M3** Input | Mouse and keyboard back-channel, local pointer: a usable PC → Mac remote desktop. | Done | M3.md |
+| **M6** Security (moved up) | PIN pairing (SPAKE2), pinned certificates, mutual TLS 1.3; UDP sealed with AES-128-GCM and a replay window; per-direction permissions; mDNS discovery. ADR 0010. | Done | M6.md |
+| **M3b** Reverse direction | The Mac as host (ScreenCaptureKit, VideoToolbox, CGEvent, permission checks), the PC as viewer (D3D11VA, flip-model swap chain, keyboard hook). ADR 0011. | Done | M3b.md |
+| **M3c** Sharp text, Mac → PC | View modes on a Mac virtual display at the PC's size (like now / more space / larger), 4:4:4 where the viewer can decode it, the clarity test card and PSNR. ADR 0012. | Done | M3c.md |
+| **M3d** Apps on both ends | Glass.exe (window, tray, machine list, PIN dialogs, paired devices, Settings) and the Mac app (menu bar, Settings); the control bar on both viewers; any pair works (PC↔Mac, PC→PC, Mac→Mac) with OS-aware keys; no connection loops; the app icon. | Built (m3d-test1 to 19); results written up to test 6 | M3d.md |
+| **M3f** Windows service: unattended access | A LocalSystem service keeps the viewer's connection while helpers in the console session do the work (screen as SYSTEM, clipboard as the user), so sign-in, UAC and Remote Desktop don't drop the viewer. Installed from Settings. ADRs 0015, 0017. | Closed, with open items | M3f.md |
+| **M5c** Clipboard and files | Text at once; pictures and files only when pasted, with no size limit (Windows virtual files streamed into Explorer; lazy items on the Mac, with a progress panel); file speed steered by the picture (30.9 MB/s in m4-test6, against about 8 MB/s for Remote Desktop). Built ahead of M4. ADR 0016. | Closed, with open items | M5c.md |
+| **M4** Robustness on Wi-Fi | All five steps built (ADR 0020): adaptive interleaved FEC (0 frames lost at 5 % random loss); NACK and a reorder window (ADR 0021); no periodic keyframes, the hitch after a loss measured (ADR 0022); Wi-Fi priority marking, the right adapter, radios kept awake (ADR 0023); Wi-Fi spikes named and the link reported (ADR 0024); `losssim` with random and burst loss. | Built (m4-test1 to 12); closes with real numbers | M4.md |
+
+### In progress
+
+**M4b – Audio** (ADRs 0018, 0025). The host's sound on the viewer, in step
+with the picture, never broken or choppy, and not on the host's own
+speakers while it's viewed.
+- **Step 1, done:** core, used by both platforms.
+  - libopus: 48 kHz stereo, 10 ms frames, low-delay mode, 192 kbps.
+  - Each datagram repeats the 3 frames before it; NACK covers longer gaps.
+  - A lock-free playout buffer holds all waiting sound at 20 ms (50 ms at
+    most). Clock drift is followed by resampling; a backlog is caught up by
+    playing up to 2 % faster. Opus conceals a missing frame rather than
+    leave a gap.
+- **Step 2, done** (m4b-test1, m4b-test2):
+  - PC → Mac: WASAPI loopback on the PC (Glass.exe sharing), AVAudioEngine
+    on the Mac.
+  - The PC's speakers are muted while it's viewed, and restored after.
+  - The results say how far the sound is behind or ahead of the picture.
+  - m4b-test1 ran half a second behind; m4b-test2 is the fix.
+- **Step 3:** Mac → PC.
+  - ScreenCaptureKit audio on the Mac host, with the Mac's output muted
+    while viewed.
+  - WASAPI low-latency playback on the Windows viewer.
+- **Step 4:**
+  - Sound through the Windows service (captured in the user's helper,
+    beside the clipboard).
+  - Sound on/off and volume in the bar, and a Sound setting.
+  - A/V sync measured on real Wi-Fi and corrected (target ±20 ms).
+- LATER: the microphone (viewer → host).
+
+### Still to do, in order
+
+1. **M4 close-out.** Real numbers from m4-test12 or later, PC ↔ PC and
+   PC ↔ Mac on Wi-Fi:
+   - frames lost and saved by NACK;
+   - hitches after a loss;
+   - Wi-Fi priority marking accepted;
+   - spikes and their causes;
+   - the Wi-Fi link at both ends.
+
+   Then `docs/results/M4.md` is closed.
+2. **M4b – Audio**, steps 3 and 4 (above).
+3. **M5 – Smoothness**, tuned with sound playing:
+   - **Frames at the viewer's refresh.** The host captures and encodes at
+     the refresh the viewer reports in `Hello`, never faster than it can
+     show. The viewer presents in step with its screen.
+   - **A Frame rate choice in the bar** (and its default in Settings):
+     Auto, or a cap of 120 / 60 / 30, offering only what the viewer's
+     screen can show.
+   - **A virtual display on a Windows host** (vendor-signed IddCx driver,
+     ADR 0019) at exactly the viewer's size and refresh, streamed 1:1.
+     The Mac host's virtual display at the viewer's refresh too.
+   - **The jitter buffer and presentation:** an adaptive jitter buffer,
+     display-linked presentation, and clock drift tracking.
+   - **Rate control:** delay-based congestion control and adaptive bitrate
+     with the Auto resolution ladder (§5e, §6b). Its budget covers FEC,
+     NACK resends, sound and file transfers.
+   - **Pacing:** packets paced on their own thread (deferred from M4 step 2).
+   - **Sound on its own socket**, marked as voice, if the A/V numbers ask
+     for it (ADR 0025).
+   - **Frame-interval metrics** against the §5c pacing target.
+   - **Baselines:** StarDesk measured before it (§5d), and comparisons
+     against StarDesk and Moonlight after.
+4. **M3e – Wake-on-LAN** (ADR 0014; not started).
+   - Wake a sleeping paired machine from the device list. The host sends
+     its adapters' MAC addresses when a viewer connects (a protocol bump).
+   - A Wake button for paired devices that aren't on the network: the
+     magic packet, then waiting for the device to reappear.
+   - Guidance for enabling it, without changing settings.
+   - The honest limit: reliable over Ethernet; most PCs can't wake over
+     Wi-Fi, and a Mac only through a Bonjour Sleep Proxy.
+5. **M5b – Gaming: feel** (use case B):
+   - relative mouse mode;
+   - a game-mode overlay;
+   - even cadence (vsync-locked sampling, cadence-error metric, a frame-cap
+     hint; §5c);
+   - measured with a real Steam game, played with mouse and keyboard;
+   - the opt-in low-latency Wi-Fi toggle (§5d), if M5 still shows AWDL
+     spikes.
+6. **M7 – Clarity (rest):** a scene-change burst and still-region refinement
+   on the Windows host.
+7. **M8 – Extras:**
+   - **A direct NVENC SDK path.** It would also allow reference-frame
+     invalidation instead of a keyframe after a loss, if M4's hitch numbers
+     ask for it (ADR 0022).
+   - **The MTU probe** (DF bit, falling back to 1200-byte datagrams) with a
+     warning when a VPN routes local traffic (ADR 0023).
+8. **M9 – iPad viewer** (future): `core` built for iOS and the Mac viewer's
+   Swift pieces; touch mapped to pointer gestures; keyboards and the Pencil.
+   Viewer only.
+9. **M10 – Android viewer** (future, maybe): `core` via JNI, MediaCodec,
+   touch and keyboard. Viewer only.
+10. **M11 – Game controllers** (future; ADR 0013):
+    - controllers on the viewer, sent as button and axis state at
+      ≥ 250 Hz;
+    - a Windows host presents a virtual Xbox 360 pad through ViGEmBus (an
+      optional one-time install), a Mac host a virtual HID gamepad if macOS
+      allows;
+    - rumble goes back to the viewer's controller.
+
+### Open items carried forward
+From closed milestones; picked up when they fit, or when a test shows them.
+- **Service (M3f):**
+  - UAC prompts, Remote Desktop take-over and give-back, and End session
+    through the service, not yet reported on.
+  - Ctrl+Alt+Del (SendSAS) for PCs that require it.
+  - Service updates without an admin prompt.
+  - A Mac LaunchDaemon for unattended access to a Mac.
+- **Windows app (M3d/M3f):**
+  - the Win and Alt+Tab keys through the hook in Glass.exe;
+  - a "busy" refusal for a third device during a session;
+  - closing `M3d.md` (tests 7 to 19).
+- **Clipboard (M5c):**
+  - drag and drop onto the viewer;
+  - rich text (RTF/HTML);
+  - progress while pasting files on the Mac. The Mac shows a panel, but
+    Finder waits until the files are all there (file promises don't work
+    for paste); dragging could fix it.
+  - Naming the file a copy couldn't read, in the session log.
+- **Recordings and tests:** Mac → Mac in CI. PC → PC is tested on QUIETPC
+  and QUIETPC22.
+
+Each milestone ends with a short written result in `docs/results/Mx.md`
+(what works, measured numbers, known issues).
 
 ## 10. Risks and open questions
 

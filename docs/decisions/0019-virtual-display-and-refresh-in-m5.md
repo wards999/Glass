@@ -25,6 +25,11 @@ Move these into **M5 (smoothness)**:
   at exactly the viewer's size and refresh, e.g. 2560x1440 at 165 Hz.
   Glass streams it 1:1: sharp text, no scaling, motion at the viewer's
   rate.
+- A **Frame rate** choice in the viewer's bar, with its default in
+  Settings: **Auto** (the default: the viewer's refresh, stepping down by
+  itself when the network can't keep up) or a cap of 120, 60 or 30. Only
+  rates the viewer's screen can show are offered. It switches live, like
+  Colour. Use it for weak Wi-Fi, a laptop's battery, or a busy host GPU.
 - **The Mac host's virtual display at the viewer's refresh,** up to what
   the Mac allows, instead of a fixed 60 Hz.
 

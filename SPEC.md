@@ -499,9 +499,9 @@ cheap**, so Glass uses both FEC and NACK, as WebRTC does:
 - Host-side setting: "require confirmation for each connection" vs unattended access.
 - Clipboard and audio are off until enabled per paired device.
 
-## 7b. Distribution without an Apple Developer ID
+## 7b. Distribution without trusted code signing
 
-Glass will not be signed with an Apple Developer ID or notarized. Design around it:
+Glass can't be signed with a trusted certificate on **either** platform: no Apple Developer ID (so no notarization), and no Windows Authenticode/EV certificate. Check every feature against this before choosing an approach (ADR 0008). Design around it:
 
 - **Stable self-signed code signature.** CI signs `Glass.app` with one
   self-signed code-signing certificate (made once; the private key is kept as
@@ -520,9 +520,16 @@ Glass will not be signed with an Apple Developer ID or notarized. Design around 
   anything needing root (only the optional §5d Wi-Fi toggle) is a one-time
   admin install step.
 - **Private APIs are allowed** (no App Store): `CGVirtualDisplay` for §4b.
-- **Windows:** the exe is unsigned too; SmartScreen needs "More info → Run
-  anyway" per build, and Windows Firewall asks per folder. `host.cmd` and the
-  README explain both. The ViGEmBus driver (M11) is signed by its vendor.
+- **Windows:** the exes are unsigned. SmartScreen needs "More info → Run
+  anyway" for each build, Windows Firewall asks per folder, and UAC shows
+  "Unknown publisher" for the service install. `host.cmd` and the README
+  explain these.
+- **No drivers of our own** (Windows only loads signed ones): reuse
+  vendor-signed drivers, e.g. an IddCx virtual display for M7 or ViGEmBus
+  for M11. On the Mac, nothing that needs a Developer ID: no DriverKit, and
+  no system or network extensions.
+- **Antivirus** may flag unsigned input injection or screen capture. The user
+  allows Glass once; Glass never tries to evade detection.
 
 ## 8. Latency budget (targets)
 

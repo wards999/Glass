@@ -229,6 +229,8 @@ struct Shared {
     /// Key presses this viewer sent (for the report).
     keys_sent: AtomicU32,
     clipboard: bool,
+    /// This PC's Wi-Fi link during the session (M4 step 5).
+    wifi: super::wlan::WifiWatch,
 }
 
 impl Shared {
@@ -441,6 +443,7 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
     let started = clock::now_us();
     let client_os = client.host_os();
     let sh = Arc::new(Shared {
+        wifi: super::wlan::WifiWatch::start(),
         client,
         can_444: AtomicBool::new(hello.caps & CAP_HEVC_444 != 0),
         want_444: AtomicBool::new(opts.full_colour),
@@ -611,6 +614,12 @@ fn session_report(sh: &Shared, r: &Report, head: &ReportHead, reason: &str) -> S
         super::qos_word(st.qos),
         st.keepalives
     );
+    let _ = writeln!(
+        out,
+        "  {}",
+        glass_core::spikes::describe(&sh.client.spikes())
+    );
+    let _ = writeln!(out, "  {}", sh.wifi.line());
     let _ = writeln!(
         out,
         "  bitrate {:.1} Mbps avg | clock sync {} (best RTT {:.2} ms, last {:.2} ms)",

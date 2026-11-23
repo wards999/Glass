@@ -159,6 +159,8 @@ private final class HostSessionRun {
     var virtualNote = ""
     var history: [String] = []
     var clipSummary = "off"
+    /// This Mac's Wi-Fi link during the session (M4 step 5).
+    let wifi = WifiWatch()
     let failLock = NSLock()
     var failure: String?
     var cursorWatch: CursorWatch // main thread
@@ -374,6 +376,7 @@ private final class HostSessionRun {
                           Double(counters.loss_ppm) / 1e4,
                           counters.nacks, counters.packets_resent))
         out.append("  network (M4): video marked for Wi-Fi priority: \(counters.qos == 1 ? "yes" : counters.qos == 2 ? "no" : "not yet") | keep-awakes sent \(counters.keepalives)")
+        out.append("  " + wifi.line())
         out.append(t.encode.line("encode"))
         out.append(t.delivery.line("  capture delivery"))
         out.append(t.vtEncode.line("  VideoToolbox"))

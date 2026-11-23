@@ -1413,6 +1413,8 @@ struct ClientShared {
     frame_hi: AtomicU32,
     frame_sum: AtomicU64,
     frame_n: AtomicU32,
+    /// Wi-Fi spikes so far (M4 step 5), published about once a second.
+    spikes: Mutex<crate::spikes::SpikeSummary>,
     clock_rtt: AtomicU32,
     last_rtt: AtomicU32,
     host_notice: std::sync::atomic::AtomicU8,
@@ -1670,6 +1672,7 @@ impl Client {
             frame_hi: AtomicU32::new(0),
             frame_sum: AtomicU64::new(0),
             frame_n: AtomicU32::new(0),
+            spikes: Mutex::new(Default::default()),
             clock_rtt: AtomicU32::new(0),
             last_rtt: AtomicU32::new(0),
             host_notice: std::sync::atomic::AtomicU8::new(0),
@@ -1888,6 +1891,11 @@ impl Client {
         }
     }
 
+    /// Wi-Fi delay spikes so far, and their likely cause (M4 step 5).
+    pub fn spikes(&self) -> crate::spikes::SpikeSummary {
+        *lock(&self.shared.spikes)
+    }
+
     /// Maps a host timestamp to the local clock, once clock sync has a sample.
     pub fn host_to_local(&self, host_us: u64) -> Option<u64> {
         let sh = &self.shared;
@@ -1910,6 +1918,8 @@ fn spawn_receiver(
         let mut buf = [0u8; WIRE_MAX + 64];
         let mut last_punch = clock::now_us();
         let mut short_wait = false;
+        let mut spikes = crate::spikes::SpikeDetector::default();
+        let mut spikes_published = 0u64;
         let host_ip = std::net::IpAddr::V4(*host_udp.ip());
         while !sh.stop.load(Ordering::Relaxed) && sh.connected.load(Ordering::Relaxed) {
             let now = clock::now_us();
@@ -1972,6 +1982,16 @@ fn spawn_receiver(
                     sh.frame_hi.fetch_max(d, Ordering::Relaxed);
                     sh.frame_sum.fetch_add(d as u64, Ordering::Relaxed);
                     sh.frame_n.fetch_add(1, Ordering::Relaxed);
+                    // Spikes: the first packet's time, which a big frame
+                    // doesn't stretch.
+                    let d1 = f.first_packet_us.saturating_sub(sent).min(u32::MAX as u64) as u32;
+                    spikes.feed(f.first_packet_us, d1);
+                    if f.first_packet_us.saturating_sub(spikes_published) >= 1_000_000 {
+                        if let Ok(mut s) = sh.spikes.try_lock() {
+                            *s = spikes.summary();
+                            spikes_published = f.first_packet_us;
+                        }
+                    }
                 }
                 if !sh.queue.push(meta, f.data) {
                     sh.queue_full.fetch_add(1, Ordering::Relaxed);

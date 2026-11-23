@@ -10,6 +10,16 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M4 test 12 (Wi-Fi spikes named, the link reported)
+1. View QUIETPC from QUIETPC22, then the Mac, for a few minutes each, on
+   Wi-Fi, with something moving all the time (a video), so spikes show.
+2. The viewer's results have two new lines: "Wi-Fi spikes (M4): N over
+   8 ms above the typical X ms … | <likely cause>", and "Wi-Fi here:
+   signal … | rate … | channel … | roams …". The host's results have its
+   own "Wi-Fi here" line.
+3. Send both. A Mac on the Wi-Fi often shows spikes "about every 1 s"
+   (AWDL). A PC may show "about every 60 s" (a scan).
+
 ## M4 test 11 (Wi-Fi priority, the right adapter, radios kept awake)
 Protocol v12: update all three machines, and the service on QUIETPC.
 1. View QUIETPC from QUIETPC22, and the Mac, for a few minutes, including a

@@ -20,6 +20,7 @@ pub mod qos;
 pub mod recording;
 pub mod replay;
 pub mod seal;
+pub mod spikes;
 pub mod stats;
 mod tls;
 

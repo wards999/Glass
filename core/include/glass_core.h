@@ -460,6 +460,43 @@
 #define GLASS_WIRE_MAX 1400
 
 /**
+ * How far over the typical network time a frame must be to count (µs).
+ */
+#define GLASS_SPIKE_OVER_US 8000
+
+/**
+ * Spikes closer than this are one event (µs).
+ */
+#define GLASS_SPIKE_MERGE_US 150000
+
+#define GLASS_CAUSE_NONE 0
+
+/**
+ * Spikes with no regular pattern: interference, distance, other traffic.
+ */
+#define GLASS_CAUSE_IRREGULAR 1
+
+/**
+ * About every second: AWDL on a Mac.
+ */
+#define GLASS_CAUSE_AWDL 2
+
+/**
+ * About every minute: a background Wi-Fi scan.
+ */
+#define GLASS_CAUSE_SCAN 3
+
+/**
+ * A tenth to half a second: Wi-Fi power save.
+ */
+#define GLASS_CAUSE_POWER_SAVE 4
+
+/**
+ * Regular, but at none of the known periods.
+ */
+#define GLASS_CAUSE_PERIODIC 5
+
+/**
  * Capacity of a [`StatRing`]: about 34 s at 120 fps.
  */
 #define GLASS_RING_CAP 4096
@@ -554,6 +591,12 @@ typedef struct GLASS_HostHandle GLASS_HostHandle;
  * keys/buttons the viewer was holding).
  */
 typedef struct GLASS_HostSession GLASS_HostSession;
+
+/**
+ * A session's Wi-Fi link: the latest and worst signal and rate, roams
+ * (the access point changed) and channel changes. No allocation.
+ */
+typedef struct GLASS_LinkTrack GLASS_LinkTrack;
 
 /**
  * A pairing in progress: the host is showing a PIN.
@@ -936,6 +979,54 @@ typedef struct {
   uint32_t qos;
   uint64_t keepalives;
 } GLASS_HostCounters;
+
+/**
+ * One look at this machine's Wi-Fi link (fed about once a second by the
+ * app: the WLAN API on Windows, CoreWLAN on the Mac). Unknown fields are 0.
+ */
+typedef struct {
+  /**
+   * Connected over Wi-Fi at all (false: wired, or Wi-Fi off).
+   */
+  bool wifi;
+  /**
+   * Signal strength (dBm, negative), and Windows' 0–100 quality.
+   */
+  int32_t rssi_dbm;
+  uint32_t quality_pct;
+  /**
+   * The link's transmit rate (Mbps).
+   */
+  uint32_t rate_mbps;
+  uint32_t channel;
+  /**
+   * The access point (all zero if the OS won't say).
+   */
+  uint8_t bssid[6];
+} GLASS_LinkSample;
+
+/**
+ * What the spikes look like, for the results (`repr(C)` for the Mac).
+ */
+typedef struct {
+  /**
+   * Spike events, and the worst one over the typical time (µs).
+   */
+  uint32_t count;
+  uint32_t max_over_us;
+  /**
+   * The typical (first-packet) network time (µs).
+   */
+  uint32_t typical_us;
+  /**
+   * The period if periodic (ms), else 0.
+   */
+  uint32_t period_ms;
+  /**
+   * `CAUSE_*`.
+   */
+  uint8_t cause;
+} GLASS_SpikeSummary;
 
 /**
  * Transfer progress and counts, for the apps (bytes; `*_total` 0 = none).
@@ -1607,6 +1698,49 @@ GLASS_ClipHandle *glass_client_fetch(const GLASS_Client *c, uint32_t id, uint8_t
  * `c` from `glass_client_connect`; `dir` a C string or null.
  */
 void glass_client_set_file_dir(const GLASS_Client *c, const char *dir);
+
+/**
+ * A session's Wi-Fi link tracker (M4 step 5): feed it a sample about
+ * once a second, read its results line at the end.
+ */
+GLASS_LinkTrack *glass_link_track_new(void);
+
+/**
+ * # Safety
+ * `t` from `glass_link_track_new`; `s` valid.
+ */
+void glass_link_track_feed(GLASS_LinkTrack *t, const GLASS_LinkSample *s);
+
+/**
+ * The results line, NUL-terminated into `buf`; returns its full length.
+ *
+ * # Safety
+ * `t` from `glass_link_track_new`; `buf` valid for `len` bytes (or null).
+ */
+size_t glass_link_track_text(const GLASS_LinkTrack *t, char *buf, size_t len);
+
+/**
+ * # Safety
+ * `t` from `glass_link_track_new`, not used after.
+ */
+void glass_link_track_free(GLASS_LinkTrack *t);
+
+/**
+ * Wi-Fi delay spikes so far (M4 step 5).
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+GLASS_SpikeSummary glass_client_spikes(const GLASS_Client *c);
+
+/**
+ * The results line for `s` (as on Windows), NUL-terminated into `buf`;
+ * returns its full length.
+ *
+ * # Safety
+ * `s` valid; `buf` valid for `len` bytes (or null).
+ */
+size_t glass_spike_text(const GLASS_SpikeSummary *s, char *buf, size_t len);
 
 /**
  * # Safety

@@ -25,7 +25,7 @@ let package = Package(
         .target(
             name: "GlassKit",
             dependencies: ["CGlassCore", "CVirtualDisplay"],
-            linkerSettings: [.unsafeFlags(["-L", coreLibDir])]
+            linkerSettings: [.unsafeFlags(["-L", coreLibDir]), .linkedFramework("CoreWLAN")]
         ),
         .executableTarget(name: "GlassMac", dependencies: ["GlassKit", "CGlassCore"]),
         .testTarget(

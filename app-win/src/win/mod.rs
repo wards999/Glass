@@ -29,6 +29,7 @@ mod slog;
 mod stats_box;
 mod vfiles;
 pub mod viewer;
+pub mod wlan;
 
 use glass_core::clock;
 use glass_core::identity::fingerprint_short;
@@ -343,11 +344,14 @@ struct HostRun {
     not_sent: u32,
     skipped: u32,
     error: Option<String>,
+    /// This PC's Wi-Fi link during the session (M4 step 5).
+    wifi: wlan::WifiWatch,
 }
 
 impl HostRun {
     fn new() -> Self {
         Self {
+            wifi: wlan::WifiWatch::start(),
             frame_id: 0,
             encode: StatRing::new(),
             send: StatRing::new(),
@@ -1158,6 +1162,7 @@ fn host_report<V: ViewerLink>(
             qos_word(c.qos),
             c.keepalives
         );
+        let _ = writeln!(r, "  {}", run.wifi.line());
     } else {
         let _ = writeln!(
             r,

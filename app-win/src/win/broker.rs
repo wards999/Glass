@@ -316,6 +316,8 @@ pub fn run(
         let t0 = clock::now_us();
         let (mut frame_id, mut idrs, mut not_sent, mut switches) = (0u32, 0u32, 0u32, 0u32);
         let mut send_ring = StatRing::new();
+        // This PC's Wi-Fi link during the session (M4 step 5).
+        let wifi = wlan::WifiWatch::start();
         // Encoded in the helper -> handed to the network here (the pipe hop).
         let mut hop = StatRing::new();
         let mut seq = 0u32;
@@ -461,6 +463,7 @@ pub fn run(
             qos_word(c.qos),
             c.keepalives
         );
+        let _ = writeln!(r, "  {}", wifi.line());
         let _ = writeln!(r, "{}", fmt_line("helper -> service", &hop.summary()));
         let _ = writeln!(
             r,

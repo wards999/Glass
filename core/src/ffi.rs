@@ -1340,6 +1340,68 @@ pub unsafe extern "C" fn glass_client_set_file_dir(c: *const Client, dir: *const
     (*c).set_file_dir(dir_arg(dir));
 }
 
+/// A session's Wi-Fi link tracker (M4 step 5): feed it a sample about
+/// once a second, read its results line at the end.
+#[no_mangle]
+pub extern "C" fn glass_link_track_new() -> *mut crate::spikes::LinkTrack {
+    Box::into_raw(Box::default())
+}
+
+/// # Safety
+/// `t` from `glass_link_track_new`; `s` valid.
+#[no_mangle]
+pub unsafe extern "C" fn glass_link_track_feed(
+    t: *mut crate::spikes::LinkTrack,
+    s: *const crate::spikes::LinkSample,
+) {
+    (*t).feed(&*s);
+}
+
+/// The results line, NUL-terminated into `buf`; returns its full length.
+///
+/// # Safety
+/// `t` from `glass_link_track_new`; `buf` valid for `len` bytes (or null).
+#[no_mangle]
+pub unsafe extern "C" fn glass_link_track_text(
+    t: *const crate::spikes::LinkTrack,
+    buf: *mut c_char,
+    len: usize,
+) -> usize {
+    copy_str(&(*t).describe(), buf, len)
+}
+
+/// # Safety
+/// `t` from `glass_link_track_new`, not used after.
+#[no_mangle]
+pub unsafe extern "C" fn glass_link_track_free(t: *mut crate::spikes::LinkTrack) {
+    if !t.is_null() {
+        drop(Box::from_raw(t));
+    }
+}
+
+/// Wi-Fi delay spikes so far (M4 step 5).
+///
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_spikes(c: *const Client) -> crate::spikes::SpikeSummary {
+    (*c).spikes()
+}
+
+/// The results line for `s` (as on Windows), NUL-terminated into `buf`;
+/// returns its full length.
+///
+/// # Safety
+/// `s` valid; `buf` valid for `len` bytes (or null).
+#[no_mangle]
+pub unsafe extern "C" fn glass_spike_text(
+    s: *const crate::spikes::SpikeSummary,
+    buf: *mut c_char,
+    len: usize,
+) -> usize {
+    copy_str(&crate::spikes::describe(&*s), buf, len)
+}
+
 /// # Safety
 /// `c` from `glass_client_connect`.
 #[no_mangle]

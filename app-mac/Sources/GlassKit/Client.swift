@@ -173,6 +173,16 @@ public final class GlassClient {
 
     public var clipProgress: GLASS_ClipProgress { with(GLASS_ClipProgress()) { glass_client_clip_progress($0) } }
 
+    /// "Wi-Fi spikes (M4): …", as on the PC (M4 step 5).
+    public var spikesLine: String {
+        with("") { p in
+            var s = glass_client_spikes(p)
+            var buf = [CChar](repeating: 0, count: 512)
+            _ = glass_spike_text(&s, &buf, buf.count)
+            return String(cString: buf)
+        }
+    }
+
     private func with<R>(_ fallback: R, _ body: (OpaquePointer) -> R) -> R {
         lock.lock()
         defer { lock.unlock() }

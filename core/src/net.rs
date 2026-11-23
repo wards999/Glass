@@ -1641,6 +1641,13 @@ struct ClientShared {
     audio_stats: Mutex<crate::audio::AudioStats>,
     /// The least sound to hold (µs), so it isn't ahead of the picture.
     audio_floor: AtomicU64,
+    /// The weak-link test mode (Mbps, 0 = off), what it dropped, when the
+    /// session started, and each time it was switched (µs into the
+    /// session, Mbps).
+    test_link: AtomicU32,
+    test_dropped: AtomicU64,
+    started_us: u64,
+    test_log: Mutex<Vec<(u64, u32)>>,
     clock_rtt: AtomicU32,
     last_rtt: AtomicU32,
     host_notice: std::sync::atomic::AtomicU8,
@@ -1907,6 +1914,10 @@ impl Client {
             audio_ring: Mutex::new(None),
             audio_stats: Mutex::new(Default::default()),
             audio_floor: AtomicU64::new(0),
+            test_link: AtomicU32::new(0),
+            test_dropped: AtomicU64::new(0),
+            started_us: clock::now_us(),
+            test_log: Mutex::new(Vec::new()),
             clock_rtt: AtomicU32::new(0),
             last_rtt: AtomicU32::new(0),
             host_notice: std::sync::atomic::AtomicU8::new(0),
@@ -2134,6 +2145,46 @@ impl Client {
         lock(&self.shared.audio_ring).clone()
     }
 
+    /// The weak-link test mode: received packets go through a pretend
+    /// bottleneck of `mbps` (a queue, and drops past 150 ms of it), so
+    /// rate control can be tried without moving a machine. 0 switches it
+    /// off. Each switch is logged with its time.
+    pub fn set_test_link(&self, mbps: u32) {
+        let sh = &self.shared;
+        if sh.test_link.swap(mbps, Ordering::Relaxed) != mbps {
+            let at = clock::now_us().saturating_sub(sh.started_us);
+            lock(&sh.test_log).push((at, mbps));
+        }
+    }
+
+    pub fn test_link(&self) -> u32 {
+        self.shared.test_link.load(Ordering::Relaxed)
+    }
+
+    /// The results line for the test mode, if it was ever on.
+    pub fn test_link_line(&self) -> Option<String> {
+        let log = lock(&self.shared.test_log);
+        if log.is_empty() {
+            return None;
+        }
+        let when = |us: u64| {
+            let s = us as f64 / 1e6;
+            format!("{}:{:04.1}", (s / 60.0) as u64, s % 60.0)
+        };
+        let events: Vec<String> = log
+            .iter()
+            .map(|&(at, mbps)| match mbps {
+                0 => format!("off at {}", when(at)),
+                m => format!("on at {} ({m} Mbps)", when(at)),
+            })
+            .collect();
+        Some(format!(
+            "test mode (weak link): {} | {} packets dropped by it",
+            events.join(", "),
+            self.shared.test_dropped.load(Ordering::Relaxed)
+        ))
+    }
+
     /// Hold at least `us` of sound (20–80 ms), so it plays with a picture
     /// that's slower than it (M4b): the viewer measures both.
     pub fn set_audio_min_target(&self, us: u64) {
@@ -2161,6 +2212,32 @@ impl Client {
 
 /// Datagrams -> open -> reassembler -> queue. Re-punches every second until
 /// video flows, then every 5 s.
+/// The weak-link test mode's queue: past this much delay, dropped (µs).
+const TEST_LINK_QUEUE_US: u64 = 150_000;
+
+/// One datagram from the host, opened: to the sound or the picture.
+fn deliver(
+    r: &mut Reassembler,
+    audio: &mut Option<crate::audio::AudioReceiver>,
+    sh: &ClientShared,
+    plain: &[u8],
+    now: u64,
+) {
+    if crate::audio::is_audio(plain) {
+        if audio.is_none() {
+            *audio = crate::audio::AudioReceiver::new().ok();
+            if let Some(a) = audio.as_ref() {
+                *lock(&sh.audio_ring) = Some(a.ring());
+            }
+        }
+        if let Some(a) = audio.as_mut() {
+            a.push(plain, now);
+        }
+    } else {
+        r.push(plain, now);
+    }
+}
+
 fn spawn_receiver(
     sh: Arc<ClientShared>,
     udp: UdpSocket,
@@ -2174,6 +2251,7 @@ fn spawn_receiver(
         let mut short_wait = false;
         let mut spikes = crate::spikes::SpikeDetector::default();
         let mut audio: Option<crate::audio::AudioReceiver> = None;
+        let mut emu = crate::pacer::Bottleneck::new(WIRE_MAX);
         let mut spikes_published = 0u64;
         let host_ip = std::net::IpAddr::V4(*host_udp.ip());
         while !sh.stop.load(Ordering::Relaxed) && sh.connected.load(Ordering::Relaxed) {
@@ -2189,8 +2267,9 @@ fn spawn_receiver(
             }
             // Wake every 2 ms while a frame is incomplete: NACKs and giving
             // up are timed (M4).
-            // Sound plays from a buffer that must be kept topped up.
-            let short = r.pending() || audio.is_some();
+            // Sound plays from a buffer that must be kept topped up; the
+            // test bottleneck releases on time.
+            let short = r.pending() || audio.is_some() || !emu.is_empty();
             if short != short_wait {
                 let t = if short { 2 } else { 100 };
                 let _ = udp.set_read_timeout(Some(Duration::from_millis(t)));
@@ -2200,18 +2279,18 @@ fn spawn_receiver(
             match udp.recv_from(&mut buf) {
                 Ok((n, from)) if from.ip() == host_ip => match opener.open(&mut buf[..n]) {
                     Ok(plain) if crate::protocol::is_keepalive(plain) => {}
-                    Ok(plain) if crate::audio::is_audio(plain) => {
-                        if audio.is_none() {
-                            audio = crate::audio::AudioReceiver::new().ok();
-                            if let Some(a) = &audio {
-                                *lock(&sh.audio_ring) = Some(a.ring());
-                            }
-                        }
-                        if let Some(a) = audio.as_mut() {
-                            a.push(plain, clock::now_us());
+                    Ok(plain) => {
+                        // The weak-link test mode: through a pretend bottleneck
+                        // (and after it, until its queue is empty, to keep the
+                        // order).
+                        let now = clock::now_us();
+                        let mbps = sh.test_link.load(Ordering::Relaxed);
+                        if mbps == 0 && emu.is_empty() {
+                            deliver(&mut r, &mut audio, &sh, plain, now);
+                        } else if !emu.admit(plain, now, mbps, TEST_LINK_QUEUE_US) {
+                            sh.test_dropped.store(emu.dropped, Ordering::Relaxed);
                         }
                     }
-                    Ok(plain) => r.push(plain, clock::now_us()),
                     Err(_) => {
                         sh.crypto_bad.store(opener.stats.bad, Ordering::Relaxed);
                         sh.crypto_replayed
@@ -2224,6 +2303,11 @@ fn spawn_receiver(
                 Err(_) => {}
             }
             let now = clock::now_us();
+            // What the pretend bottleneck lets through by now.
+            while let Some(d) = emu.front_due(now) {
+                deliver(&mut r, &mut audio, &sh, d, now);
+                emu.pop();
+            }
             if let Some(a) = audio.as_mut() {
                 a.set_rtt(sh.last_rtt.load(Ordering::Relaxed));
                 a.set_min_target(sh.audio_floor.load(Ordering::Relaxed));

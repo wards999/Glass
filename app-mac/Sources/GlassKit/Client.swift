@@ -179,6 +179,23 @@ public final class GlassClient {
         with(nil) { glass_client_audio_ring($0) }
     }
 
+    /// The weak-link test mode (Mbps, 0 = off): what arrives goes through
+    /// a pretend bottleneck, to try rate control without moving a machine.
+    public var testLink: UInt32 {
+        get { with(0) { glass_client_test_link($0) } }
+        set { with(()) { glass_client_set_test_link($0, newValue) } }
+    }
+
+    /// "test mode (weak link): on at 0:32 (15 Mbps), off at …" (empty if
+    /// never on).
+    public var testLinkLine: String {
+        with("") { p in
+            var buf = [CChar](repeating: 0, count: 512)
+            _ = glass_client_test_link_text(p, &buf, buf.count)
+            return String(cString: buf)
+        }
+    }
+
     /// Hold at least `us` of sound, to wait for a slower picture (M4b).
     public func setAudioMinTarget(_ us: UInt64) {
         with(()) { glass_client_set_audio_min_target($0, us) }

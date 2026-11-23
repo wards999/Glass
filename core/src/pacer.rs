@@ -107,6 +107,56 @@ impl PaceQueue {
     }
 }
 
+/// A pretend bottleneck for the weak-link test mode (on the viewer):
+/// datagrams leave at `mbps`, queue when more comes, and are dropped past
+/// `max_queue_us` of queue, as a weak router does. With the mode off, what
+/// is still queued drains in order first.
+pub struct Bottleneck {
+    q: PaceQueue,
+    free_at: u64,
+    pub dropped: u64,
+}
+
+impl Bottleneck {
+    pub fn new(slot: usize) -> Self {
+        Self {
+            q: PaceQueue::new(slot),
+            free_at: 0,
+            dropped: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.q.is_empty()
+    }
+
+    /// Takes a datagram arriving at `now_us` through a link of `mbps` (0:
+    /// off, just keeping the order). False if it was dropped.
+    pub fn admit(&mut self, d: &[u8], now_us: u64, mbps: u32, max_queue_us: u64) -> bool {
+        let start = self.free_at.max(now_us);
+        let done = if mbps == 0 {
+            start
+        } else {
+            start + (d.len() as f64 * 8.0 / mbps as f64) as u64
+        };
+        if done.saturating_sub(now_us) > max_queue_us || !self.q.push(d, done) {
+            self.dropped += 1;
+            return false;
+        }
+        self.free_at = done;
+        true
+    }
+
+    /// The next datagram through by `now_us`, if any; `pop` after it.
+    pub fn front_due(&self, now_us: u64) -> Option<&[u8]> {
+        self.q.front_due(now_us)
+    }
+
+    pub fn pop(&mut self) {
+        self.q.pop();
+    }
+}
+
 /// How fast to send a frame of `bytes` (bytes per µs): over at most
 /// [`SPREAD_OF_REFRESH`] of the viewer's refresh interval, and never slower
 /// than [`MIN_RATE_X`] × `avg_bytes_per_us` (the recent average).
@@ -160,6 +210,34 @@ mod tests {
         }
         assert!(!q.push(&[1; 100], 0));
         assert!(!PaceQueue::new(100).push(&[1; 101], 0));
+    }
+
+    /// The weak-link test mode: 45 Mbps arriving through 15 Mbps.
+    #[test]
+    fn the_bottleneck_queues_then_drops() {
+        let mut b = Bottleneck::new(1400);
+        let (mut through, mut worst) = (0usize, 0u64);
+        let mut sent_at = std::collections::VecDeque::new();
+        // 1 s: a 1200-byte datagram every 213 µs is 45 Mbps.
+        let mut t = 0u64;
+        while t < 1_000_000 {
+            if b.admit(&[0; 1200], t, 15, 150_000) {
+                sent_at.push_back(t);
+            }
+            while b.front_due(t).is_some() {
+                b.pop();
+                through += 1200;
+                worst = worst.max(t - sent_at.pop_front().unwrap());
+            }
+            t += 213;
+        }
+        let mbps = through as f64 * 8.0 / 1e6;
+        assert!((12.0..=16.0).contains(&mbps), "{mbps}");
+        assert!((140_000..=152_000).contains(&worst), "{worst}");
+        assert!(b.dropped > 2_000, "{}", b.dropped);
+        // Off: what's queued drains in order, then straight through.
+        assert!(b.admit(&[1; 10], t, 0, 150_000));
+        assert!(!b.is_empty());
     }
 
     #[test]

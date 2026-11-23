@@ -1939,6 +1939,30 @@ size_t glass_audio_stats_text(const GLASS_AudioStats *s, char *buf, size_t len);
 int64_t glass_session_take_video_rate(const GLASS_HostSession *s);
 
 /**
+ * The weak-link test mode (Mbps, 0 = off): received packets go through a
+ * pretend bottleneck. Each switch is logged.
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+void glass_client_set_test_link(const GLASS_Client *c, uint32_t mbps);
+
+/**
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+uint32_t glass_client_test_link(const GLASS_Client *c);
+
+/**
+ * The test mode's results line (empty if it was never on), NUL-terminated
+ * into `buf`; returns its full length.
+ *
+ * # Safety
+ * `c` from `glass_client_connect`; `buf` valid for `len` bytes (or null).
+ */
+size_t glass_client_test_link_text(const GLASS_Client *c, char *buf, size_t len);
+
+/**
  * Hold at least `us` of sound (20–80 ms), so it isn't ahead of a slower
  * picture (M4b).
  *

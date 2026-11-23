@@ -111,6 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         submenu("View", [
             item("Toggle Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", chord),
             item("Show/Hide Stats", #selector(toggleStats), "s", chord, target: self),
+            item("Test: Weak Wi-Fi On/Off", #selector(toggleTestLink), "l", chord, target: self),
         ])
         NSApp.mainMenu = main
     }
@@ -196,6 +197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         refreshFound()
     }
     @objc private func toggleStats() { viewer?.toggleOverlay() }
+    @objc private func toggleTestLink() { viewer?.toggleTestLink() }
 
     @objc private func togglePcStyle(_ sender: NSMenuItem) {
         let on = sender.state != .on

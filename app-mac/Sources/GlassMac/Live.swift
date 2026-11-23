@@ -277,6 +277,15 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     /// Stats are off unless chosen (bar or ⌃⌥⌘S); the choice is kept.
     private var statsHidden = !UserDefaults.standard.bool(forKey: "showStats")
 
+    /// The weak-link test mode, ⌃⌥⌘L: a pretend 15 Mbps bottleneck on
+    /// what arrives (logged in the results with its times).
+    static let testLinkMbps: UInt32 = 15
+
+    func toggleTestLink() {
+        client.testLink = client.testLink == 0 ? Self.testLinkMbps : 0
+        lastOverlay = 0 // show it at once
+    }
+
     func toggleOverlay() {
         statsHidden.toggle()
         UserDefaults.standard.set(!statsHidden, forKey: "showStats")
@@ -746,13 +755,15 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 inputLine,
                 "  encode \(p50(r.encode)) | network \(p50(r.network)) | queue \(p50(r.queue)) | decode \(p50(r.decode)) | wait \(p50(r.wait)) | present \(p50(r.present))   (p50 ms)",
                 "lost \(st.rx.frames_lost)  skipped \(st.rx.frames_skipped)  keyframe req \(st.keyframe_requests)  decode err \(decodeErrors)  RTT \(String(format: "%.1f", Double(st.last_rtt_us) / 1e3)) ms  input events \(st.input_events)",
-                "⌃⌥⌘F full screen · ⌃⌥⌘S hide stats · ⌃⌥⌘W disconnect · ⌃⌥⌘Q quit",
+                "⌃⌥⌘F full screen · ⌃⌥⌘S hide stats · ⌃⌥⌘L test weak Wi-Fi · ⌃⌥⌘W disconnect · ⌃⌥⌘Q quit",
             ]
             if audioLatencyMs > 0 {
                 lines.insert(String(format: "sound   %.0f ms + the output's %.0f ms (picture p50 %.0f ms)",
                                     audioLatencyMs, outputLatencyMs, Double(total.p50_us) / 1e3), at: 4)
             }
             if let n = noticeText(st.host_notice) { lines.insert(n, at: 0) }
+            let test = client.testLink
+            if test > 0 { lines.insert("TEST: weak Wi-Fi, \(test) Mbps (⌃⌥⌘L to end)", at: 0) }
             if let f = files { lines.insert(f, at: 0) }
             if now - windowStart >= 2_000_000 {
                 recent.reset()
@@ -761,8 +772,10 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             return lines.joined(separator: "\n")
         }
         overlay.stringValue = text
-        // A blocking notice shows even when the stats are hidden.
-        let notice = noticeText(st.host_notice) ?? files
+        // A blocking notice, the test mode and files on their way show even
+        // when the stats are hidden.
+        let testOn = client.testLink > 0 ? "TEST: weak Wi-Fi, \(client.testLink) Mbps (⌃⌥⌘L to end)" : nil
+        let notice = noticeText(st.host_notice) ?? testOn ?? files
         if statsHidden {
             overlay.isHidden = notice == nil
             if let notice { overlay.stringValue = notice }
@@ -855,6 +868,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 }
             }
             out.append("  " + wifi.line())
+            let testLine = client.testLinkLine
+            if !testLine.isEmpty { out.append("  " + testLine) }
             out.append(String(format: "  rate control (M5): %@ | backed off %u times%@",
                               st.video_limit_bps == 0 ? "no limit now" : String(format: "limit %.1f Mbps now", Double(st.video_limit_bps) / 1e6),
                               st.video_backoffs,

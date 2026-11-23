@@ -10,6 +10,18 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 10 (rate control, with the weak-link test mode)
+Protocol v14: update all three machines, and the service on QUIETPC.
+1. 3D pool for about 30 s as normal.
+2. ⌃⌥⌘L on the Mac: "TEST: weak Wi-Fi, 15 Mbps" appears. Keep playing
+   for about a minute. Expected: a moment of lag as the queue fills, then
+   rate control backs off. The picture gets a little softer but stays
+   smooth and quick.
+3. ⌃⌥⌘L again (off). Within a few seconds it climbs back to full quality.
+4. Send both results. The Mac's "test mode (weak link)" line has the
+   times; "rate control (M5)" has the backoffs and the lowest limit; and
+   "worst moments" shows whether anything stalled.
+
 ## M5 test 9 (rate control)
 Protocol v14: update all three machines, and the service on QUIETPC.
 1. The 3D pool test as before. On this link, "rate control (M5)" should

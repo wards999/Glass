@@ -1439,6 +1439,37 @@ pub unsafe extern "C" fn glass_session_take_video_rate(s: *const HostSession) ->
     (*s).take_video_rate().map_or(-1, |b| b as i64)
 }
 
+/// The weak-link test mode (Mbps, 0 = off): received packets go through a
+/// pretend bottleneck. Each switch is logged.
+///
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_set_test_link(c: *const Client, mbps: u32) {
+    (*c).set_test_link(mbps);
+}
+
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_test_link(c: *const Client) -> u32 {
+    (*c).test_link()
+}
+
+/// The test mode's results line (empty if it was never on), NUL-terminated
+/// into `buf`; returns its full length.
+///
+/// # Safety
+/// `c` from `glass_client_connect`; `buf` valid for `len` bytes (or null).
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_test_link_text(
+    c: *const Client,
+    buf: *mut c_char,
+    len: usize,
+) -> usize {
+    copy_str(&(*c).test_link_line().unwrap_or_default(), buf, len)
+}
+
 /// Hold at least `us` of sound (20–80 ms), so it isn't ahead of a slower
 /// picture (M4b).
 ///

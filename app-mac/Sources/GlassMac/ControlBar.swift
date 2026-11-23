@@ -85,6 +85,9 @@ final class ControlBar: NSVisualEffectView {
         row.orientation = .horizontal
         row.spacing = 8
         row.edgeInsets = NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 12)
+        // Too narrow a window clips the bar rather than widening the view
+        // (m5-test12: a wider button pushed the picture off the screen).
+        row.setClippingResistancePriority(.defaultLow, for: .horizontal)
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
         NSLayoutConstraint.activate([
@@ -108,7 +111,7 @@ final class ControlBar: NSVisualEffectView {
         pin.state = pinned ? .on : .off
         let testOn = testLinkMbps > 0
         testLink.state = testOn ? .on : .off
-        testLink.title = testOn ? "Weak Wi-Fi test · \(testLinkMbps) Mbps" : "Weak Wi-Fi test"
+        // The colour says it's on; the title stays the same width.
         testLink.bezelColor = testOn ? .systemOrange : nil
         testLink.contentTintColor = testOn ? .white : nil
         status.stringValue = text

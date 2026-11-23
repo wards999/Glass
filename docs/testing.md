@@ -18,7 +18,8 @@ Protocol v14, as before: update all three machines, and the service on QUIETPC.
    (M5)" line says "no limit now" and the PC's frame rate goes back to
    twice the Mac's refresh (about 100+ fps sent).
 3. Check the whole PC screen still shows in full screen (the chat panel on
-   the right).
+   the right), before and after clicking "Weak Wi-Fi test", and with the
+   control bar open.
 4. Send both results.
 
 ## M5 test 12 (the whole PC screen on the Mac; rate control's climb)

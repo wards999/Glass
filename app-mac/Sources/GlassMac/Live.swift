@@ -226,10 +226,19 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         // Centred under the handle, but always inside the view.
         let barCentre = bar.centerXAnchor.constraint(equalTo: view.centerXAnchor)
         barCentre.priority = .defaultHigh
+        // Never required: the bar must not decide the view's size. With
+        // required edges, the Weak Wi-Fi button's longer title made the bar
+        // wider than the view, and AppKit widened the full-screen view to
+        // fit it, pushing the right of the picture off the screen
+        // (m5-test12). Below the window's own 500, the bar gives way.
+        let barLeading = bar.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor)
+        let barTrailing = bar.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor)
+        barLeading.priority = .init(490)
+        barTrailing.priority = .init(490)
         NSLayoutConstraint.activate([
             barCentre,
-            bar.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor),
-            bar.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor),
+            barLeading,
+            barTrailing,
             bar.topAnchor.constraint(equalTo: view.topAnchor, constant: 0),
         ])
         self.bar = bar

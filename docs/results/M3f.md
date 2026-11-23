@@ -1,8 +1,10 @@
 # M3f — Windows service: unattended access
 
-**Status: in progress.** The service (ADR 0015) is built and installs on
-QUIETPC. The sharing it does works. The lock screen and UAC prompts are
-still to be tested with a working keyboard.
+**Status: closed (2026-11-23), with the open items below.** The service
+(ADR 0015) installs and runs on QUIETPC. Since m5c-test7 it keeps the viewer's
+connection while helpers do the work (ADR 0017), so signing in or Remote
+Desktop no longer drops the viewer. The user moved on to M4; the open items
+are carried forward.
 
 ## Found on the way (PC → PC, m3d-test18 … m3f-test7)
 
@@ -39,8 +41,28 @@ still to be tested with a working keyboard.
 
 0 lost frames. The session switched 4:2:0 → 4:4:4 → 4:2:0 from the bar.
 
-## Still to do in M3f
-- The lock screen, sign-in and UAC prompts through the service, now that
-  typing works. Also End session from QUIETPC's window.
+## The service keeps the connection (ADR 0017), QUIETPC22 → QUIETPC
+
+Signing in at QUIETPC's lock screen (PIN typed in the viewer) used to drop the
+session and reconnect about 5 s later. With the broker and helpers:
+
+| build | session switches, viewer kept connected | picture paused | helper → service hop p50 / p99 / max |
+|---|---|---|---|
+| m5c-test8 (463 s) | 1 | 0.37 s | 0.14 / 0.53 / 2.61 ms |
+| m5c-test9 (231 s) | 1 | 0.24 s | 0.10 / 0.52 / 58.4 ms |
+
+- The 58 ms max was a video frame waiting behind a file chunk in the broker's
+  loop. Fixed in m5c-test10: clipboard data has its own path. A local test
+  during a 300 MB copy then measured hop max 1.58 ms.
+- On one PC, two rounds at about 140 fps: capture → screen p50 was
+  10.38 / 10.35 ms in-app and 10.47 / 10.38 ms through the broker, and p99
+  16.80 / 16.82 vs 16.80 / 16.42 ms. The hop doesn't show.
+- Clipboard with the service: files crossed both ways (m5c-test8: "1 copies
+  offered, 1 pasted on the viewer, 3 pasted here").
+
+## Carried forward (open)
+- UAC prompts, Remote Desktop take-over and give-back, and End session
+  through the new service. In m5c-test12's list, not yet reported.
 - The Win / Alt+Tab hook in Glass.exe.
-- A "busy" refusal for a third device during a session (protocol v8, with M3e).
+- A "busy" refusal for a third device during a session.
+- Ctrl+Alt+Del (SendSAS) for PCs that require it.

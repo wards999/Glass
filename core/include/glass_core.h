@@ -280,7 +280,7 @@
  * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
  * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 12
+#define GLASS_PROTOCOL_VERSION 13
 
 /**
  * Most "seen by" ids a `Hello` carries (no-loop rule).
@@ -640,6 +640,13 @@ typedef struct GLASS_LinkTrack GLASS_LinkTrack;
  * A pairing in progress: the host is showing a PIN.
  */
 typedef struct GLASS_Pairing GLASS_Pairing;
+
+/**
+ * Decoded audio between the receiver and the device callback: one writer
+ * (the receiver), one reader (the device). Lock-free; the callback never
+ * waits.
+ */
+typedef struct GLASS_PcmRing GLASS_PcmRing;
 
 typedef struct GLASS_Replay GLASS_Replay;
 
@@ -1016,6 +1023,11 @@ typedef struct {
    */
   uint32_t qos;
   uint64_t keepalives;
+  /**
+   * Sound frames sent, and resent after a NACK (M4b).
+   */
+  uint64_t audio_frames;
+  uint64_t audio_resent;
 } GLASS_HostCounters;
 
 /**
@@ -1042,6 +1054,41 @@ typedef struct {
    */
   uint8_t bssid[6];
 } GLASS_LinkSample;
+
+/**
+ * What the viewer's audio did (for the results).
+ */
+typedef struct {
+  /**
+   * Frames played from their own datagram, rebuilt from a later
+   * datagram's redundant copy, or resent after a NACK.
+   */
+  uint64_t frames;
+  uint64_t from_redundancy;
+  uint64_t from_resend;
+  uint64_t nacks;
+  /**
+   * Frames that never came in time: concealed (Opus PLC, no click).
+   */
+  uint64_t concealed;
+  /**
+   * The device found the buffer empty while sound played (an audible gap).
+   */
+  uint64_t underruns;
+  /**
+   * Playout buffer: target and current depth (ms), and the drift
+   * correction (parts per million, + = playing faster).
+   */
+  uint32_t target_ms;
+  uint32_t depth_ms;
+  int32_t drift_ppm;
+  /**
+   * From capture on the host to leaving this machine's buffer (ms,
+   * smoothed), once clocks are synced: the output device adds its own
+   * few ms. Compare with the picture's capture -> screen for A/V sync.
+   */
+  uint32_t latency_ms;
+} GLASS_AudioStats;
 
 /**
  * What the spikes look like, for the results (`repr(C)` for the Mac).
@@ -1762,6 +1809,49 @@ size_t glass_link_track_text(const GLASS_LinkTrack *t, char *buf, size_t len);
  * `t` from `glass_link_track_new`, not used after.
  */
 void glass_link_track_free(GLASS_LinkTrack *t);
+
+/**
+ * The sound ring the output device reads (M4b), or null until the host
+ * sends sound. Release it with `glass_audio_ring_free` (it stays valid
+ * after the client closes).
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+const GLASS_PcmRing *glass_client_audio_ring(const GLASS_Client *c);
+
+/**
+ * Fills `out` (`n` interleaved stereo samples at 48 kHz) from the ring at
+ * `gain`, silence for what isn't there. For the audio device's callback:
+ * never blocks or allocates. Returns the samples that were sound.
+ *
+ * # Safety
+ * `ring` from `glass_client_audio_ring`; `out` valid for `n` floats.
+ */
+size_t glass_audio_ring_read(const GLASS_PcmRing *ring, float *out, size_t n, float gain);
+
+/**
+ * # Safety
+ * `ring` from `glass_client_audio_ring`, not used after.
+ */
+void glass_audio_ring_free(const GLASS_PcmRing *ring);
+
+/**
+ * The results line for `s`, NUL-terminated into `buf`; returns its full
+ * length.
+ *
+ * # Safety
+ * `s` valid; `buf` valid for `len` bytes (or null).
+ */
+size_t glass_audio_stats_text(const GLASS_AudioStats *s, char *buf, size_t len);
+
+/**
+ * What the sound did so far (M4b).
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+GLASS_AudioStats glass_client_audio_stats(const GLASS_Client *c);
 
 /**
  * Wi-Fi delay spikes so far (M4 step 5).

@@ -87,6 +87,11 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private let log = SessionLog(kind: "viewer")
     /// This Mac's Wi-Fi link during the session (M4 step 5).
     private let wifi = WifiWatch()
+    /// The host's sound (M4b), from when it first comes (main thread).
+    private var player: AudioPlayer?
+    /// The sound line, kept for the report after the client closes.
+    private var audioLine = ""
+
     private var windowStart = GlassClock.nowUs()
     private var lastOverlay: UInt64 = 0
     private let iso = keyboardIsISO()
@@ -584,6 +589,11 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         if now - lastClipPoll >= 150_000 {
             lastClipPoll = now
             pollClipboard()
+            // The host's sound: play it once it comes.
+            if player == nil, let ring = client.audioRing() {
+                player = AudioPlayer(ring: ring)
+            }
+            audioLine = client.audioLine
         }
         if now - lastOverlay >= 250_000 {
             lastOverlay = now
@@ -674,6 +684,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private func completed(_ reason: String) {
         guard !finished else { return }
         finished = true
+        player?.stop()
+        player = nil
         if let m = keyMonitor { NSEvent.removeMonitor(m) }
         keyMonitor = nil
         link?.invalidate()
@@ -740,6 +752,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                               Double(st.rx.recovery_us_max) / 1e3))
             out.append("  network (M4): input marked for Wi-Fi priority: \(st.qos == 1 ? "yes" : st.qos == 2 ? "no" : "not yet") | keep-awakes sent \(st.keepalives)")
             out.append("  " + client.spikesLine)
+            if !audioLine.isEmpty { out.append("  " + audioLine) }
             out.append("  " + wifi.line())
             out.append("  packets \(st.rx.packets) | lost frames \(st.rx.frames_lost) | skipped \(st.rx.frames_skipped) | late \(st.rx.late) | dup \(st.rx.duplicates) | bad \(st.rx.bad) | rejected \(st.crypto_bad + st.crypto_replayed) | queue full \(st.queue_full) | keyframe requests \(st.keyframe_requests)")
             out.append(String(format: "  bitrate %.1f Mbps avg | clock sync %@ (best RTT %.2f ms, last %.2f ms)",

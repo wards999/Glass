@@ -620,6 +620,12 @@ fn session_report(sh: &Shared, r: &Report, head: &ReportHead, reason: &str) -> S
         glass_core::spikes::describe(&sh.client.spikes())
     );
     let _ = writeln!(out, "  {}", sh.wifi.line());
+    // LATER(M4b step 3): played on Windows too.
+    let _ = writeln!(
+        out,
+        "  {} (not played on Windows yet)",
+        glass_core::audio::describe(&sh.client.audio_stats())
+    );
     let _ = writeln!(
         out,
         "  bitrate {:.1} Mbps avg | clock sync {} (best RTT {:.2} ms, last {:.2} ms)",

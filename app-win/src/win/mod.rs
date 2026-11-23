@@ -26,6 +26,7 @@ mod pipe;
 mod present;
 pub mod service;
 mod slog;
+mod sound;
 mod stats_box;
 mod vfiles;
 pub mod viewer;
@@ -944,6 +945,11 @@ fn run_session<V: ViewerLink>(
         s.set_file_dir(Some(clip::file_dir(a.desktops, "host")));
         clip::ClipSync::start(s.clip_link(), false)
     });
+    // The sound (M4b), when this process hosts the session itself; the
+    // speakers stay silent here meanwhile.
+    let sound = session
+        .clip_session()
+        .map(|s| sound::Capture::start(s.audio_out(), true));
     let t0 = clock::now_us();
     let log = session.counters().map(|_| slog::SessionLog::start("host"));
     let mut next_log = t0 + slog::EVERY_US;
@@ -972,7 +978,7 @@ fn run_session<V: ViewerLink>(
                 log.write(&format!(
                     "{}\n{}",
                     crate::banner(),
-                    host_report(session, &run, a, cap, t0, clip_here, None)
+                    host_report(session, &run, a, cap, t0, clip_here, sound.as_ref(), None)
                 ));
             }
         }
@@ -1082,6 +1088,7 @@ fn run_session<V: ViewerLink>(
         cap,
         t0,
         clip_here,
+        sound.as_ref(),
         Some(run.error.as_deref().unwrap_or("viewer left")),
     );
     if let Some(log) = &log {
@@ -1107,6 +1114,7 @@ fn host_report<V: ViewerLink>(
     cap: &capture::Capture,
     t0: u64,
     clip_here: bool,
+    sound: Option<&sound::Capture>,
     ended: Option<&str>,
 ) -> String {
     let secs = (clock::now_us() - t0) as f64 / 1e6;
@@ -1163,6 +1171,15 @@ fn host_report<V: ViewerLink>(
             c.keepalives
         );
         let _ = writeln!(r, "  {}", run.wifi.line());
+        if let Some(snd) = sound {
+            let _ = writeln!(
+                r,
+                "  {} | {} sent, {} resent for the viewer",
+                snd.line(),
+                c.audio_frames,
+                c.audio_resent
+            );
+        }
     } else {
         let _ = writeln!(
             r,

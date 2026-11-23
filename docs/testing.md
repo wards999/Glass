@@ -10,6 +10,23 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M4b test 1 (sound: PC → Mac)
+Sound works from a Windows PC sharing with **Glass.exe** to the Mac
+viewing it. The Glass service doesn't send sound yet (step 4), so on
+QUIETPC switch Allow connections to Glass.exe sharing, or share from
+QUIETPC22.
+1. View the PC from the Mac. Play music or a video on the PC.
+2. The Mac plays the sound. The PC's own speakers are silent during the
+   session, and come back when it ends.
+3. Listen for crackles, gaps or drift, including during a file copy and
+   from a weaker Wi-Fi spot. Note whether the sound seems ahead of or
+   behind the picture.
+4. Send both results:
+   - the Mac viewer's has "sound (M4b): N frames played … concealed …
+     gaps … buffer … latency …";
+   - the PC host's has "sound (M4b): N frames sent (M silent) | this PC's
+     speakers muted during the session".
+
 ## M4 test 12 (Wi-Fi spikes named, the link reported)
 1. View QUIETPC from QUIETPC22, then the Mac, for a few minutes each, on
    Wi-Fi, with something moving all the time (a video), so spikes show.

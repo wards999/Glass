@@ -331,6 +331,7 @@ protocol version, `fp` first 8 bytes of the fingerprint (hex), `ip`, `port`.
 Advisory only: trust comes from the pinned fingerprint, never from discovery.
 
 ## Changelog
+- v13 — M4b: sound, `"GLAU"` datagrams (Opus, 2 redundant frames) and `"GLNA"` audio NACKs.
 - v12 — M4: keep-awake datagram host → viewer (`"GLKA"`); packet marking (no format change).
 - v11 — M4: NACK datagram (`"GLNK"`), `RESENT` flag (bit 2) on resent video packets.
 - v10 — M4: FEC on video (`fec_groups`, `fec_parity` in the header, parity packets), `ReceiverReport` (22).

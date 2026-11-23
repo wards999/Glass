@@ -9,7 +9,7 @@
 /// announces new stream parameters mid-session (`StreamChange`).
 /// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
 /// datagrams. v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 12;
+pub const PROTOCOL_VERSION: u8 = 13;
 
 /// Most "seen by" ids a `Hello` carries (no-loop rule).
 pub const MAX_SEEN_BY: usize = 8;

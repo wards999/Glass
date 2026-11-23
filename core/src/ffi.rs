@@ -1379,6 +1379,65 @@ pub unsafe extern "C" fn glass_link_track_free(t: *mut crate::spikes::LinkTrack)
     }
 }
 
+/// The sound ring the output device reads (M4b), or null until the host
+/// sends sound. Release it with `glass_audio_ring_free` (it stays valid
+/// after the client closes).
+///
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_audio_ring(c: *const Client) -> *const crate::audio::PcmRing {
+    (*c).audio_ring().map_or(std::ptr::null(), Arc::into_raw)
+}
+
+/// Fills `out` (`n` interleaved stereo samples at 48 kHz) from the ring at
+/// `gain`, silence for what isn't there. For the audio device's callback:
+/// never blocks or allocates. Returns the samples that were sound.
+///
+/// # Safety
+/// `ring` from `glass_client_audio_ring`; `out` valid for `n` floats.
+#[no_mangle]
+pub unsafe extern "C" fn glass_audio_ring_read(
+    ring: *const crate::audio::PcmRing,
+    out: *mut f32,
+    n: usize,
+    gain: f32,
+) -> usize {
+    (*ring).read(std::slice::from_raw_parts_mut(out, n), gain)
+}
+
+/// # Safety
+/// `ring` from `glass_client_audio_ring`, not used after.
+#[no_mangle]
+pub unsafe extern "C" fn glass_audio_ring_free(ring: *const crate::audio::PcmRing) {
+    if !ring.is_null() {
+        drop(Arc::from_raw(ring));
+    }
+}
+
+/// The results line for `s`, NUL-terminated into `buf`; returns its full
+/// length.
+///
+/// # Safety
+/// `s` valid; `buf` valid for `len` bytes (or null).
+#[no_mangle]
+pub unsafe extern "C" fn glass_audio_stats_text(
+    s: *const crate::audio::AudioStats,
+    buf: *mut c_char,
+    len: usize,
+) -> usize {
+    copy_str(&crate::audio::describe(&*s), buf, len)
+}
+
+/// What the sound did so far (M4b).
+///
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_audio_stats(c: *const Client) -> crate::audio::AudioStats {
+    (*c).audio_stats()
+}
+
 /// Wi-Fi delay spikes so far (M4 step 5).
 ///
 /// # Safety

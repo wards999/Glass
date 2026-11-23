@@ -293,6 +293,30 @@ pub struct AudioStats {
     pub target_ms: u32,
     pub depth_ms: u32,
     pub drift_ppm: i32,
+    /// From capture on the host to leaving this machine's buffer (ms,
+    /// smoothed), once clocks are synced: the output device adds its own
+    /// few ms. Compare with the picture's capture -> screen for A/V sync.
+    pub latency_ms: u32,
+}
+
+/// The viewer's results line (the same on both platforms).
+pub fn describe(s: &AudioStats) -> String {
+    if s.frames == 0 && s.concealed == 0 {
+        return "sound (M4b): none came".into();
+    }
+    format!(
+        "sound (M4b): {} frames played ({} rebuilt from a later packet, {} resent; {} asks) | concealed {} | gaps {} | buffer {} ms (target {}) | drift {:+} ppm | latency {} ms + the output's",
+        s.frames,
+        s.from_redundancy,
+        s.from_resend,
+        s.nacks,
+        s.concealed,
+        s.underruns,
+        s.depth_ms,
+        s.target_ms,
+        s.drift_ppm,
+        s.latency_ms
+    )
 }
 
 const SLOTS: usize = 64;
@@ -308,6 +332,8 @@ struct Slot {
     len: u16,
     /// How it came: 0 own datagram, 1 redundant copy, 2 resend.
     via: u8,
+    /// Capture time on the host (µs; 0 if unknown, e.g. a resend).
+    ts: u64,
     data: [u8; MAX_OPUS],
 }
 
@@ -334,6 +360,9 @@ pub struct AudioReceiver {
     nack_last: Option<(u32, u64)>,
     rtt_us: u32,
     last_push_us: u64,
+    /// `host clock - local clock` (µs), once synced.
+    clock_offset: Option<i64>,
+    latency_avg: f64,
     pub stats: AudioStats,
 }
 
@@ -348,6 +377,7 @@ impl AudioReceiver {
                     seq: u32::MAX,
                     len: 0,
                     via: 0,
+                    ts: 0,
                     data: [0; MAX_OPUS],
                 }; SLOTS],
             ),
@@ -367,6 +397,8 @@ impl AudioReceiver {
             nack_last: None,
             rtt_us: 0,
             last_push_us: 0,
+            clock_offset: None,
+            latency_avg: 0.0,
             stats: AudioStats::default(),
         })
     }
@@ -378,6 +410,11 @@ impl AudioReceiver {
 
     pub fn set_rtt(&mut self, rtt_us: u32) {
         self.rtt_us = rtt_us;
+    }
+
+    /// `host clock - local clock` (µs), for the latency measurement.
+    pub fn set_clock_offset(&mut self, offset_us: Option<i64>) {
+        self.clock_offset = offset_us;
     }
 
     /// A datagram from the host (`is_audio`), received at `now_us`.
@@ -397,6 +434,11 @@ impl AudioReceiver {
             slot.seq = seq;
             slot.len = f.len() as u16;
             slot.via = if resent { 2 } else { u8::from(k > 0) };
+            slot.ts = if resent {
+                0
+            } else {
+                p.capture_ts_us.saturating_sub(k as u64 * FRAME_US)
+            };
             slot.data[..f.len()].copy_from_slice(f);
             if self.newest.is_none_or(|n| before(n, seq)) {
                 self.newest = Some(seq);
@@ -473,6 +515,17 @@ impl AudioReceiver {
                     _ => {}
                 }
                 self.stats.frames += 1;
+                // Played after what's already in the ring.
+                if let (Some(off), true) = (self.clock_offset, s.ts != 0) {
+                    let captured = crate::clock::host_to_local(s.ts, off);
+                    let lat = (now_us + level).saturating_sub(captured) as f64;
+                    self.latency_avg = if self.latency_avg == 0.0 {
+                        lat
+                    } else {
+                        self.latency_avg + (lat - self.latency_avg) * 0.05
+                    };
+                    self.stats.latency_ms = (self.latency_avg / 1_000.0) as u32;
+                }
                 self.dec
                     .decode_float(&s.data[..s.len as usize], &mut self.pcm, false)
             } else if newer && level <= LOW_WATER_US {

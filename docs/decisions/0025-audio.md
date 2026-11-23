@@ -69,8 +69,22 @@ Targets (SPEC §2): audio latency ≤ 40 ms, in sync with the picture
 ## Steps
 1. Core (this ADR): codec, packets, redundancy, NACK, playout. Done.
 2. Windows host: WASAPI loopback capture → `AudioSender`, on the session's
-   socket, marked as voice. Mac viewer: CoreAudio output reading the ring.
-   The host's speakers muted while viewed.
+   socket. Mac viewer: CoreAudio output reading the ring. The host's
+   speakers muted while viewed. Done in m4b-test1:
+   - Loopback asks Windows for 48 kHz stereo float, converted from the
+     device's own format. Frames follow the device's clock while sound
+     plays. When nothing plays, silence frames go out on a 10 ms clock, so
+     the viewer's buffer never runs dry.
+   - Muting: checked on QUIETPC22's default output. Loopback still captured
+     the tone at full level (RMS 0.0353 against 0.0354) while the speakers
+     were muted. The mute is restored when the session ends, or if Glass
+     stops capturing.
+   - Mac viewer: AVAudioEngine with a source node that reads the ring in
+     the render callback (no lock, no allocation), and a 256-frame output
+     buffer (~5 ms).
+   - Audio shares the video's socket, so it's marked as video, not voice.
+     LATER(M5): its own socket marked as voice, if A/V numbers ask for it.
+   - In-app host only: the service's sessions come in step 4.
 3. Mac host: ScreenCaptureKit audio. Windows viewer: WASAPI low-latency
    output.
 4. The service, where capture runs in the user's session helper (with the

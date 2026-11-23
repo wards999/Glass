@@ -343,6 +343,9 @@ pub struct HostCounters {
     /// Video packet marking (`qos::QOS_*`), and keep-awakes sent (M4).
     pub qos: u32,
     pub keepalives: u64,
+    /// Sound frames sent, and resent after a NACK (M4b).
+    pub audio_frames: u64,
+    pub audio_resent: u64,
 }
 
 /// Called on the host's UDP thread for every input action, in order.
@@ -384,6 +387,54 @@ struct HostShared {
     resent: AtomicU64,
     qos: AtomicU32,
     keepalives: AtomicU64,
+    /// Sound (M4b): the encoder (made by the first `AudioOut::send`), and
+    /// frames sent and resent.
+    audio: Mutex<Option<crate::audio::AudioSender>>,
+    audio_frames: AtomicU64,
+    audio_resent: AtomicU64,
+}
+
+/// Sends the host's sound to the viewer, from the capture thread (M4b).
+/// Encodes, then seals and sends on the video's socket (one sealer: the
+/// nonce never repeats). Lock order: `audio`, then `tx`.
+#[derive(Clone)]
+pub struct AudioOut {
+    sh: Arc<HostShared>,
+    tx: Arc<Mutex<VideoTx>>,
+}
+
+impl AudioOut {
+    /// One 10 ms frame (`audio::FRAME_LEN` interleaved stereo samples at
+    /// 48 kHz) captured at `capture_ts_us` (this machine's clock). False if
+    /// the viewer isn't reachable yet or encoding failed.
+    pub fn send(&self, pcm: &[f32], capture_ts_us: u64) -> bool {
+        let Some(peer) = unpack_v4(self.sh.peer.load(Ordering::Relaxed)) else {
+            return false;
+        };
+        let mut a = lock(&self.sh.audio);
+        if a.is_none() {
+            *a = crate::audio::AudioSender::new().ok();
+        }
+        let Some(s) = a.as_mut() else {
+            return false;
+        };
+        let Ok(d) = s.frame(pcm, capture_ts_us) else {
+            return false;
+        };
+        let mut t = lock(&self.tx);
+        let VideoTx {
+            udp, sealer, wire, ..
+        } = &mut *t;
+        let len = sealer.seal(d, wire);
+        let ok = udp.send_to(&wire[..len], peer).is_ok();
+        t.last_send_us = clock::now_us();
+        self.sh.audio_frames.fetch_add(1, Ordering::Relaxed);
+        ok
+    }
+
+    pub fn connected(&self) -> bool {
+        self.sh.connected.load(Ordering::Relaxed) && !self.sh.stop.load(Ordering::Relaxed)
+    }
 }
 
 /// Video out: frames from the encoder and, for NACKs, resends from the UDP
@@ -598,6 +649,9 @@ impl HostListener {
             resent: AtomicU64::new(0),
             qos: AtomicU32::new(0),
             keepalives: AtomicU64::new(0),
+            audio: Mutex::new(None),
+            audio_frames: AtomicU64::new(0),
+            audio_resent: AtomicU64::new(0),
         });
         let tx = Arc::new(Mutex::new(VideoTx {
             udp: self.udp.try_clone()?,
@@ -782,6 +836,26 @@ impl HostListener {
                         let m = crate::qos::mark(&t.udp, crate::qos::Class::Video, v4);
                         sh.qos.store(m.state as u32, Ordering::Relaxed);
                         t.marking = Some(m);
+                    }
+                } else if let Some((first, count)) = crate::audio::decode_nack(d) {
+                    // Sound frames asked for again (M4b).
+                    if let Some(peer) = unpack_v4(sh.peer.load(Ordering::Relaxed)) {
+                        let mut a = lock(&sh.audio);
+                        if let Some(s) = a.as_mut() {
+                            for q in 0..count.min(32) as u32 {
+                                let Some(d) = s.resend(first.wrapping_add(q)) else {
+                                    continue;
+                                };
+                                let mut t = lock(&vtx);
+                                let VideoTx {
+                                    udp, sealer, wire, ..
+                                } = &mut *t;
+                                let len = sealer.seal(d, wire);
+                                let _ = udp.send_to(&wire[..len], peer);
+                                t.last_send_us = clock::now_us();
+                                sh.audio_resent.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                 } else if let Some(nk) = crate::protocol::Nack::decode(d) {
                     // Resend at once, from here: the frame sender may be
@@ -1052,6 +1126,14 @@ impl HostSession {
         Box::new(move |f: &[u8]| is_clip_frame(f) && out.write_all(f).is_ok())
     }
 
+    /// For the sound capture thread (M4b).
+    pub fn audio_out(&self) -> AudioOut {
+        AudioOut {
+            sh: self.shared.clone(),
+            tx: self.tx.clone(),
+        }
+    }
+
     pub fn counters(&self) -> HostCounters {
         HostCounters {
             keyframe_requests: self.shared.keyframe_requests.load(Ordering::Relaxed),
@@ -1062,6 +1144,8 @@ impl HostSession {
             packets_resent: self.shared.resent.load(Ordering::Relaxed),
             qos: self.shared.qos.load(Ordering::Relaxed),
             keepalives: self.shared.keepalives.load(Ordering::Relaxed),
+            audio_frames: self.shared.audio_frames.load(Ordering::Relaxed),
+            audio_resent: self.shared.audio_resent.load(Ordering::Relaxed),
             ..self.counters
         }
     }
@@ -1377,6 +1461,14 @@ impl InputTx {
         self.last_send_us = now;
     }
 
+    /// Asks the host for sound frames again (M4b).
+    fn send_audio_nack(&mut self, first: u32, count: u8) {
+        let b = crate::audio::encode_nack(first, count);
+        let len = self.sealer.seal(&b, &mut self.wire);
+        let _ = self.udp.send_to(&self.wire[..len], self.dest);
+        self.last_send_us = clock::now_us();
+    }
+
     /// Asks the host for packets of a frame again (M4).
     fn send_nack(&mut self, frame_id: u32, indices: &[u16]) {
         let n = crate::protocol::Nack::encode(self.session_id, frame_id, indices, &mut self.nack);
@@ -1415,6 +1507,10 @@ struct ClientShared {
     frame_n: AtomicU32,
     /// Wi-Fi spikes so far (M4 step 5), published about once a second.
     spikes: Mutex<crate::spikes::SpikeSummary>,
+    /// Sound (M4b): the ring the output device reads, once sound comes,
+    /// and what the receiver did.
+    audio_ring: Mutex<Option<Arc<crate::audio::PcmRing>>>,
+    audio_stats: Mutex<crate::audio::AudioStats>,
     clock_rtt: AtomicU32,
     last_rtt: AtomicU32,
     host_notice: std::sync::atomic::AtomicU8,
@@ -1673,6 +1769,8 @@ impl Client {
             frame_sum: AtomicU64::new(0),
             frame_n: AtomicU32::new(0),
             spikes: Mutex::new(Default::default()),
+            audio_ring: Mutex::new(None),
+            audio_stats: Mutex::new(Default::default()),
             clock_rtt: AtomicU32::new(0),
             last_rtt: AtomicU32::new(0),
             host_notice: std::sync::atomic::AtomicU8::new(0),
@@ -1891,6 +1989,17 @@ impl Client {
         }
     }
 
+    /// The ring of decoded sound the output device reads (M4b), once the
+    /// host sends sound.
+    pub fn audio_ring(&self) -> Option<Arc<crate::audio::PcmRing>> {
+        lock(&self.shared.audio_ring).clone()
+    }
+
+    /// What the sound did so far (M4b).
+    pub fn audio_stats(&self) -> crate::audio::AudioStats {
+        *lock(&self.shared.audio_stats)
+    }
+
     /// Wi-Fi delay spikes so far, and their likely cause (M4 step 5).
     pub fn spikes(&self) -> crate::spikes::SpikeSummary {
         *lock(&self.shared.spikes)
@@ -1919,6 +2028,7 @@ fn spawn_receiver(
         let mut last_punch = clock::now_us();
         let mut short_wait = false;
         let mut spikes = crate::spikes::SpikeDetector::default();
+        let mut audio: Option<crate::audio::AudioReceiver> = None;
         let mut spikes_published = 0u64;
         let host_ip = std::net::IpAddr::V4(*host_udp.ip());
         while !sh.stop.load(Ordering::Relaxed) && sh.connected.load(Ordering::Relaxed) {
@@ -1934,7 +2044,8 @@ fn spawn_receiver(
             }
             // Wake every 2 ms while a frame is incomplete: NACKs and giving
             // up are timed (M4).
-            let short = r.pending();
+            // Sound plays from a buffer that must be kept topped up.
+            let short = r.pending() || audio.is_some();
             if short != short_wait {
                 let t = if short { 2 } else { 100 };
                 let _ = udp.set_read_timeout(Some(Duration::from_millis(t)));
@@ -1944,6 +2055,17 @@ fn spawn_receiver(
             match udp.recv_from(&mut buf) {
                 Ok((n, from)) if from.ip() == host_ip => match opener.open(&mut buf[..n]) {
                     Ok(plain) if crate::protocol::is_keepalive(plain) => {}
+                    Ok(plain) if crate::audio::is_audio(plain) => {
+                        if audio.is_none() {
+                            audio = crate::audio::AudioReceiver::new().ok();
+                            if let Some(a) = &audio {
+                                *lock(&sh.audio_ring) = Some(a.ring());
+                            }
+                        }
+                        if let Some(a) = audio.as_mut() {
+                            a.push(plain, clock::now_us());
+                        }
+                    }
                     Ok(plain) => r.push(plain, clock::now_us()),
                     Err(_) => {
                         sh.crypto_bad.store(opener.stats.bad, Ordering::Relaxed);
@@ -1957,6 +2079,20 @@ fn spawn_receiver(
                 Err(_) => {}
             }
             let now = clock::now_us();
+            if let Some(a) = audio.as_mut() {
+                a.set_rtt(sh.last_rtt.load(Ordering::Relaxed));
+                a.set_clock_offset(
+                    sh.clock_valid
+                        .load(Ordering::Acquire)
+                        .then(|| sh.clock_offset.load(Ordering::Relaxed)),
+                );
+                a.tick(now, |first, count| {
+                    lock(&sh.input).send_audio_nack(first, count)
+                });
+                if let Ok(mut s) = sh.audio_stats.try_lock() {
+                    *s = a.stats;
+                }
+            }
             r.poll(now, |id, ix| lock(&sh.input).send_nack(id, ix));
             while let Some(f) = r.pop(now) {
                 let meta = LiveFrameMeta {

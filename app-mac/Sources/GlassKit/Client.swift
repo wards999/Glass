@@ -173,6 +173,22 @@ public final class GlassClient {
 
     public var clipProgress: GLASS_ClipProgress { with(GLASS_ClipProgress()) { glass_client_clip_progress($0) } }
 
+    /// The ring of decoded sound to play (M4b), once the host sends sound;
+    /// the caller releases it (`AudioPlayer` does).
+    public func audioRing() -> OpaquePointer? {
+        with(nil) { glass_client_audio_ring($0) }
+    }
+
+    /// "sound (M4b): …", as on the PC.
+    public var audioLine: String {
+        with("") { p in
+            var s = glass_client_audio_stats(p)
+            var buf = [CChar](repeating: 0, count: 512)
+            _ = glass_audio_stats_text(&s, &buf, buf.count)
+            return String(cString: buf)
+        }
+    }
+
     /// "Wi-Fi spikes (M4): …", as on the PC (M4 step 5).
     public var spikesLine: String {
         with("") { p in

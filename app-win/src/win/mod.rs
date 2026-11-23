@@ -366,12 +366,78 @@ struct HostRun {
     /// and the rate it sends at.
     capped: u32,
     send_hz: u32,
+    /// Worst moments (M5): the longest pauses in capture while the picture
+    /// was moving (µs into the session, gap), and the biggest frames (µs,
+    /// bytes, encode µs, keyframe). Longest / biggest first.
+    t0: u64,
+    last_capture: u64,
+    last_gap: u64,
+    pauses: Vec<(u64, u64)>,
+    big: Vec<(u64, usize, u32, bool)>,
     error: Option<String>,
     /// This PC's Wi-Fi link during the session (M4 step 5).
     wifi: wlan::WifiWatch,
 }
 
 impl HostRun {
+    /// A pause in capture after frames were coming steadily (a game
+    /// freezing, capture stalling), not a still screen.
+    fn note_capture(&mut self, now: u64) {
+        if self.last_capture > 0 {
+            let gap = now.saturating_sub(self.last_capture);
+            let moving = self.last_gap < 30_000;
+            if moving && gap > 40_000 && now > self.t0 + 2_000_000 {
+                let at = now.saturating_sub(self.t0);
+                if self.pauses.len() < 5 || gap > self.pauses.last().map_or(0, |p| p.1) {
+                    self.pauses.push((at, gap));
+                    self.pauses.sort_by_key(|p| std::cmp::Reverse(p.1));
+                    self.pauses.truncate(5);
+                }
+            }
+            self.last_gap = gap;
+        }
+        self.last_capture = now;
+    }
+
+    /// "worst moments (M5): …", for the results.
+    fn moments_line(&self) -> Option<String> {
+        let when = |us: u64| {
+            let s = us as f64 / 1e6;
+            format!("{}:{:04.1}", (s / 60.0) as u64, s % 60.0)
+        };
+        let mut parts = Vec::new();
+        if !self.pauses.is_empty() {
+            let p: Vec<String> = self
+                .pauses
+                .iter()
+                .map(|(at, gap)| format!("{} {:.0} ms", when(*at), *gap as f64 / 1e3))
+                .collect();
+            parts.push(format!("capture paused while moving: {}", p.join(", ")));
+        }
+        if !self.big.is_empty() {
+            let b: Vec<String> = self
+                .big
+                .iter()
+                .map(|(at, bytes, enc, key)| {
+                    format!(
+                        "{} {:.0} KB in {:.1} ms{}",
+                        when(*at),
+                        *bytes as f64 / 1e3,
+                        *enc as f64 / 1e3,
+                        if *key { " (keyframe)" } else { "" }
+                    )
+                })
+                .collect();
+            parts.push(format!("biggest frames: {}", b.join(", ")));
+        }
+        (!parts.is_empty()).then(|| {
+            format!(
+                "  worst moments (M5, time into the session): {}",
+                parts.join(" | ")
+            )
+        })
+    }
+
     fn new() -> Self {
         Self {
             wifi: wlan::WifiWatch::start(),
@@ -388,6 +454,11 @@ impl HostRun {
             skipped: 0,
             capped: 0,
             send_hz: 0,
+            t0: clock::now_us(),
+            last_capture: 0,
+            last_gap: u64::MAX,
+            pauses: Vec::with_capacity(8),
+            big: Vec::with_capacity(8),
             error: None,
         }
     }
@@ -414,6 +485,12 @@ impl HostRun {
         self.frame_id = self.frame_id.wrapping_add(1);
         match session.send_frame(&f, data) {
             Ok(true) => {
+                let at = out.saturating_sub(self.t0);
+                if self.big.len() < 5 || data.len() > self.big.last().map_or(0, |b| b.1) {
+                    self.big.push((at, data.len(), encode_us, key));
+                    self.big.sort_by_key(|b| std::cmp::Reverse(b.1));
+                    self.big.truncate(5);
+                }
                 self.encode.push(encode_us);
                 self.send.push(clock::now_us().saturating_sub(out) as u32);
                 self.size.push(data.len() as u32);
@@ -1116,6 +1193,7 @@ fn run_session<V: ViewerLink>(
             }
             got = true;
             run.intervals.tick(arrival);
+            run.note_capture(arrival);
             // At most one frame per refresh of the viewer's screen (M5's
             // first step, m4b-test2): a 60 Hz Mac sent 165 fps fell behind,
             // showed 37 fps and lost frames to a full queue. The newest is
@@ -1224,6 +1302,9 @@ fn host_report<V: ViewerLink>(
             run.not_sent,
             run.skipped
         );
+        if let Some(m) = run.moments_line() {
+            let _ = writeln!(r, "{m}");
+        }
         if run.send_hz > 0 {
             let _ = writeln!(
                 r,

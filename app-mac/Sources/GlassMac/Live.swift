@@ -20,6 +20,22 @@ struct FrameTiming {
     var lastPacket: UInt64
     var decodeEnd: UInt64
     var inputSeq: UInt32
+    /// For "worst moments": the frame's size, whether it's a keyframe, and
+    /// its network time (µs, 0 if unknown).
+    var bytes = 0
+    var idr = false
+    var network: UInt64 = 0
+}
+
+/// One of the longest gaps on screen (M5): when (µs into the session), how
+/// long since the frame before, and what that frame was.
+struct Moment {
+    var at: UInt64
+    var gap: UInt64
+    var total: UInt64
+    var bytes: Int
+    var idr: Bool
+    var network: UInt64
 }
 
 /// Latency rings for one reporting window (all µs).
@@ -124,6 +140,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     // Shared by the decode thread, presented handlers and main; guarded by `lock`.
     private let lock = NSLock()
     private var latest: (CVPixelBuffer, FrameTiming)?
+    /// The longest gaps on screen, longest first (under `lock`).
+    private var worst: [Moment] = []
     private var stopReason: String?
     private var superseded = 0
     private var submittedCount = 0 // handed to Core Animation (presented = confirmed on screen)
@@ -499,8 +517,11 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                     }
                     guard let pb else { return }
                     if latest != nil { superseded += 1 }
+                    let net = capture > 0 ? span(meta.last_packet_us, capture + UInt64(meta.encode_us)) : 0
                     latest = (pb, FrameTiming(captureLocal: capture, lastPacket: meta.last_packet_us,
-                                              decodeEnd: t1, inputSeq: meta.input_seq))
+                                              decodeEnd: t1, inputSeq: meta.input_seq,
+                                              bytes: bytes.count, idr: meta.flags & UInt8(GLASS_FLAG_IDR) != 0,
+                                              network: UInt64(net)))
                 }
             }
             if r == .disconnected {
@@ -683,6 +704,17 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                     if self.lastPresentedUs > 0 { s.interval.push(span(shown, self.lastPresentedUs)) }
                     if newInput, let sentAt { s.input.push(span(shown, sentAt)) }
                 }
+                // The longest gaps on screen, after the first 2 s (start-up).
+                if self.lastPresentedUs > 0, shown > self.started + 2_000_000 {
+                    let gap = shown &- self.lastPresentedUs
+                    if self.worst.count < 6 || gap > (self.worst.last?.gap ?? 0) {
+                        self.worst.append(Moment(at: shown - self.started, gap: gap,
+                                                 total: t.captureLocal > 0 ? shown &- t.captureLocal : 0,
+                                                 bytes: t.bytes, idr: t.idr, network: t.network))
+                        self.worst.sort { $0.gap > $1.gap }
+                        if self.worst.count > 6 { self.worst.removeLast() }
+                    }
+                }
                 self.lastPresentedUs = shown
             }
         }
@@ -823,6 +855,19 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 }
             }
             out.append("  " + wifi.line())
+            if !worst.isEmpty {
+                // m5-test4: "the first change still felt off". Totals can't say
+                // when or why; these can.
+                let items = worst.map { m -> String in
+                    let secs = Double(m.at) / 1e6
+                    let when = String(format: "%d:%04.1f", Int(secs) / 60, secs.truncatingRemainder(dividingBy: 60))
+                    var why = String(format: "%.0f KB%@", Double(m.bytes) / 1e3, m.idr ? " keyframe" : "")
+                    if m.network > 0 { why += String(format: ", network %.0f ms", Double(m.network) / 1e3) }
+                    if m.total > 0 { why += String(format: ", capture → screen %.0f ms", Double(m.total) / 1e3) }
+                    return String(format: "%@ a %.0f ms gap (%@)", when, Double(m.gap) / 1e3, why)
+                }
+                out.append("  worst moments (M5): " + items.joined(separator: " | "))
+            }
             out.append("  packets \(st.rx.packets) | lost frames \(st.rx.frames_lost) | skipped \(st.rx.frames_skipped) | late \(st.rx.late) | dup \(st.rx.duplicates) | bad \(st.rx.bad) | rejected \(st.crypto_bad + st.crypto_replayed) | queue full \(st.queue_full) | keyframe requests \(st.keyframe_requests)")
             out.append(String(format: "  bitrate %.1f Mbps avg | clock sync %@ (best RTT %.2f ms, last %.2f ms)",
                               Double(s.bytes) * 8 / secs / 1e6, st.clock_valid ? "ok" : "NOT SYNCED",

@@ -10,6 +10,16 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 6 (worst moments)
+The same 3D pool test, starting from the menu (the static view) into the
+live table. Note roughly when it felt off (seconds after connecting).
+1. Send both results. The new lines are "worst moments (M5)":
+   - on the Mac, the longest gaps on screen, each with its frame's size,
+     network time and capture → screen;
+   - on the PC, the longest capture pauses while moving, and the biggest
+     frames with their encode time.
+2. Everything from M5 test 5 too (60 fps shown, A/V).
+
 ## M5 test 5 (every refresh shown)
 The same 3D pool test.
 1. The Mac's results: "presented" close to 60 fps (m5-test4: 51.5).

@@ -1861,6 +1861,15 @@ void glass_audio_ring_free(const GLASS_PcmRing *ring);
 size_t glass_audio_stats_text(const GLASS_AudioStats *s, char *buf, size_t len);
 
 /**
+ * Hold at least `us` of sound (20–80 ms), so it isn't ahead of a slower
+ * picture (M4b).
+ *
+ * # Safety
+ * `c` from `glass_client_connect`.
+ */
+void glass_client_set_audio_min_target(const GLASS_Client *c, uint64_t us);
+
+/**
  * What the sound did so far (M4b).
  *
  * # Safety

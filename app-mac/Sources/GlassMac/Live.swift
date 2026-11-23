@@ -94,6 +94,12 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private var audioLine = ""
     private var audioLatencyMs = 0.0
     private var outputLatencyMs = 0.0
+    /// The sound held to wait for the picture (ms), adjusted once a second.
+    private var audioFloorMs = 20.0
+    private var lastSync: UInt64 = 0
+    /// The picture's capture -> screen p50 over the last couple of seconds
+    /// (ms), from the overlay's window.
+    private var picturePrevMs = 0.0
 
     private var windowStart = GlassClock.nowUs()
     private var lastOverlay: UInt64 = 0
@@ -598,8 +604,20 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             }
             audioLine = client.audioLine
             if let player {
-                audioLatencyMs = Double(client.audioStats.latency_ms)
+                let st = client.audioStats
+                audioLatencyMs = Double(st.latency_ms)
                 outputLatencyMs = player.outputLatencyMs
+                // A/V sync: once a second, hold the sound so it plays when
+                // the picture shows (m4b-test2: sound 23 ms ahead of a slow
+                // picture). Sound a little late is far less noticeable than
+                // early, so aim 5 ms behind.
+                if now - lastSync >= 1_000_000, audioLatencyMs > 0, picturePrevMs > 0 {
+                    lastSync = now
+                    let sound = audioLatencyMs + outputLatencyMs
+                    let want = Double(st.queued_ms) + (picturePrevMs + 5 - sound)
+                    audioFloorMs += (min(max(want, 20), 80) - audioFloorMs) * 0.5
+                    client.setAudioMinTarget(UInt64(audioFloorMs * 1_000))
+                }
             }
         }
         if now - lastOverlay >= 250_000 {
@@ -652,6 +670,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             let r = recent
             func p50(_ s: Stats) -> String { s.summary.count > 0 ? String(format: "%.1f", Double(s.summary.p50_us) / 1e3) : "-" }
             let total = r.total.summary
+            if total.count > 30 { picturePrevMs = Double(total.p50_us) / 1e3 }
             let totalLine = total.count > 0
                 ? String(format: "capture → screen  p50 %.1f  p99 %.1f ms", Double(total.p50_us) / 1e3, Double(total.p99_us) / 1e3)
                 : (st.clock_valid ? "capture → screen  (waiting for frames)" : "capture → screen  (syncing clocks…)")

@@ -10,6 +10,14 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M4b test 3 (sound with the picture, fewer glitches)
+As M4b test 2 (the 3D pool cue ball, the Mac's own speakers).
+1. With the stats on, the "sound" line's total (X + the output's Y) should
+   now be close to "picture p50", a few ms behind it.
+2. Send the Mac viewer's results. "A/V (M4b)" should say a few ms
+   behind, not ahead. "concealed" and "gaps" should be near 0 on a good
+   link.
+
 ## M4b test 2 (sound in sync)
 As M4b test 1. Sound should now be in step with the picture: lips with
 speech, a game's sound with its action.

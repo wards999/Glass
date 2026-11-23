@@ -347,8 +347,13 @@ const SLOTS: usize = 64;
 const START_TARGET_US: u64 = 30_000;
 const MIN_TARGET_US: u64 = 20_000;
 const MAX_TARGET_US: u64 = 50_000;
+/// How much sound may be held to wait for a slow picture.
+const SYNC_MAX_US: u64 = 80_000;
 /// Conceal the next frame only when the buffer is this low and it hasn't come.
 const LOW_WATER_US: u64 = 5_000;
+/// A frame is overdue when nothing has come for this long (they come every
+/// 10 ms).
+const OVERDUE_US: u64 = 15_000;
 /// More than this over the target waiting: skip to the newest sound (the
 /// output was late to start, or a long stall). Less is played slightly
 /// faster until it's gone ([`CATCH_UP_SPEED`]).
@@ -396,6 +401,9 @@ pub struct AudioReceiver {
     latency_avg: f64,
     /// Samples (per channel) still to fade in after a catch-up skip.
     fade_left: usize,
+    /// The least the target may be (µs): set so the sound isn't ahead of
+    /// a slower picture ([`Self::set_min_target`]).
+    sync_floor_us: u64,
     pub stats: AudioStats,
 }
 
@@ -433,6 +441,7 @@ impl AudioReceiver {
             clock_offset: None,
             latency_avg: 0.0,
             fade_left: 0,
+            sync_floor_us: MIN_TARGET_US,
             stats: AudioStats::default(),
         })
     }
@@ -444,6 +453,13 @@ impl AudioReceiver {
 
     pub fn set_rtt(&mut self, rtt_us: u32) {
         self.rtt_us = rtt_us;
+    }
+
+    /// Hold at least `us` of sound (20–80 ms): the viewer sets it so the
+    /// sound plays when its picture shows, not before (sound early is more
+    /// noticeable than late).
+    pub fn set_min_target(&mut self, us: u64) {
+        self.sync_floor_us = us.clamp(MIN_TARGET_US, SYNC_MAX_US);
     }
 
     /// `host clock - local clock` (µs), for the latency measurement.
@@ -523,14 +539,19 @@ impl AudioReceiver {
                 }
             }
         }
-        // Adapt the target: up at once after a gap, down slowly when calm.
+        // Adapt the target: up at once after a gap, down slowly when calm,
+        // never below what keeps the sound with the picture.
+        let floor = self.sync_floor_us;
+        if self.target_us < floor {
+            self.target_us = floor;
+        }
         let u = self.ring.underruns();
         if u > self.last_underruns {
             self.last_underruns = u;
-            self.target_us = (self.target_us + 10_000).min(MAX_TARGET_US);
+            self.target_us = (self.target_us + 10_000).min(MAX_TARGET_US.max(floor));
             self.calm_since_us = now_us;
         } else if now_us.saturating_sub(self.calm_since_us) > 10_000_000 {
-            self.target_us = self.target_us.saturating_sub(5_000).max(MIN_TARGET_US);
+            self.target_us = self.target_us.saturating_sub(5_000).max(floor);
             self.calm_since_us = now_us;
         }
         self.catch_up(next);
@@ -565,14 +586,18 @@ impl AudioReceiver {
                 self.dec
                     .decode_float(&s.data[..s.len as usize], &mut self.pcm, false)
             } else if level <= LOW_WATER_US
-                && (newer || now_us.saturating_sub(self.last_push_us) < 60_000)
+                && (newer || now_us.saturating_sub(self.last_push_us) >= OVERDUE_US)
+                && now_us.saturating_sub(self.last_push_us) < 100_000
             {
-                // About to run dry while the stream is live: a concealed
-                // frame, never a silent gap.
+                // About to run dry and the frame is lost (a newer one is
+                // here) or overdue: conceal rather than leave a gap. Not
+                // when it's merely a little late (m4b-test2 concealed 45
+                // frames that were on their way, and dropped them).
                 // It really didn't come: conceal (Opus fades it in), no
                 // click, and make room so the next burst is covered.
                 self.stats.concealed += 1;
-                self.target_us = (self.target_us + 5_000).min(MAX_TARGET_US);
+                self.target_us =
+                    (self.target_us + 5_000).min(MAX_TARGET_US.max(self.sync_floor_us));
                 self.calm_since_us = now_us;
                 self.dec.decode_float(&[], &mut self.pcm, false)
             } else {
@@ -955,6 +980,71 @@ mod tests {
         // this code made).
         let w = worst_step(&heard);
         assert!(w < 0.6, "step {w}");
+    }
+
+    /// m4b-test2: frames a few ms late (Wi-Fi jitter, a busy host) were
+    /// concealed and then thrown away when they came.
+    #[test]
+    fn late_but_coming_is_waited_for() {
+        let mut s = AudioSender::new().unwrap();
+        let mut r = AudioReceiver::new().unwrap();
+        let ring = r.ring();
+        let mut pull = [0f32; FRAME_LEN / 2];
+        let mut queue: Vec<(u64, Vec<u8>)> = Vec::new();
+        for ms in 0..20_000u64 {
+            let now = ms * 1_000;
+            if ms % 10 == 0 {
+                let f = (ms / 10) as u32;
+                let d = s.frame(&tone(f), now + 1).unwrap().to_vec();
+                // Every third frame 8 ms late, every 50th 14 ms late.
+                let late = if f.is_multiple_of(50) {
+                    14
+                } else if f.is_multiple_of(3) {
+                    8
+                } else {
+                    0
+                };
+                queue.push((ms + late, d));
+            }
+            queue.retain(|(t, d)| {
+                if *t == ms {
+                    r.push(d, now);
+                    false
+                } else {
+                    true
+                }
+            });
+            r.tick(now, |_, _| {});
+            if ms > 40 && ms % 5 == 0 {
+                ring.read(&mut pull, 1.0);
+            }
+        }
+        let st = r.stats;
+        assert_eq!((st.concealed, st.underruns), (0, 0), "{st:?}");
+    }
+
+    #[test]
+    fn the_sound_waits_for_a_slower_picture() {
+        let mut s = AudioSender::new().unwrap();
+        let mut r = AudioReceiver::new().unwrap();
+        r.set_clock_offset(Some(0));
+        r.set_min_target(55_000);
+        let ring = r.ring();
+        let mut pull = [0f32; FRAME_LEN / 2];
+        for ms in 0..5_000u64 {
+            let now = ms * 1_000;
+            if ms % 10 == 0 {
+                let d = s.frame(&tone((ms / 10) as u32), now + 1).unwrap().to_vec();
+                r.push(&d, now);
+            }
+            r.tick(now, |_, _| {});
+            if ms > 40 && ms % 5 == 0 {
+                ring.read(&mut pull, 1.0);
+            }
+        }
+        let st = r.stats;
+        assert!((50..=65).contains(&st.latency_ms), "{st:?}");
+        assert_eq!((st.concealed, st.underruns), (0, 0), "{st:?}");
     }
 
     #[test]

@@ -1429,6 +1429,16 @@ pub unsafe extern "C" fn glass_audio_stats_text(
     copy_str(&crate::audio::describe(&*s), buf, len)
 }
 
+/// Hold at least `us` of sound (20–80 ms), so it isn't ahead of a slower
+/// picture (M4b).
+///
+/// # Safety
+/// `c` from `glass_client_connect`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_client_set_audio_min_target(c: *const Client, us: u64) {
+    (*c).set_audio_min_target(us);
+}
+
 /// What the sound did so far (M4b).
 ///
 /// # Safety

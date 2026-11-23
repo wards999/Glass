@@ -54,6 +54,29 @@ Fixed in m4b-test2:
   | bursts 1.1 % | 10 (0.10 %) | 0 | 45 ms |
   | bursts 3.9 % | 20 (0.20 %) | 7 | 50 ms |
 
+### m4b-test2 (the Mac viewing QUIETPC22, a Steam game, 299 s)
+- **Sound:** 30 ms from capture to the Mac's speakers (the output adds
+  1 ms). The half-second delay is fixed.
+- **Picture:** 53 ms (capture → screen p50), so the sound came **23 ms
+  ahead**.
+  - The PC sent up to 165 fps (75 arrived) to a 60 Hz Mac, which presented
+    37.5 fps, each frame shown for two refreshes, with 32 ms in present.
+  - Its decode queue overflowed 25 times: 39 keyframe requests, and
+    5 hitches averaging 138 ms.
+  - That's M5's "frames at the viewer's refresh", needed now.
+- **Sound glitches:** 45 concealed, 11 gaps, with almost nothing lost (one
+  frame rebuilt, no resends). The never-a-gap rule concealed frames that
+  were only a little late, then dropped them when they came.
+
+Fixed in m4b-test3:
+- A frame is concealed only when it's lost (a newer one is here) or
+  overdue (nothing for 15 ms). A test with frames 8–14 ms late gives no
+  concealment.
+- **A/V sync follows the picture.** Once a second, the Mac viewer sets how
+  much sound to hold so it plays about 5 ms after its picture shows
+  (20–80 ms). A test holding 55 ms gives 50–65 ms latency, with no gaps.
+- losssim: no audio gaps in any loss model; concealed 0.03 % at 5 %.
+
 ## To do
 - Steps 2–4 (ADR 0025), then real numbers: audio latency, A/V offset,
   concealed and gaps on Wi-Fi, with a file copy running.

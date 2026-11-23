@@ -91,6 +91,15 @@ so the backlog stayed for the whole session. Now:
   of) the picture, including the output device's own latency. The Mac's
   overlay shows it live.
 
+## Revised after m4b-test2: sound waits for a slower picture
+- On a Mac showing a 165 Hz game at 60 Hz, the picture took 53 ms and the
+  sound 30 ms, so the sound came early, which is more noticeable than late.
+- The viewer now measures both once a second and holds enough sound (20–80
+  ms) for it to play about 5 ms after its picture.
+- The picture's own delay is M5's to fix (frames at the viewer's refresh).
+- A frame is concealed only when it's lost or 15 ms overdue, never while
+  it's merely late.
+
 ## Steps
 1. Core (this ADR): codec, packets, redundancy, NACK, playout. Done.
 2. Windows host: WASAPI loopback capture → `AudioSender`, on the session's

@@ -1511,6 +1511,8 @@ struct ClientShared {
     /// and what the receiver did.
     audio_ring: Mutex<Option<Arc<crate::audio::PcmRing>>>,
     audio_stats: Mutex<crate::audio::AudioStats>,
+    /// The least sound to hold (µs), so it isn't ahead of the picture.
+    audio_floor: AtomicU64,
     clock_rtt: AtomicU32,
     last_rtt: AtomicU32,
     host_notice: std::sync::atomic::AtomicU8,
@@ -1771,6 +1773,7 @@ impl Client {
             spikes: Mutex::new(Default::default()),
             audio_ring: Mutex::new(None),
             audio_stats: Mutex::new(Default::default()),
+            audio_floor: AtomicU64::new(0),
             clock_rtt: AtomicU32::new(0),
             last_rtt: AtomicU32::new(0),
             host_notice: std::sync::atomic::AtomicU8::new(0),
@@ -1995,6 +1998,12 @@ impl Client {
         lock(&self.shared.audio_ring).clone()
     }
 
+    /// Hold at least `us` of sound (20–80 ms), so it plays with a picture
+    /// that's slower than it (M4b): the viewer measures both.
+    pub fn set_audio_min_target(&self, us: u64) {
+        self.shared.audio_floor.store(us, Ordering::Relaxed);
+    }
+
     /// What the sound did so far (M4b).
     pub fn audio_stats(&self) -> crate::audio::AudioStats {
         *lock(&self.shared.audio_stats)
@@ -2081,6 +2090,7 @@ fn spawn_receiver(
             let now = clock::now_us();
             if let Some(a) = audio.as_mut() {
                 a.set_rtt(sh.last_rtt.load(Ordering::Relaxed));
+                a.set_min_target(sh.audio_floor.load(Ordering::Relaxed));
                 a.set_clock_offset(
                     sh.clock_valid
                         .load(Ordering::Acquire)

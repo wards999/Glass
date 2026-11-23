@@ -179,6 +179,11 @@ public final class GlassClient {
         with(nil) { glass_client_audio_ring($0) }
     }
 
+    /// Hold at least `us` of sound, to wait for a slower picture (M4b).
+    public func setAudioMinTarget(_ us: UInt64) {
+        with(()) { glass_client_set_audio_min_target($0, us) }
+    }
+
     public var audioStats: GLASS_AudioStats {
         with(GLASS_AudioStats()) { glass_client_audio_stats($0) }
     }

@@ -10,6 +10,15 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 4 (twice the refresh, the newest shown late in each refresh)
+The same 3D pool test. Is it at least as smooth as m4b-test2 was?
+1. The PC's results: "frame rate (M5): at most 120 fps, twice the viewer's
+   screen"; "frames sent" up to ~120 while the balls move.
+2. The Mac's results: "presented by: late in each refresh"; "present
+   interval" p50 16.7 ms; "present" and "capture -> screen" lower than
+   m5-test2's 32 and 54 ms.
+3. Sound: "A/V" a few ms behind the picture.
+
 ## M5 test 3 (frames shown as soon as they're decoded)
 The same 3D pool test, windowed and full screen (⌃⌥⌘F).
 1. The Mac's results: "presented by: as decoded", and "present" plus

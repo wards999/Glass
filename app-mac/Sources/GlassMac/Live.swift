@@ -80,12 +80,16 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private var layer: CAMetalLayer!
     private var overlay: NSTextField!
     private var link: CADisplayLink?
-    /// Frames on their way to the screen (main thread). Each is presented
-    /// as soon as it's decoded, up to two at once; more and the newest
-    /// waits (m5-test2: presenting at the display link's tick, just after
-    /// a refresh, cost two refreshes, 32 ms, even with CAMetalDisplayLink).
-    private var inFlight = 0
-    private let presentPath = "as decoded (up to 2 in flight)"
+    /// Each refresh, the newest decoded frame is presented a few ms before
+    /// the next one ([`Self::presentLead`]): every picture is sampled at the
+    /// same point, so motion moves in even steps, and it's shown sooner
+    /// than when presented at the tick just after a refresh (m5-test2:
+    /// 32 ms). Presenting each frame as it was decoded (m5-test3) doesn't
+    /// suit the host sending twice the refresh.
+    private let presentPath = "late in each refresh, the newest frame"
+    /// How long before the next refresh the frame goes (s).
+    private let presentLead = 0.005
+    private var presentScheduled = false
     private var keyMonitor: Any?
     private var finished = false
     private let started = GlassClock.nowUs()
@@ -496,7 +500,6 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                     }
                     guard let pb else { return }
                     if latest != nil { superseded += 1 }
-                    DispatchQueue.main.async { [weak self] in self?.presentNow() }
                     latest = (pb, FrameTiming(captureLocal: capture, lastPacket: meta.last_packet_us,
                                               decodeEnd: t1, inputSeq: meta.input_seq))
                 }
@@ -591,9 +594,16 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     // MARK: main thread
 
     @objc private func tick(_ link: CADisplayLink) {
-        // Presenting happens as frames are decoded (presentNow); the tick
-        // only picks up one that waited for a slot.
-        presentNow()
+        // The newest frame goes a few ms before the next refresh.
+        if !presentScheduled {
+            let wait = link.targetTimestamp - CACurrentMediaTime() - presentLead
+            presentScheduled = true
+            if wait > 0.0005 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in self?.presentNow() }
+            } else {
+                presentNow()
+            }
+        }
         pollCursor()
         tickBar()
         let changes = client.infoChanges
@@ -640,17 +650,17 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         }
     }
 
-    /// Presents the newest decoded frame now if a slot is free (main
-    /// thread): the window manager picks it up at the very next refresh,
-    /// instead of waiting for the tick at the start of one.
-    fileprivate func presentNow() {
-        guard !finished, inFlight < 2 else { return }
+    /// Presents the newest decoded frame, if there's a new one (main
+    /// thread).
+    private func presentNow() {
+        presentScheduled = false
+        guard !finished else { return }
         let item: (CVPixelBuffer, FrameTiming)? = lock.withLock {
             defer { latest = nil }
             return latest
         }
         guard let item else { return }
-        if present(item.0, item.1) { inFlight += 1 }
+        present(item.0, item.1)
     }
 
     @discardableResult
@@ -661,12 +671,6 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         lock.withLock { submittedCount += 1 }
         let client = self.client
         drawable.addPresentedHandler { [weak self] d in
-            // Shown (or dropped): its slot is free; the newest waiting goes.
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.inFlight = max(0, self.inFlight - 1)
-                self.presentNow()
-            }
             guard let self, d.presentedTime > 0 else { return }
             let shown = GlassClock.us(fromMediaTime: d.presentedTime)
             // First frame showing a newer input: input -> screen.

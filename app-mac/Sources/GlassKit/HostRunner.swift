@@ -388,7 +388,7 @@ private final class HostSessionRun {
         out.append(t.send.line("send (packetise)"))
         out.append(t.interval.line("capture interval"))
         out.append("  stale frames skipped (encoder busy or the frame-rate cap, newest frame wins): \(t.stale)")
-        if t.sendHz > 0 { out.append("  frame rate (M5): at most \(t.sendHz) fps, the viewer's screen") }
+        if t.sendHz > 0 { out.append("  frame rate (M5): at most \(t.sendHz) fps, twice the viewer's screen") }
         if !running, !t.psnrY.isEmpty {
             func p50(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
             let good = t.psnrY.filter { $0 >= 45 }.count
@@ -446,7 +446,9 @@ private final class Pipeline {
         converter = chroma444 ? Converter(width: display.width, height: display.height) : nil
         idle = DispatchSource.makeTimerSource(queue: run.q)
         let viewerHz = Int(run.viewerHz)
-        sendHz = viewerHz > 0 ? min(viewerHz, display.fps) : display.fps
+        // Twice the viewer's refresh (exactly it made motion uneven: the
+        // two clocks drift, m5-test1..3), at most this display's.
+        sendHz = viewerHz > 0 ? min(viewerHz * 2, display.fps) : display.fps
         minGapUs = sendHz > 0 && sendHz < display.fps ? UInt64(900_000 / sendHz) : 0
         run.totals.sendHz = sendHz
         run.totals.hardware = encoder.usingHardware

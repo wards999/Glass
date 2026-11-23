@@ -978,14 +978,18 @@ fn run_session<V: ViewerLink>(
     let log = session.counters().map(|_| slog::SessionLog::start("host"));
     let mut next_log = t0 + slog::EVERY_US;
     let mut pending_idr = true;
-    // The frame-rate cap: the viewer's refresh (it says in Hello), never
-    // more than this screen's. 90 % of the interval, so a frame per refresh
-    // always arrives in time for it.
+    // The frame-rate cap: twice the viewer's refresh (it says in Hello),
+    // never more than this screen's. Exactly its refresh (m5-test1..3)
+    // made motion uneven: this PC's clock and the viewer's screen drift
+    // against each other, so some refreshes got a fresh frame and some an
+    // old one. At twice, the viewer always has a fresh one to pick at its
+    // refresh, without the load of everything (165 fps: m4b-test2's full
+    // queue). 90 % of the interval.
     let viewer_hz = session.viewer().refresh_hz as u32;
     let send_hz = if viewer_hz == 0 {
         fps
     } else {
-        viewer_hz.min(fps.max(1))
+        (viewer_hz * 2).min(fps.max(1))
     };
     let min_gap = 900_000 / send_hz.max(1) as u64;
     let mut last_sent = 0u64;
@@ -1223,7 +1227,7 @@ fn host_report<V: ViewerLink>(
         if run.send_hz > 0 {
             let _ = writeln!(
                 r,
-                "  frame rate (M5): at most {} fps, the viewer's screen | {} frames held back (a newer one went instead)",
+                "  frame rate (M5): at most {} fps, twice the viewer's screen | {} frames held back (a newer one went instead)",
                 run.send_hz, run.capped
             );
         }

@@ -10,6 +10,12 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 5 (every refresh shown)
+The same 3D pool test.
+1. The Mac's results: "presented" close to 60 fps (m5-test4: 51.5).
+2. "A/V (M4b)": the sound a few ms behind the picture (m5-test4: 18).
+3. How does it feel against the uncapped m4b-test2?
+
 ## M5 test 4 (twice the refresh, the newest shown late in each refresh)
 The same 3D pool test. Is it at least as smooth as m4b-test2 was?
 1. The PC's results: "frame rate (M5): at most 120 fps, twice the viewer's

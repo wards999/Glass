@@ -89,7 +89,6 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private let presentPath = "late in each refresh, the newest frame"
     /// How long before the next refresh the frame goes (s).
     private let presentLead = 0.005
-    private var presentScheduled = false
     private var keyMonitor: Any?
     private var finished = false
     private let started = GlassClock.nowUs()
@@ -594,15 +593,14 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     // MARK: main thread
 
     @objc private func tick(_ link: CADisplayLink) {
-        // The newest frame goes a few ms before the next refresh.
-        if !presentScheduled {
-            let wait = link.targetTimestamp - CACurrentMediaTime() - presentLead
-            presentScheduled = true
-            if wait > 0.0005 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in self?.presentNow() }
-            } else {
-                presentNow()
-            }
+        // The newest frame goes a few ms before the next refresh. Every
+        // refresh schedules its own (m5-test4: when one ran late, the next
+        // refresh saw it still pending and skipped: 51.5 fps shown of 60).
+        let wait = link.targetTimestamp - CACurrentMediaTime() - presentLead
+        if wait > 0.0005 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in self?.presentNow() }
+        } else {
+            presentNow()
         }
         pollCursor()
         tickBar()
@@ -653,7 +651,6 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     /// Presents the newest decoded frame, if there's a new one (main
     /// thread).
     private func presentNow() {
-        presentScheduled = false
         guard !finished else { return }
         let item: (CVPixelBuffer, FrameTiming)? = lock.withLock {
             defer { latest = nil }

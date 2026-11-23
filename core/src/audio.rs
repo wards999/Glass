@@ -551,9 +551,11 @@ impl AudioReceiver {
         let u = self.ring.underruns();
         if u > self.last_underruns {
             self.last_underruns = u;
-            self.loss_target_us = (self.loss_target_us + 10_000).min(MAX_TARGET_US);
+            // Small steps, quick to come back (m5-test4: 5 concealed and a
+            // gap left 35 ms of margin, keeping the sound 18 ms behind).
+            self.loss_target_us = (self.loss_target_us + 5_000).min(MAX_TARGET_US);
             self.calm_since_us = now_us;
-        } else if now_us.saturating_sub(self.calm_since_us) > 10_000_000 {
+        } else if now_us.saturating_sub(self.calm_since_us) > 5_000_000 {
             self.loss_target_us = self.loss_target_us.saturating_sub(5_000).max(MIN_TARGET_US);
             self.calm_since_us = now_us;
         }
@@ -600,7 +602,7 @@ impl AudioReceiver {
                 // It really didn't come: conceal (Opus fades it in), no
                 // click, and make room so the next burst is covered.
                 self.stats.concealed += 1;
-                self.loss_target_us = (self.loss_target_us + 5_000).min(MAX_TARGET_US);
+                self.loss_target_us = (self.loss_target_us + 2_000).min(MAX_TARGET_US);
                 self.target_us = self.loss_target_us.max(self.sync_floor_us);
                 self.calm_since_us = now_us;
                 self.dec.decode_float(&[], &mut self.pcm, false)

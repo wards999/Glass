@@ -103,6 +103,7 @@ Framing (inside TLS): `u16 length` (type + body) · `u8 type` · body. Max
 | 19 | FileCancel | either | `id u32`: that offer can't be fetched (the files changed or couldn't be read, or something newer was copied). The receiver drops what arrived. |
 | 20 | FileRequest | either | `id u32`: something was pasted here; send what offer `id` stands for (the PNG as a kind-2 ClipChunk with that id, or the files as `FileData`), or `FileCancel` if it's gone. |
 | 22 | ReceiverReport | viewer → host | `expected u32`, `missing u32`: every 0.25 s, the video data packets the viewer expected since the last report, and how many didn't arrive (rebuilt by FEC or not). The host sizes FEC from it (up fast, down slowly). |
+| 23 | VideoRate | viewer → host | `bits_per_s u32`: keep video at or below this (0 = no limit, the host's own setting). From the viewer's delay-based rate control (ADR 0027): sent when it changes by 3 % or more, and again every second. The host never goes above its own bitrate. |
 | 21 | FileRate | viewer → host | `bytes_per_s u32`: how fast file data to the viewer may go. Sent every 0.25 s. The viewer steers it from its picture: the video frames' average network time over the last 0.25 s 4 ms over its quiet baseline, a single frame 30 ms over, a lost frame, late packets, or a round trip 10 ms over its baseline halve it; an average 2 ms over holds it; otherwise it rises by 15 % while a copy is moving (1–60 MB/s). It uses the same speed for its own file data. |
 
 **Offers, not copies.** Pictures and files are sent only when pasted, as Remote Desktop does: the receiver puts a promise on its clipboard (Windows: delayed rendering for pictures, virtual files for files; Mac: lazy pasteboard items), and the request goes when an app asks for the data. Copying without pasting costs a few bytes.
@@ -331,6 +332,7 @@ protocol version, `fp` first 8 bytes of the fingerprint (hex), `ip`, `port`.
 Advisory only: trust comes from the pinned fingerprint, never from discovery.
 
 ## Changelog
+- v14 — M5: `VideoRate` (23), viewer → host: keep video at or below this many bits/s (0 = no limit).
 - v13 — M4b: sound, `"GLAU"` datagrams (Opus, 2 redundant frames) and `"GLNA"` audio NACKs.
 - v12 — M4: keep-awake datagram host → viewer (`"GLKA"`); packet marking (no format change).
 - v11 — M4: NACK datagram (`"GLNK"`), `RESENT` flag (bit 2) on resent video packets.

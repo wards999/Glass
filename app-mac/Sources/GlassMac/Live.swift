@@ -855,6 +855,10 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 }
             }
             out.append("  " + wifi.line())
+            out.append(String(format: "  rate control (M5): %@ | backed off %u times%@",
+                              st.video_limit_bps == 0 ? "no limit now" : String(format: "limit %.1f Mbps now", Double(st.video_limit_bps) / 1e6),
+                              st.video_backoffs,
+                              st.video_lowest_bps > 0 ? String(format: ", lowest %.1f Mbps", Double(st.video_lowest_bps) / 1e6) : ""))
             if !worst.isEmpty {
                 // m5-test4: "the first change still felt off". Totals can't say
                 // when or why; these can.

@@ -182,6 +182,20 @@ impl Encoder {
         self.encode_texture(src, pts_us, force_idr, on_packet)
     }
 
+    /// Changes the bitrate from the next frame (M5 rate control). NVENC
+    /// reconfigures without a keyframe; the 1-frame buffer follows.
+    pub fn set_bitrate(&mut self, bps: i64) {
+        // SAFETY: the context this encoder owns; FFmpeg's NVENC applies the
+        // change at the next frame it's given.
+        unsafe {
+            let fps =
+                (*self.ctx).framerate.num.max(1) as i64 / (*self.ctx).framerate.den.max(1) as i64;
+            (*self.ctx).bit_rate = bps;
+            (*self.ctx).rc_max_rate = bps;
+            (*self.ctx).rc_buffer_size = (bps / fps.max(1)) as i32;
+        }
+    }
+
     /// Keeps `src` as the last frame without encoding it (a GPU copy): the
     /// frame-rate cap holds the newest frame until it's time to send one.
     pub fn keep(&mut self, src: &ID3D11Texture2D) {

@@ -38,6 +38,8 @@ pub enum ToHelper {
     InputSeq(u32),
     /// The viewer left: stop, put the screen back, send the results.
     Stop,
+    /// The viewer's video limit (bits/s, 0 = none), M5 rate control.
+    Bitrate(u32),
 }
 
 /// Helper → broker. Borrowed from the read buffer.
@@ -75,6 +77,7 @@ const SET_MODE: u8 = 3;
 const INPUT: u8 = 4;
 const INPUT_SEQ: u8 = 5;
 const STOP: u8 = 6;
+const BITRATE: u8 = 8;
 /// Broker → clipboard helper: a clipboard control message from the viewer.
 pub const CLIP_TO_HELPER: u8 = 7;
 
@@ -174,6 +177,10 @@ impl ToHelper {
                 out.extend_from_slice(&s.to_le_bytes());
             }
             ToHelper::Stop => begin(out, STOP),
+            ToHelper::Bitrate(b) => {
+                begin(out, BITRATE);
+                out.extend_from_slice(&b.to_le_bytes());
+            }
         }
         finish(out);
     }
@@ -218,6 +225,7 @@ impl ToHelper {
             }),
             INPUT_SEQ => ToHelper::InputSeq(b.u32()?),
             STOP => ToHelper::Stop,
+            BITRATE => ToHelper::Bitrate(b.u32()?),
             _ => return None,
         })
     }
@@ -396,6 +404,7 @@ mod tests {
             }),
             ToHelper::Input(InputAction::Scroll { dy: -120, dx: 7 }),
             ToHelper::InputSeq(u32::MAX),
+            ToHelper::Bitrate(17_000_000),
             ToHelper::Stop,
         ];
         let mut out = Vec::new();

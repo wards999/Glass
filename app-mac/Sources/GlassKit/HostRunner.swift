@@ -143,6 +143,8 @@ private final class Totals {
     var hardware = true, lowLatency = false
     /// The frame-rate cap: the viewer's refresh, at most this display's.
     var sendHz = 0
+    /// Rate control (M5): the bitrate now, the lowest set, changes.
+    var rateNow = 0, rateLow = 0, rateChanges = 0
 }
 
 /// One viewer's session: view modes, the pipeline, the report.
@@ -322,6 +324,17 @@ private final class HostSessionRun {
             if !q.sync(execute: { s.connected }) { break }
             if let f = failLock.withLock({ failure }) { reason = f; break }
             if let deadline, GlassClock.nowUs() >= deadline { reason = "--seconds elapsed"; break }
+            // Rate control (M5): the viewer's limit, never above ours.
+            if let limit = q.sync(execute: { s.takeVideoRate() }) {
+                let ours = runner.options.mbps * 1_000_000
+                let bps = limit == 0 ? ours : min(Int(limit), ours)
+                if bps != totals.rateNow {
+                    q.async { [self] in pipeline?.encoder.setBitrate(bps) }
+                    totals.rateChanges += 1
+                    totals.rateNow = bps
+                    totals.rateLow = totals.rateLow == 0 ? bps : min(totals.rateLow, bps)
+                }
+            }
             if let req = q.sync(execute: { s.takeModeRequest() }) {
                 configure(mode: req.mode, allow444: req.allow444)
             }
@@ -393,6 +406,13 @@ private final class HostSessionRun {
         out.append(t.interval.line("capture interval"))
         out.append("  stale frames skipped (encoder busy or the frame-rate cap, newest frame wins): \(t.stale)")
         if t.sendHz > 0 { out.append("  frame rate (M5): at most \(t.sendHz) fps, twice the viewer's screen") }
+        let ours = runner.options.mbps * 1_000_000
+        let limited = t.rateChanges > 0 && t.rateNow != ours
+        out.append(String(format: "  rate control (M5): bitrate %@ | %ld changes%@",
+                          limited ? String(format: "%.1f Mbps now, the viewer's limit", Double(t.rateNow) / 1e6)
+                                  : "\(o.mbps) Mbps (no limit from the viewer)",
+                          t.rateChanges,
+                          t.rateLow > 0 && t.rateLow < ours ? String(format: ", lowest %.1f Mbps", Double(t.rateLow) / 1e6) : ""))
         if !running, !t.psnrY.isEmpty {
             func p50(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
             let good = t.psnrY.filter { $0 >= 45 }.count

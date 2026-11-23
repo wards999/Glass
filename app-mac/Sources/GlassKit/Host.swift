@@ -241,6 +241,14 @@ public final class GlassHostSession {
 
     public var clipProgress: GLASS_ClipProgress { ptr.map { glass_session_clip_progress($0) } ?? GLASS_ClipProgress() }
 
+    /// The viewer's latest video limit (M5): nil nothing new, 0 no limit,
+    /// else bits/s.
+    public func takeVideoRate() -> Int64? {
+        guard let ptr else { return nil }
+        let v = glass_session_take_video_rate(ptr)
+        return v < 0 ? nil : v
+    }
+
     /// Text from the viewer, once.
     public func takeClipboard() -> ClipboardSync.Item? {
         guard let ptr, let h = glass_session_take_clipboard(ptr) else { return nil }

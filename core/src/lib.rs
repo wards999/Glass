@@ -19,6 +19,7 @@ pub mod packet;
 pub mod pairing;
 pub mod protocol;
 pub mod qos;
+pub mod ratecontrol;
 pub mod recording;
 pub mod replay;
 pub mod seal;

@@ -402,6 +402,9 @@ struct HostShared {
     pace_total: AtomicU64,
     pace_max: AtomicU64,
     hurried: AtomicU64,
+    /// The viewer's video limit (bits/s + 1, so 0 = nothing new; 1 = no
+    /// limit), taken by the encoder (M5 rate control).
+    video_rate: AtomicU64,
 }
 
 /// Sends the host's sound to the viewer, from the capture thread (M4b).
@@ -689,6 +692,7 @@ impl HostListener {
             pace_total: AtomicU64::new(0),
             pace_max: AtomicU64::new(0),
             hurried: AtomicU64::new(0),
+            video_rate: AtomicU64::new(0),
         });
         let mut threads = Vec::new();
         let tx = Arc::new(Mutex::new(VideoTx {
@@ -819,6 +823,10 @@ impl HostListener {
                         Message::Control(Control::SetMode { mode, allow_444 }) => {
                             let v = 1 << 16 | (allow_444 as u32) << 8 | mode as u32;
                             sh.mode_req.store(v, Ordering::Relaxed);
+                        }
+                        Message::Control(Control::VideoRate { bits_per_s }) => {
+                            sh.video_rate
+                                .store(bits_per_s as u64 + 1, Ordering::Relaxed);
                         }
                         Message::Clip(_)
                         | Message::FileData(_)
@@ -1220,6 +1228,16 @@ impl HostSession {
         Box::new(move |f: &[u8]| is_clip_frame(f) && out.write_all(f).is_ok())
     }
 
+    /// The viewer's latest video limit, once each time it sends one (M5):
+    /// `Some(0)` no limit, `Some(bits_per_s)`. The encoder applies it,
+    /// never above its own setting.
+    pub fn take_video_rate(&self) -> Option<u32> {
+        match self.shared.video_rate.swap(0, Ordering::Relaxed) {
+            0 => None,
+            v => Some((v - 1) as u32),
+        }
+    }
+
     /// For the sound capture thread (M4b).
     pub fn audio_out(&self) -> AudioOut {
         AudioOut {
@@ -1449,6 +1467,11 @@ pub struct ClientStats {
     /// Input marking (`qos::QOS_*`) and keep-awakes sent (M4 step 4).
     pub qos: u32,
     pub keepalives: u64,
+    /// Rate control (M5): the video limit now (bits/s, 0 = none), times it
+    /// backed off, and the lowest limit set.
+    pub video_limit_bps: u32,
+    pub video_backoffs: u32,
+    pub video_lowest_bps: u32,
 }
 
 /// The host's pointer as last reported. `generation` changes on every update.
@@ -1605,6 +1628,13 @@ struct ClientShared {
     frame_n: AtomicU32,
     /// Wi-Fi spikes so far (M4 step 5), published about once a second.
     spikes: Mutex<crate::spikes::SpikeSummary>,
+    /// First-packet network time of the frames since the rate controller
+    /// last looked (µs, sum and count), and its state (M5).
+    rate_sum: AtomicU64,
+    rate_n: AtomicU32,
+    video_limit: AtomicU32,
+    video_backoffs: AtomicU32,
+    video_lowest: AtomicU32,
     /// Sound (M4b): the ring the output device reads, once sound comes,
     /// and what the receiver did.
     audio_ring: Mutex<Option<Arc<crate::audio::PcmRing>>>,
@@ -1869,6 +1899,11 @@ impl Client {
             frame_sum: AtomicU64::new(0),
             frame_n: AtomicU32::new(0),
             spikes: Mutex::new(Default::default()),
+            rate_sum: AtomicU64::new(0),
+            rate_n: AtomicU32::new(0),
+            video_limit: AtomicU32::new(0),
+            video_backoffs: AtomicU32::new(0),
+            video_lowest: AtomicU32::new(0),
             audio_ring: Mutex::new(None),
             audio_stats: Mutex::new(Default::default()),
             audio_floor: AtomicU64::new(0),
@@ -2087,6 +2122,9 @@ impl Client {
             crypto_replayed: sh.crypto_replayed.load(Ordering::Relaxed),
             qos,
             keepalives,
+            video_limit_bps: sh.video_limit.load(Ordering::Relaxed),
+            video_backoffs: sh.video_backoffs.load(Ordering::Relaxed),
+            video_lowest_bps: sh.video_lowest.load(Ordering::Relaxed),
         }
     }
 
@@ -2230,6 +2268,8 @@ fn spawn_receiver(
                     // doesn't stretch.
                     let d1 = f.first_packet_us.saturating_sub(sent).min(u32::MAX as u64) as u32;
                     spikes.feed(f.first_packet_us, d1);
+                    sh.rate_sum.fetch_add(d1 as u64, Ordering::Relaxed);
+                    sh.rate_n.fetch_add(1, Ordering::Relaxed);
                     if f.first_packet_us.saturating_sub(spikes_published) >= 1_000_000 {
                         if let Ok(mut s) = sh.spikes.try_lock() {
                             *s = spikes.summary();
@@ -2288,6 +2328,9 @@ fn spawn_control(
         let mut seq = 0u32;
         let mut last_ping = 0u64;
         let mut file_rate = crate::clipboard::RateControl::default();
+        let mut video_rate = crate::ratecontrol::VideoRateControl::default();
+        let mut last_vrate = 0u64;
+        let mut vrate_bytes = 0u64;
         let mut last_rate = 0u64;
         let mut last_report = (0u64, 0u64);
         let mut last_kf = 0u64;
@@ -2311,6 +2354,25 @@ fn spawn_control(
                     client_ts: clock::now_us(),
                 };
                 ok &= send_control(&out, ping).is_ok();
+            }
+            // Video rate control (M5): back off as soon as a queue builds.
+            if now.saturating_sub(last_vrate) >= crate::ratecontrol::TICK_US {
+                let dt = now.saturating_sub(last_vrate).max(1) as f64 / 1e6;
+                last_vrate = now;
+                let st = sh.rx.load();
+                let sum = sh.rate_sum.swap(0, Ordering::Relaxed);
+                let n = sh.rate_n.swap(0, Ordering::Relaxed);
+                let bps = st.bytes.saturating_sub(vrate_bytes) as f64 * 8.0 / dt;
+                vrate_bytes = st.bytes;
+                let delay = (n > 0).then(|| (sum / n as u64).min(u32::MAX as u64) as u32);
+                if let Some(limit) = video_rate.tick(now, delay, st.frames_lost + st.late, bps) {
+                    ok &= send_control(&out, Control::VideoRate { bits_per_s: limit }).is_ok();
+                }
+                sh.video_limit.store(video_rate.limit(), Ordering::Relaxed);
+                sh.video_backoffs
+                    .store(video_rate.backoffs, Ordering::Relaxed);
+                sh.video_lowest
+                    .store(video_rate.lowest_bps, Ordering::Relaxed);
             }
             // File speed, both ways, from how the picture is doing.
             if now.saturating_sub(last_rate) >= crate::clipboard::RATE_TICK_US {

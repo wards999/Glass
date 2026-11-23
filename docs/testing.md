@@ -10,6 +10,19 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 9 (rate control)
+Protocol v14: update all three machines, and the service on QUIETPC.
+1. The 3D pool test as before. On this link, "rate control (M5)" should
+   say "no limit now" on the Mac and "no limit from the viewer" on the PC,
+   or at most a few brief backoffs.
+2. Then make the link worse:
+   - start a big file copy, or a download on another machine;
+   - or take the Mac further from the router.
+   The picture should stay smooth and quick, perhaps a little softer. The
+   Mac's line shows the limit and how often it backed off, and the PC's
+   the bitrate it was set to.
+3. Send both results.
+
 ## M5 test 8 (no false NACKs)
 As M5 test 7. The Mac's "NACK:" line should show few asks (m5-test7: 1,142,
 none needed) and "dup" in the hundreds, not tens of thousands. The PC's

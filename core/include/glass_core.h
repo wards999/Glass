@@ -307,7 +307,7 @@
  * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
  * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 13
+#define GLASS_PROTOCOL_VERSION 14
 
 /**
  * Most "seen by" ids a `Hello` carries (no-loop rule).
@@ -504,6 +504,36 @@
 #define GLASS_QOS_MARKED 1
 
 #define GLASS_QOS_REFUSED 2
+
+/**
+ * How often the controller runs (µs).
+ */
+#define GLASS_TICK_US 100000
+
+/**
+ * Average first-packet time this far over the baseline: back off (µs).
+ */
+#define GLASS_CONGESTED_US 15000
+
+/**
+ * This far over: hold (µs).
+ */
+#define GLASS_WORRIED_US 6000
+
+/**
+ * After backing off, no ramp-up for this long (µs).
+ */
+#define GLASS_HOLD_US 500000
+
+/**
+ * Never below this: text and fine detail go soft (bits/s).
+ */
+#define GLASS_MIN_BPS 8e6
+
+/**
+ * At or above this it's no limit (bits/s).
+ */
+#define GLASS_MAX_BPS 200e6
 
 #define GLASS_FORMAT_VERSION 1
 
@@ -913,6 +943,13 @@ typedef struct {
    */
   uint32_t qos;
   uint64_t keepalives;
+  /**
+   * Rate control (M5): the video limit now (bits/s, 0 = none), times it
+   * backed off, and the lowest limit set.
+   */
+  uint32_t video_limit_bps;
+  uint32_t video_backoffs;
+  uint32_t video_lowest_bps;
 } GLASS_ClientStats;
 
 /**
@@ -1891,6 +1928,15 @@ void glass_audio_ring_free(const GLASS_PcmRing *ring);
  * `s` valid; `buf` valid for `len` bytes (or null).
  */
 size_t glass_audio_stats_text(const GLASS_AudioStats *s, char *buf, size_t len);
+
+/**
+ * The viewer's latest video limit (M5 rate control), once each time it
+ * sends one: -1 nothing new, 0 no limit, else bits/s.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+int64_t glass_session_take_video_rate(const GLASS_HostSession *s);
 
 /**
  * Hold at least `us` of sound (20–80 ms), so it isn't ahead of a slower

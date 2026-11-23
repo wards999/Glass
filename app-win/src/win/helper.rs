@@ -31,6 +31,8 @@ struct FromBroker {
     gone: AtomicBool,
     keyframe: AtomicBool,
     mode: Mutex<Option<(u8, bool)>>,
+    /// The viewer's video limit, bits/s + 1 (0 = nothing new), M5.
+    video_rate: std::sync::atomic::AtomicU64,
     input_seq: AtomicU32,
     sink: Mutex<Option<InputSink>>,
 }
@@ -49,6 +51,7 @@ fn read_broker(mut rx: File, st: Arc<FromBroker>) {
                 *lock(&st.mode) = Some((mode, allow_444))
             }
             Some(ToHelper::InputSeq(s)) => st.input_seq.store(s, Ordering::Relaxed),
+            Some(ToHelper::Bitrate(b)) => st.video_rate.store(b as u64 + 1, Ordering::Relaxed),
             Some(ToHelper::Input(a)) => {
                 if let Some(sink) = lock(&st.sink).as_mut() {
                     sink(a);
@@ -94,6 +97,12 @@ impl ViewerLink for PipeViewer {
     }
     fn take_mode_request(&self) -> Option<(u8, bool)> {
         lock(&self.st.mode).take()
+    }
+    fn take_video_rate(&self) -> Option<u32> {
+        match self.st.video_rate.swap(0, Ordering::Relaxed) {
+            0 => None,
+            v => Some((v - 1) as u32),
+        }
     }
     fn send_stream_change(&mut self, info: StreamInfo) -> std::io::Result<()> {
         self.send(ToBroker::StreamChange(info))

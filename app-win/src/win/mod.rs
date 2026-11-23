@@ -369,6 +369,11 @@ struct HostRun {
     /// Worst moments (M5): the longest pauses in capture while the picture
     /// was moving (µs into the session, gap), and the biggest frames (µs,
     /// bytes, encode µs, keyframe). Longest / biggest first.
+    /// Rate control (M5): the encoder's bitrate now, the lowest set, and
+    /// how many changes (0 = none yet: our own setting).
+    rate_now: i64,
+    rate_lo: i64,
+    rate_changes: u32,
     t0: u64,
     last_capture: u64,
     last_gap: u64,
@@ -454,6 +459,9 @@ impl HostRun {
             skipped: 0,
             capped: 0,
             send_hz: 0,
+            rate_now: 0,
+            rate_lo: 0,
+            rate_changes: 0,
             t0: clock::now_us(),
             last_capture: 0,
             last_gap: u64::MAX,
@@ -577,6 +585,9 @@ pub(crate) trait ViewerLink {
     fn streaming(&self) -> bool;
     fn take_keyframe_request(&self) -> bool;
     fn take_mode_request(&self) -> Option<(u8, bool)>;
+    /// The viewer's video limit (bits/s, 0 = none), once each time it
+    /// sends one (M5 rate control).
+    fn take_video_rate(&self) -> Option<u32>;
     fn send_stream_change(&mut self, info: StreamInfo) -> std::io::Result<()>;
     fn input_seq(&self) -> u32;
     fn send_frame(&mut self, f: &OutFrame, data: &[u8]) -> std::io::Result<bool>;
@@ -610,6 +621,9 @@ impl ViewerLink for HostSession {
     }
     fn take_mode_request(&self) -> Option<(u8, bool)> {
         HostSession::take_mode_request(self)
+    }
+    fn take_video_rate(&self) -> Option<u32> {
+        HostSession::take_video_rate(self)
     }
     fn send_stream_change(&mut self, info: StreamInfo) -> std::io::Result<()> {
         HostSession::send_stream_change(self, info)
@@ -1112,6 +1126,25 @@ fn run_session<V: ViewerLink>(
             }
         }
         pending_idr |= session.take_keyframe_request();
+        // Rate control (M5): the viewer's limit, never above ours.
+        if let Some(limit) = session.take_video_rate() {
+            let ours = a.mbps as i64 * 1_000_000;
+            let bps = if limit == 0 {
+                ours
+            } else {
+                (limit as i64).min(ours)
+            };
+            if bps != run.rate_now {
+                enc.set_bitrate(bps);
+                run.rate_changes += 1;
+                run.rate_now = bps;
+                run.rate_lo = if run.rate_lo == 0 {
+                    bps
+                } else {
+                    run.rate_lo.min(bps)
+                };
+            }
+        }
         // The viewer switched colour (4:2:0 <-> 4:4:4); view modes need a
         // virtual display, which a PC host doesn't have yet (M7).
         if let Some((_mode, allow)) = session.take_mode_request() {
@@ -1305,6 +1338,27 @@ fn host_report<V: ViewerLink>(
         if let Some(m) = run.moments_line() {
             let _ = writeln!(r, "{m}");
         }
+        let _ = writeln!(
+            r,
+            "  rate control (M5): bitrate {} | {} changes{}",
+            if run.rate_changes == 0 || run.rate_now == (a.mbps as i64 * 1_000_000) {
+                format!(
+                    "{:.0} Mbps (no limit from the viewer)",
+                    (a.mbps as i64 * 1_000_000) as f64 / 1e6
+                )
+            } else {
+                format!(
+                    "{:.1} Mbps now, the viewer's limit",
+                    run.rate_now as f64 / 1e6
+                )
+            },
+            run.rate_changes,
+            if run.rate_lo > 0 && run.rate_lo < (a.mbps as i64 * 1_000_000) {
+                format!(", lowest {:.1} Mbps", run.rate_lo as f64 / 1e6)
+            } else {
+                String::new()
+            }
+        );
         if run.send_hz > 0 {
             let _ = writeln!(
                 r,

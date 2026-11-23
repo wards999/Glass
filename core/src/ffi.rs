@@ -1429,6 +1429,16 @@ pub unsafe extern "C" fn glass_audio_stats_text(
     copy_str(&crate::audio::describe(&*s), buf, len)
 }
 
+/// The viewer's latest video limit (M5 rate control), once each time it
+/// sends one: -1 nothing new, 0 no limit, else bits/s.
+///
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_take_video_rate(s: *const HostSession) -> i64 {
+    (*s).take_video_rate().map_or(-1, |b| b as i64)
+}
+
 /// Hold at least `us` of sound (20–80 ms), so it isn't ahead of a slower
 /// picture (M4b).
 ///

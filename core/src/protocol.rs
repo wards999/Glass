@@ -9,7 +9,7 @@
 /// announces new stream parameters mid-session (`StreamChange`).
 /// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
 /// datagrams. v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 13;
+pub const PROTOCOL_VERSION: u8 = 14;
 
 /// Most "seen by" ids a `Hello` carries (no-loop rule).
 pub const MAX_SEEN_BY: usize = 8;
@@ -421,6 +421,12 @@ pub enum Control {
         expected: u32,
         missing: u32,
     },
+    /// Client -> host (M5 rate control): keep video at or below this many
+    /// bits/s (0 = no limit: the host's own setting). Sent when it changes,
+    /// and again every second.
+    VideoRate {
+        bits_per_s: u32,
+    },
 }
 
 /// Largest encoded control message (including the 2-byte length).
@@ -449,6 +455,7 @@ impl Control {
             Control::SetMode { .. } => 15,
             Control::StreamChange { .. } => 16,
             Control::ReceiverReport { .. } => 22,
+            Control::VideoRate { .. } => 23,
         }
     }
 
@@ -485,6 +492,7 @@ impl Control {
                 put(&expected.to_be_bytes());
                 put(&missing.to_be_bytes());
             }
+            Control::VideoRate { bits_per_s } => put(&bits_per_s.to_be_bytes()),
             Control::StreamChange { info } => {
                 put(&[info.codec, info.chroma, info.mode, 0]);
                 put(&info.width.to_be_bytes());
@@ -572,6 +580,7 @@ impl Control {
             15 => 2,
             16 => 10,
             22 => 8,
+            23 => 4,
             _ => return Err(ControlError::Malformed),
         };
         if b.len() != want {
@@ -623,6 +632,9 @@ impl Control {
             22 => Control::ReceiverReport {
                 expected: u32_at(0),
                 missing: u32_at(4),
+            },
+            23 => Control::VideoRate {
+                bits_per_s: u32_at(0),
             },
             _ => Control::Bye,
         };
@@ -924,6 +936,9 @@ mod tests {
             Control::ReceiverReport {
                 expected: 1234,
                 missing: 56,
+            },
+            Control::VideoRate {
+                bits_per_s: 42_000_000,
             },
             Control::StreamChange {
                 info: StreamInfo {

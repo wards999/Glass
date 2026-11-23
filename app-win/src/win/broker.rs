@@ -403,6 +403,9 @@ pub fn run(
             if let Some((mode, allow_444)) = session.take_mode_request() {
                 send(&screen_out, &ToHelper::SetMode { mode, allow_444 });
             }
+            if let Some(b) = session.take_video_rate() {
+                send(&screen_out, &ToHelper::Bitrate(b));
+            }
             let now = session.input_seq();
             if now != seq {
                 seq = now;

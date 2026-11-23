@@ -37,6 +37,15 @@ public final class HEVCEncoder {
     /// (1 = 4:2:0, 3 = 4:4:4).
     public private(set) var producedChroma: Int?
     private var session: VTCompressionSession?
+
+    /// Changes the bitrate from the next frame (M5 rate control): the
+    /// average, and the 1.5x-per-second cap with it. No keyframe needed.
+    public func setBitrate(_ bps: Int) {
+        guard let session else { return }
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: bps))
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
+                             value: [NSNumber(value: bps * 3 / 16), NSNumber(value: 1)] as CFArray)
+    }
     private var out: UnsafeMutableRawPointer
     private var outCap: Int
     private var sample: UnsafeMutableRawPointer

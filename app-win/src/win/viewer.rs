@@ -620,6 +620,21 @@ fn session_report(sh: &Shared, r: &Report, head: &ReportHead, reason: &str) -> S
         glass_core::spikes::describe(&sh.client.spikes())
     );
     let _ = writeln!(out, "  {}", sh.wifi.line());
+    let _ = writeln!(
+        out,
+        "  rate control (M5): {} | backed off {} times{}",
+        if st.video_limit_bps == 0 {
+            "no limit now".to_string()
+        } else {
+            format!("limit {:.1} Mbps now", st.video_limit_bps as f64 / 1e6)
+        },
+        st.video_backoffs,
+        if st.video_lowest_bps > 0 {
+            format!(", lowest {:.1} Mbps", st.video_lowest_bps as f64 / 1e6)
+        } else {
+            String::new()
+        }
+    );
     // LATER(M4b step 3): played on Windows too.
     let _ = writeln!(
         out,

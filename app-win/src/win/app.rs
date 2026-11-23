@@ -182,6 +182,9 @@ struct GlassApp {
     /// This window runs in a Remote Desktop session.
     remote: bool,
     notice: Option<(String, Instant)>,
+    /// The last session's results (also saved next to Glass.exe), for
+    /// Settings > Session results.
+    last_report: Option<String>,
     sharing: Option<Arc<AtomicBool>>,
     /// Ends the current shared session (sharing goes on).
     end_session: Arc<AtomicBool>,
@@ -264,6 +267,7 @@ pub fn run(share: bool) -> Res<()> {
                 svc_build: super::service::installed_build(),
                 remote: super::service::in_remote_session(),
                 notice: None,
+                last_report: None,
                 sharing: None,
                 end_session: Arc::new(AtomicBool::new(false)),
                 share_status: String::new(),
@@ -552,6 +556,29 @@ fn save_report(file: &str, report: &str) {
 // ---------------------------------------------------------------- behaviour
 
 impl GlassApp {
+    /// What Settings > Session results shows: this app's last session, and
+    /// the service's (on a PC with the service).
+    fn results_text(&self) -> String {
+        let mut t = self.last_report.clone().unwrap_or_default();
+        if self.svc != super::service::State::NotInstalled {
+            let svc = std::fs::read_to_string(super::service::data_dir().join("agent-results.txt"))
+                .unwrap_or_default();
+            // The last session: from its last banner line on.
+            if let Some(i) = svc.rfind("Glass (Windows)") {
+                if !t.is_empty() {
+                    t.push_str("\n\n");
+                }
+                t.push_str("The Glass service's last session:\n");
+                t.push_str(svc[i..].trim_end());
+            }
+        }
+        if t.is_empty() {
+            "No session yet since Glass started.".into()
+        } else {
+            t
+        }
+    }
+
     /// The installed service's build when it differs from this app's
     /// (`None`: no service, or it matches).
     fn svc_out_of_date(&self) -> Option<String> {
@@ -762,13 +789,14 @@ impl GlassApp {
                 show(ctx);
             }
             Msg::Report(r) => {
+                // No pop-up: they're saved, and one click away in Settings.
                 self.connecting = None;
                 self.viewing = None;
                 self.notice = Some((
-                    "Session ended. Results are saved next to Glass.exe.".into(),
+                    "Session ended. Its results: Settings \u{203A} Session results.".into(),
                     Instant::now(),
                 ));
-                self.dialog = Dialog::Report(r, false);
+                self.last_report = Some(r);
                 show(ctx);
             }
             Msg::Reconnecting => {
@@ -1984,6 +2012,7 @@ impl GlassApp {
                 let mut s = self.settings.clone();
                 let peers: Vec<Peer> = self.device.peers();
                 let mut forget = None;
+                let mut open_results = false;
                 // A panel under the gear (like the Mac's popover), not a
                 // modal: a click outside it or Esc closes it.
                 let anchor = self.gear_rect;
@@ -2120,6 +2149,17 @@ impl GlassApp {
                     });
                     ui.add_space(10.0);
 
+                    section(ui, "Session results", p);
+                    ui.label(
+                        RichText::new("Numbers from the last session (also saved next to Glass.exe, and by the service in C:\\ProgramData\\Glass\\agent-results.txt).")
+                            .size(12.5)
+                            .color(p.weak),
+                    );
+                    if ui.add(plain_button("Last session\u{2019}s results \u{2026}", p)).clicked() {
+                        open_results = true;
+                    }
+                    ui.add_space(10.0);
+
                     section(ui, "Paired devices", p);
                     if peers.is_empty() {
                         ui.label(RichText::new("None yet.").color(p.weak));
@@ -2186,6 +2226,10 @@ impl GlassApp {
                 if let Some(fp) = forget {
                     let _ = self.device.forget(&fp);
                     self.scan();
+                }
+                if open_results {
+                    self.dialog = Dialog::Report(self.results_text(), false);
+                    return;
                 }
             }
         }

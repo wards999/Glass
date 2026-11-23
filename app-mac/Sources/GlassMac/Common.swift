@@ -89,11 +89,34 @@ final class MetalView: NSView {
     override func menu(for event: NSEvent) -> NSMenu? { nil }
 }
 
+/// The last session's results (viewing or sharing), for Settings > Session
+/// results; each is also appended to
+/// ~/Library/Application Support/Glass/results.txt.
+var lastSessionResults: String?
+
+/// Keeps a finished session's results without a pop-up: they're one click
+/// away in Settings.
+func recordResults(_ text: String) {
+    lastSessionResults = text
+    let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Glass", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let file = dir.appendingPathComponent("results.txt")
+    let data = Data((text + "\n\n").utf8)
+    if let h = try? FileHandle(forWritingTo: file) {
+        h.seekToEndOfFile()
+        h.write(data)
+        try? h.close()
+    } else {
+        try? data.write(to: file)
+    }
+}
+
 /// Shows results in a selectable monospace text view with a Copy button.
 func showResults(_ text: String) {
     let alert = NSAlert()
-    alert.messageText = "Glass test results"
-    alert.informativeText = "Copy these and paste them back to Claude."
+    alert.messageText = "Session results"
+    alert.informativeText = "The last session's numbers (also saved in ~/Library/Application Support/Glass/results.txt)."
     let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 820, height: 340))
     scroll.hasVerticalScroller = true
     let tv = NSTextView(frame: scroll.bounds)

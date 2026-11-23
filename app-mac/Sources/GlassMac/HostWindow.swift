@@ -186,11 +186,8 @@ final class HostController: NSObject {
             }
             r.onSessionEnd = { [weak self] report in
                 print(report)
-                // Switched off during a session: show the results on their own.
-                guard let self, !self.stopped else {
-                    showResults(report)
-                    return
-                }
+                recordResults(report)
+                guard let self, !self.stopped else { return }
                 self.lastReport = report
                 self.resultsButton.isEnabled = true
                 self.streamLabel.isHidden = true

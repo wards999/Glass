@@ -355,6 +355,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let clipNote = NSTextField(wrappingLabelWithString: "Shared: text, pictures and files copied on one computer can be pasted on the other, both ways, while a session is on. Pictures and files are sent only when you paste them. Changes apply from the next session.")
         clipNote.font = .systemFont(ofSize: 11)
         clipNote.textColor = .secondaryLabelColor
+        let resultsButton = NSButton(title: "Last session\u{2019}s results\u{2026}", target: self,
+                                     action: #selector(showLastResults))
+        resultsButton.bezelStyle = .rounded
         // A visible way out (Esc and a click outside work too).
         let closeX = NSButton(image: NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "Close") ?? NSImage(),
                               target: self, action: #selector(closeSettingsTapped))
@@ -365,7 +368,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         var views: [NSView] = [titleRow, heading("Appearance"), theme,
                                heading("When viewing, start in"), radios,
                                heading("Colour"), colour, note,
-                               heading("Clipboard"), clipboard, clipNote, heading("Paired devices")]
+                               heading("Clipboard"), clipboard, clipNote,
+                               heading("Session results"), resultsButton, heading("Paired devices")]
         let peers = GlassDevice.shared?.peers ?? []
         if peers.isEmpty {
             let none = NSTextField(labelWithString: "None yet.")
@@ -429,6 +433,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     @objc private func pickColour(_ sender: NSSegmentedControl) {
         UserDefaults.standard.set(sender.selectedSegment == 1, forKey: "fullColour")
+    }
+
+    @objc private func showLastResults() {
+        closeSettings()
+        showResults(lastSessionResults ?? "No session yet since Glass started.")
     }
 
     @objc private func pickClipboard(_ sender: NSSegmentedControl) {
@@ -816,7 +825,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 } else {
                     self.viewingHost = nil
                     self.showConnect()
-                    showResults(self.droppedReports + "(couldn\u{2019}t reconnect within 15 s)")
+                    recordResults(self.droppedReports + "(couldn\u{2019}t reconnect within 15 s)")
                     self.droppedReports = ""
                 }
             }
@@ -938,7 +947,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 }
                 self.viewingHost = nil
                 self.showConnect()
-                showResults(self.droppedReports + report)
+                recordResults(self.droppedReports + report)
                 self.droppedReports = ""
             }
             viewer = v

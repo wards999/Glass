@@ -53,12 +53,21 @@ pub fn modes(device: &str) -> Vec<Mode> {
 }
 
 pub fn current(device: &str) -> Option<Mode> {
+    settings(device, ENUM_CURRENT_SETTINGS)
+}
+
+/// The mode saved for this screen (what `restore` goes back to).
+pub fn saved(device: &str) -> Option<Mode> {
+    settings(device, ENUM_DISPLAY_SETTINGS_MODE(u32::MAX - 1)) // ENUM_REGISTRY_SETTINGS
+}
+
+fn settings(device: &str, which: ENUM_DISPLAY_SETTINGS_MODE) -> Option<Mode> {
     let d = wide(device);
     let mut dm = DEVMODEW {
         dmSize: std::mem::size_of::<DEVMODEW>() as u16,
         ..Default::default()
     };
-    unsafe { EnumDisplaySettingsW(PCWSTR(d.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm) }
+    unsafe { EnumDisplaySettingsW(PCWSTR(d.as_ptr()), which, &mut dm) }
         .as_bool()
         .then_some(Mode {
             width: dm.dmPelsWidth,

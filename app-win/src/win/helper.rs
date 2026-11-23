@@ -206,6 +206,12 @@ pub fn screen(args: &[String]) -> Res<()> {
             &|l| println!("{l}"),
         );
         *lock(&st.sink) = None;
+        // A helper killed mid-session (a session switch) couldn't put the
+        // screen back, and the one after it didn't change it: whoever ends
+        // the session puts it back.
+        if a.match_res && display::current(&mon.name) != display::saved(&mon.name) {
+            display::restore(&mon.name);
+        }
         match body {
             Ok(report) => {
                 let _ = out.send(ToBroker::Report(&report));

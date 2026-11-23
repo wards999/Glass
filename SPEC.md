@@ -621,7 +621,8 @@ speakers while it's viewed.
    Then `docs/results/M4.md` is closed.
 2. **M4b – Audio**, steps 3 and 4 (above).
 3. **M5 – Smoothness**, tuned with sound playing:
-   - **Frames at the viewer's refresh.** The host captures and encodes at
+   - **Frames at the viewer's refresh** (step 1 built in m5-test1: the host
+     sends at most one frame per refresh of the viewer's screen, the newest). The host captures and encodes at
      the refresh the viewer reports in `Hello`, never faster than it can
      show. The viewer presents in step with its screen.
    - **A Frame rate choice in the bar** (and its default in Settings):

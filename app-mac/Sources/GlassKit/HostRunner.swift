@@ -141,6 +141,8 @@ private final class Totals {
     var psnrY: [Double] = [], psnrC: [Double] = []
     var producedChroma: Int?
     var hardware = true, lowLatency = false
+    /// The frame-rate cap: the viewer's refresh, at most this display's.
+    var sendHz = 0
 }
 
 /// One viewer's session: view modes, the pipeline, the report.
@@ -159,6 +161,8 @@ private final class HostSessionRun {
     var virtualNote = ""
     var history: [String] = []
     var clipSummary = "off"
+    /// The viewer's screen refresh (Hz, 0 = unknown), from its Hello.
+    var viewerHz: UInt16 = 0
     /// This Mac's Wi-Fi link during the session (M4 step 5).
     let wifi = WifiWatch()
     let failLock = NSLock()
@@ -274,6 +278,7 @@ private final class HostSessionRun {
         let log = SessionLog(kind: "host")
         _ = log.due(started)
         let viewer = q.sync { s.viewer }
+        viewerHz = viewer.refresh_hz
         // 4:4:4 from the start unless the viewer prefers 4:2:0.
         configure(mode: viewer.mode, allow444: viewer.caps & UInt8(GLASS_CAP_PREFER_420) == 0)
 
@@ -382,7 +387,8 @@ private final class HostSessionRun {
         out.append(t.vtEncode.line("  VideoToolbox"))
         out.append(t.send.line("send (packetise)"))
         out.append(t.interval.line("capture interval"))
-        out.append("  stale frames skipped (encoder still busy, newest frame wins): \(t.stale)")
+        out.append("  stale frames skipped (encoder busy or the frame-rate cap, newest frame wins): \(t.stale)")
+        if t.sendHz > 0 { out.append("  frame rate (M5): at most \(t.sendHz) fps, the viewer's screen") }
         if !running, !t.psnrY.isEmpty {
             func p50(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
             let good = t.psnrY.filter { $0 >= 45 }.count
@@ -422,6 +428,12 @@ private final class Pipeline {
     private let lock = NSLock()
     private var pending: (CVPixelBuffer, UInt64)?
     private var busy = false
+    /// The frame-rate cap (M5's first step): at most one frame per refresh
+    /// of the viewer's screen (95 % of its interval), the newest one. 0 = no
+    /// cap. `lastSent` on the session queue.
+    let minGapUs: UInt64
+    let sendHz: Int
+    private var lastSent: UInt64 = 0
 
     init(run: HostSessionRun, display: HostDisplay, chroma444: Bool) throws {
         self.run = run
@@ -433,6 +445,10 @@ private final class Pipeline {
                                         bitrate: o.mbps * 1_000_000, chroma444: chroma444))
         converter = chroma444 ? Converter(width: display.width, height: display.height) : nil
         idle = DispatchSource.makeTimerSource(queue: run.q)
+        let viewerHz = Int(run.viewerHz)
+        sendHz = viewerHz > 0 ? min(viewerHz, display.fps) : display.fps
+        minGapUs = sendHz > 0 && sendHz < display.fps ? UInt64(950_000 / sendHz) : 0
+        run.totals.sendHz = sendHz
         run.totals.hardware = encoder.usingHardware
         run.totals.lowLatency = encoder.lowLatencyRateControl
     }
@@ -471,16 +487,27 @@ private final class Pipeline {
     }
 
     /// Encodes the newest waiting frame until none is left (session queue).
+    /// Under the frame-rate cap, a frame that comes too soon waits for its
+    /// turn; a newer one replaces it meanwhile.
     private func drain() {
         while true {
+            let now = GlassClock.nowUs()
+            let since = now &- lastSent
+            let wait = minGapUs > 0 && since < minGapUs ? minGapUs - since : 0
             lock.lock()
             guard let (pb, ts) = pending else {
                 busy = false
                 lock.unlock()
                 return
             }
+            if wait > 0 {
+                lock.unlock() // still busy: the capture callback won't kick again
+                run.q.asyncAfter(deadline: .now() + .microseconds(Int(wait))) { [self] in drain() }
+                return
+            }
             pending = nil
             lock.unlock()
+            lastSent = now
             encodeAndSend(pb, ts, force: false)
         }
     }

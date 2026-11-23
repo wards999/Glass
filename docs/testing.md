@@ -10,6 +10,16 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 1 (frames at the viewer's refresh)
+The same 3D pool test: QUIETPC22 (Glass.exe sharing) viewed from the Mac.
+1. The game should look smoother. Turn the stats on: "shown" should be
+   close to 60 fps, and "capture → screen" lower than m4b-test2's 53 ms.
+2. The sound's line should fall with the picture's, and stay a few ms
+   behind it.
+3. Send both results. The PC's has "frame rate (M5): at most 60 fps, the
+   viewer's screen". The Mac's "present interval" p50 should be 16.7 ms,
+   not 33.
+
 ## M4b test 3 (sound with the picture, fewer glitches)
 As M4b test 2 (the 3D pool cue ball, the Mac's own speakers).
 1. With the stats on, the "sound" line's total (X + the output's Y) should

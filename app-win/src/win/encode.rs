@@ -182,6 +182,43 @@ impl Encoder {
         self.encode_texture(src, pts_us, force_idr, on_packet)
     }
 
+    /// Keeps `src` as the last frame without encoding it (a GPU copy): the
+    /// frame-rate cap holds the newest frame until it's time to send one.
+    pub fn keep(&mut self, src: &ID3D11Texture2D) {
+        if !self.keep_last {
+            return;
+        }
+        if self.last.is_none() {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { src.GetDesc(&mut desc) };
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
+            desc.CPUAccessFlags = 0;
+            desc.MiscFlags = 0;
+            let mut t = None;
+            if unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut t)) }.is_err() {
+                return;
+            }
+            self.last = t;
+        }
+        if let Some(last) = &self.last {
+            unsafe { self.d3d.CopyResource(last, src) };
+        }
+    }
+
+    /// Encodes the kept frame (not an IDR unless `force_idr`).
+    pub fn encode_last(
+        &mut self,
+        pts_us: i64,
+        force_idr: bool,
+        on_packet: impl FnMut(&[u8], bool, i64),
+    ) -> Res<()> {
+        let Some(last) = self.last.clone() else {
+            return Ok(());
+        };
+        self.encode_texture(&last, pts_us, force_idr, on_packet)
+    }
+
     /// True once a frame has been kept for [`Self::encode_last_idr`].
     pub fn has_last(&self) -> bool {
         self.last.is_some()

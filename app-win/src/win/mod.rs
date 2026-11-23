@@ -344,6 +344,10 @@ struct HostRun {
     blocked_us: u64,
     not_sent: u32,
     skipped: u32,
+    /// Frames the frame-rate cap didn't send (a newer one went instead),
+    /// and the rate it sends at.
+    capped: u32,
+    send_hz: u32,
     error: Option<String>,
     /// This PC's Wi-Fi link during the session (M4 step 5).
     wifi: wlan::WifiWatch,
@@ -364,6 +368,8 @@ impl HostRun {
             blocked_us: 0,
             not_sent: 0,
             skipped: 0,
+            capped: 0,
+            send_hz: 0,
             error: None,
         }
     }
@@ -954,6 +960,19 @@ fn run_session<V: ViewerLink>(
     let log = session.counters().map(|_| slog::SessionLog::start("host"));
     let mut next_log = t0 + slog::EVERY_US;
     let mut pending_idr = true;
+    // The frame-rate cap: the viewer's refresh (it says in Hello), never
+    // more than this screen's. 95 % of the interval, so a frame per refresh
+    // always arrives in time for it.
+    let viewer_hz = session.viewer().refresh_hz as u32;
+    let send_hz = if viewer_hz == 0 {
+        fps
+    } else {
+        viewer_hz.min(fps.max(1))
+    };
+    let min_gap = 950_000 / send_hz.max(1) as u64;
+    let mut last_sent = 0u64;
+    let mut held: Option<u64> = None;
+    run.send_hz = send_hz;
     if let Some(frame) = first.take().filter(|f| f.size == (w, h)) {
         // Encoded now and kept as the last frame; the keyframe the viewer
         // asks for once it's ready resends it (pending_idr stays set).
@@ -968,7 +987,14 @@ fn run_session<V: ViewerLink>(
         && !stop.load(Ordering::Relaxed)
         && !end.load(Ordering::Relaxed)
     {
-        cap.wait(5);
+        // A frame held by the frame-rate cap goes as soon as its turn
+        // comes, so wait no longer than that.
+        let wait_ms = match held {
+            Some(_) => (min_gap.saturating_sub(clock::now_us().saturating_sub(last_sent)) / 1_000)
+                .clamp(1, 5) as u32,
+            None => 5,
+        };
+        cap.wait(wait_ms);
         // The running log (in-app host: if Glass is killed, its numbers so
         // far are still there; m4-test1).
         if let Some(log) = &log {
@@ -1064,10 +1090,33 @@ fn run_session<V: ViewerLink>(
             }
             got = true;
             run.intervals.tick(arrival);
+            // At most one frame per refresh of the viewer's screen (M5's
+            // first step, m4b-test2): a 60 Hz Mac sent 165 fps fell behind,
+            // showed 37 fps and lost frames to a full queue. The newest is
+            // kept and goes when its turn comes.
+            if !pending_idr && arrival.saturating_sub(last_sent) < min_gap {
+                enc.keep(&frame.texture);
+                held = Some(frame.ts_us);
+                run.capped += 1;
+                continue;
+            }
+            held = None;
+            last_sent = arrival;
             let idr = std::mem::take(&mut pending_idr);
             let input_seq = session.input_seq();
             enc.encode(&frame.texture, arrival as i64, idr, |data, key, _| {
                 run.on_packet(session, arrival, input_seq, data, key)
+            })?;
+        }
+        if held.is_some() && clock::now_us().saturating_sub(last_sent) >= min_gap {
+            held = None;
+            let now = clock::now_us();
+            last_sent = now;
+            run.capped = run.capped.saturating_sub(1); // it went after all
+            let idr = std::mem::take(&mut pending_idr);
+            let input_seq = session.input_seq();
+            enc.encode_last(now as i64, idr, |data, key, _| {
+                run.on_packet(session, now, input_seq, data, key)
             })?;
         }
         if !got && pending_idr && session.streaming() && enc.has_last() {
@@ -1149,6 +1198,13 @@ fn host_report<V: ViewerLink>(
             run.not_sent,
             run.skipped
         );
+        if run.send_hz > 0 {
+            let _ = writeln!(
+                r,
+                "  frame rate (M5): at most {} fps, the viewer's screen | {} frames held back (a newer one went instead)",
+                run.send_hz, run.capped
+            );
+        }
         let _ = writeln!(
             r,
             "  bitrate {:.1} Mbps avg | {} packets",

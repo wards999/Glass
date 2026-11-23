@@ -72,9 +72,18 @@ between any pair (PC↔Mac, PC↔PC).
   sent; a request for an older offer gets `FileCancel`.
 - **Speed adapts to the picture (v9, m5c-test8 feedback).** The fixed 60 Mbps
   made a 1 GB paste take 2 min 20 s, against 2 min 7 s for Remote Desktop.
-  Now the viewer steers it every 0.5 s (`RateControl`): lost frames, late
-  packets, or a round trip 10 ms over the quiet baseline halve it; otherwise
-  it rises by a quarter while a copy is moving, 1–60 MB/s. With nothing
+  Now the viewer steers it every 0.25 s (`RateControl`). The main signal is
+  the video frames' own network time (from the host's send time, through
+  clock sync, to their last packet): any frame 5 ms over the quiet baseline
+  halves the speed, 2.5 ms over holds it. A lost frame, late packets or a
+  round trip 10 ms over its baseline also halve it. Otherwise it rises by
+  15 % while a copy is moving, 1–60 MB/s. (m5c-test9 steered by the round
+  trip alone, twice a second: much faster than before, but frames queued to
+  26 ms p99 behind the copy.)
+- In the service, the clipboard helper's messages go to the viewer's
+  connection from the clipboard pipe's own thread, never through the loop
+  that forwards video frames. In m5c-test9 a frame waited 58 ms there behind
+  a file chunk. With nothing
   moving it drifts back to the start (7.5 MB/s), so a copy never starts at
   full blast. The viewer sends the speed to the host (`FileRate`) for files
   going its way.

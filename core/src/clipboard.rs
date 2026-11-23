@@ -309,15 +309,28 @@ pub fn encode_message(m: &Message, out: &mut Vec<u8>) -> bool {
     }
 }
 
-/// The viewer's steering of file speed (M5c): every half second, from what
-/// it sees of the picture. Lost or late video, or a round trip well above
-/// the quiet baseline, halves the speed; otherwise, while a copy is
-/// actually moving, it rises by a quarter. With nothing moving it drifts
-/// back to [`FILE_RATE`], so a new copy never starts at full blast.
+/// How far over its quiet baseline any video frame's network time may get
+/// before file data halves (µs), and before it stops speeding up.
+pub const FRAME_SLACK_US: u32 = 5_000;
+pub const FRAME_WARN_US: u32 = 2_500;
+/// How often the viewer steers (µs).
+pub const RATE_TICK_US: u64 = 250_000;
+
+/// The viewer's steering of file speed (M5c), every [`RATE_TICK_US`], from
+/// what it sees of the picture. The video frames' own network time is the
+/// main signal: as soon as any frame of the last tick took more than
+/// [`FRAME_SLACK_US`] over the quiet baseline, the speed halves. So do a
+/// lost frame, late packets, or a round trip 10 ms over its baseline. Over
+/// [`FRAME_WARN_US`] it holds. Otherwise, while a copy is moving, it rises
+/// by 15 %. With nothing moving it drifts back to [`FILE_RATE`], so a new
+/// copy never starts at full blast. (m5c-test9: steering by the round trip
+/// alone, twice a second, let frames queue to 26 ms p99 behind a copy.)
 pub struct RateControl {
     rate: f64,
     base_rtt: u32,
-    base_since: u64,
+    base_rtt_since: u64,
+    base_frame: u32,
+    base_frame_since: u64,
     last_bad: u64,
 }
 
@@ -326,7 +339,9 @@ impl Default for RateControl {
         Self {
             rate: FILE_RATE as f64,
             base_rtt: u32::MAX,
-            base_since: 0,
+            base_rtt_since: 0,
+            base_frame: u32::MAX,
+            base_frame_since: 0,
             last_bad: 0,
         }
     }
@@ -334,25 +349,44 @@ impl Default for RateControl {
 
 impl RateControl {
     /// `bad`: video frames lost plus late packets so far; `rtt_us`: the
-    /// latest round trip; `moving`: a copy is going either way. Returns the
-    /// speed to use (bytes/s).
-    pub fn tick(&mut self, now_us: u64, bad: u64, rtt_us: u32, moving: bool) -> u64 {
-        // The quiet baseline: the lowest round trip of the last 10 s.
-        if rtt_us > 0
-            && (rtt_us < self.base_rtt || now_us.saturating_sub(self.base_since) > 10_000_000)
-        {
+    /// latest round trip; `frames`: the lowest and highest network time of
+    /// the video frames since the last tick (µs), if any came; `moving`: a
+    /// copy is going either way. Returns the speed to use (bytes/s).
+    pub fn tick(
+        &mut self,
+        now_us: u64,
+        bad: u64,
+        rtt_us: u32,
+        frames: Option<(u32, u32)>,
+        moving: bool,
+    ) -> u64 {
+        // Quiet baselines: the lowest of the last 10 s.
+        let fresh = |since: u64| now_us.saturating_sub(since) > 10_000_000;
+        if rtt_us > 0 && (rtt_us < self.base_rtt || fresh(self.base_rtt_since)) {
             self.base_rtt = rtt_us;
-            self.base_since = now_us;
+            self.base_rtt_since = now_us;
         }
+        if let Some((lo, _)) = frames {
+            if lo < self.base_frame || fresh(self.base_frame_since) {
+                self.base_frame = lo;
+                self.base_frame_since = now_us;
+            }
+        }
+        let over = |slack: u32| {
+            frames.is_some_and(|(_, hi)| {
+                self.base_frame != u32::MAX && hi > self.base_frame.saturating_add(slack)
+            })
+        };
         let worse = bad > self.last_bad
-            || (self.base_rtt != u32::MAX && rtt_us > self.base_rtt.saturating_add(10_000));
+            || (self.base_rtt != u32::MAX && rtt_us > self.base_rtt.saturating_add(10_000))
+            || over(FRAME_SLACK_US);
         self.last_bad = bad;
         if worse {
             self.rate /= 2.0;
-        } else if moving {
-            self.rate *= 1.25;
-        } else {
-            self.rate += (FILE_RATE as f64 - self.rate) * 0.2;
+        } else if moving && !over(FRAME_WARN_US) {
+            self.rate *= 1.15;
+        } else if !moving {
+            self.rate += (FILE_RATE as f64 - self.rate) * 0.1;
         }
         self.rate = self.rate.clamp(FILE_RATE_MIN as f64, FILE_RATE_MAX as f64);
         self.rate as u64
@@ -1212,28 +1246,39 @@ mod tests {
     fn file_speed_follows_the_picture() {
         let mut r = RateControl::default();
         let mut t = 0;
-        let mut tick = |r: &mut RateControl, bad, rtt, moving| {
-            t += 500_000;
-            r.tick(t, bad, rtt, moving)
+        let mut tick = |r: &mut RateControl, bad, rtt, frames, moving| {
+            t += RATE_TICK_US;
+            r.tick(t, bad, rtt, frames, moving)
         };
+        let calm = Some((3_000, 4_000));
         // A quiet network and a copy going: it speeds up to the cap.
         let mut v = 0;
-        for _ in 0..40 {
-            v = tick(&mut r, 0, 3_000, true);
+        for _ in 0..60 {
+            v = tick(&mut r, 0, 3_000, calm, true);
         }
         assert_eq!(v, FILE_RATE_MAX);
-        // The round trip jumps: halved at once.
-        assert_eq!(tick(&mut r, 0, 20_000, true), FILE_RATE_MAX / 2);
+        // One frame 6 ms slower than the quiet ones: halved at once.
+        assert_eq!(
+            tick(&mut r, 0, 3_000, Some((3_000, 9_100)), true),
+            FILE_RATE_MAX / 2
+        );
+        // 3 ms slower: held, not raised.
+        assert_eq!(
+            tick(&mut r, 0, 3_000, Some((3_000, 6_000)), true),
+            FILE_RATE_MAX / 2
+        );
+        // The round trip jumps: halved.
+        assert_eq!(tick(&mut r, 0, 20_000, calm, true), FILE_RATE_MAX / 4);
         // A lost frame: halved again.
-        assert_eq!(tick(&mut r, 1, 3_000, true), FILE_RATE_MAX / 4);
+        assert_eq!(tick(&mut r, 1, 3_000, calm, true), FILE_RATE_MAX / 8);
         // Nothing moving: back towards the starting speed, not up.
-        for _ in 0..40 {
-            v = tick(&mut r, 1, 3_000, false);
+        for _ in 0..80 {
+            v = tick(&mut r, 1, 3_000, None, false);
         }
         assert!((v as i64 - FILE_RATE as i64).abs() < 100_000, "{v}");
         // Never below the floor.
         for i in 0..40 {
-            v = tick(&mut r, 2 + i, 3_000, true);
+            v = tick(&mut r, 2 + i, 3_000, calm, true);
         }
         assert_eq!(v, FILE_RATE_MIN);
     }

@@ -50,7 +50,6 @@ enum Msg {
     Report(String),
     ScreenUp,
     ScreenGone,
-    Clip(Vec<u8>),
 }
 
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
@@ -75,6 +74,10 @@ struct Screen {
     display: Mutex<(u16, u16, u16)>,
     /// Its latest clipboard results line (from the clipboard helper).
     clip_line: Mutex<String>,
+    /// The viewer's connection, for the clipboard helper's messages while a
+    /// session is on: written from the clipboard pipe's thread, so file
+    /// data never queues with the video.
+    clip_to_viewer: Mutex<Option<glass_core::clipboard::FrameWriter>>,
 }
 
 fn read_screen(mut rx: File, tx: mpsc::Sender<Msg>, screen: Arc<Screen>) {
@@ -125,13 +128,13 @@ fn read_screen(mut rx: File, tx: mpsc::Sender<Msg>, screen: Arc<Screen>) {
     let _ = tx.send(Msg::ScreenGone);
 }
 
-fn read_clip(mut rx: File, tx: mpsc::Sender<Msg>, screen: Arc<Screen>) {
+fn read_clip(mut rx: File, screen: Arc<Screen>) {
     let mut buf = Vec::new();
     while let Ok(kind) = read_message(&mut rx, &mut buf) {
         match ToBroker::decode(kind, &buf) {
             Some(ToBroker::ClipFrame(f)) => {
-                if tx.send(Msg::Clip(f.to_vec())).is_err() {
-                    return;
+                if let Some(to) = lock(&screen.clip_to_viewer).as_ref() {
+                    to(f);
                 }
             }
             Some(ToBroker::ClipSummary(s)) => *lock(&screen.clip_line) = s.to_string(),
@@ -233,18 +236,28 @@ pub fn run(
             screen_out.clone(),
             move |r| read_screen(r, tx1.clone(), sc.clone()),
         );
-        let (tx2, sc) = (tx.clone(), screen.clone());
+        let sc = screen.clone();
         serve(
             format!("{}-clip", a.pipes),
             clip_allow,
             clip_ok,
             clip_out.clone(),
-            move |r| read_clip(r, tx2.clone(), sc.clone()),
+            move |r| read_clip(r, sc.clone()),
         );
     }
     drop(tx);
 
     while !stop.load(Ordering::Relaxed) {
+        // Let a starting screen helper say what's on screen first, so the
+        // viewer's first picture is the right size (m5c-test9 showed a
+        // placeholder 1280x720 for a moment).
+        let until = clock::now_us() + 5_000_000;
+        while lock(&screen.display).0 == 0
+            && clock::now_us() < until
+            && !stop.load(Ordering::Relaxed)
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let (w, h, fps) = *lock(&screen.display);
         let info = StreamInfo {
             codec: CODEC_HEVC,
@@ -294,6 +307,7 @@ pub fn run(
             }
             true
         })));
+        *lock(&screen.clip_to_viewer) = Some(session.clip_sender());
         let start = ToHelper::Start {
             hello: session.viewer,
             peer: session.peer_tcp.to_string(),
@@ -375,9 +389,6 @@ pub fn run(
                     say("The screen helper changed (a Windows session switch); the viewer stays connected.");
                 }
                 Ok(Msg::ScreenGone) => gap_since = Some(clock::now_us()),
-                Ok(Msg::Clip(f)) => {
-                    session.send_clip_frame(&f);
-                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -408,6 +419,7 @@ pub fn run(
             }
         }
         session.relay_clipboard(None);
+        *lock(&screen.clip_to_viewer) = None;
         let secs = (clock::now_us() - t0) as f64 / 1e6;
         let c = session.counters();
         let ic = c.input;

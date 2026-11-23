@@ -79,6 +79,21 @@ fn send_control(w: &TlsWriter, msg: Control) -> io::Result<()> {
     w.write_all(&buf[..n])
 }
 
+/// Exactly one clipboard message (17-21)?
+fn is_clip_frame(frame: &[u8]) -> bool {
+    matches!(
+        Message::decode(frame),
+        Ok((
+            Message::Clip(_)
+                | Message::FileData(_)
+                | Message::FileCancel(_)
+                | Message::FileRequest(_)
+                | Message::FileRate(_),
+            n
+        )) if n == frame.len()
+    )
+}
+
 /// A clipboard link's writer onto a session's connection.
 fn frame_writer(w: TlsWriter) -> crate::clipboard::FrameWriter {
     Box::new(move |f: &[u8]| w.write_all(f).is_ok())
@@ -904,18 +919,15 @@ impl HostSession {
     /// Sends a clipboard message from that helper to the viewer, unchanged.
     /// Refused (false) unless it's exactly one clipboard message.
     pub fn send_clip_frame(&self, frame: &[u8]) -> bool {
-        let ok = matches!(
-            Message::decode(frame),
-            Ok((
-                Message::Clip(_)
-                    | Message::FileData(_)
-                    | Message::FileCancel(_)
-                    | Message::FileRequest(_)
-                        | Message::FileRate(_),
-                n
-            )) if n == frame.len()
-        );
-        ok && self.out.write_all(frame).is_ok()
+        is_clip_frame(frame) && self.out.write_all(frame).is_ok()
+    }
+
+    /// `send_clip_frame` for another thread: a clipboard helper's file data
+    /// then goes straight to the connection, never queued with the video
+    /// (m5c-test9: a frame waited 58 ms behind a file chunk).
+    pub fn clip_sender(&self) -> crate::clipboard::FrameWriter {
+        let out = self.out.clone();
+        Box::new(move |f: &[u8]| is_clip_frame(f) && out.write_all(f).is_ok())
     }
 
     pub fn counters(&self) -> HostCounters {
@@ -1228,6 +1240,10 @@ struct ClientShared {
     crypto_replayed: AtomicU64,
     clock_valid: AtomicBool,
     clock_offset: AtomicI64,
+    /// The video frames' network time since the file-speed steering last
+    /// looked (µs; lowest and highest; IDRs left out, they're big).
+    frame_lo: AtomicU32,
+    frame_hi: AtomicU32,
     clock_rtt: AtomicU32,
     last_rtt: AtomicU32,
     host_notice: std::sync::atomic::AtomicU8,
@@ -1476,6 +1492,8 @@ impl Client {
             crypto_replayed: AtomicU64::new(0),
             clock_valid: AtomicBool::new(false),
             clock_offset: AtomicI64::new(0),
+            frame_lo: AtomicU32::new(u32::MAX),
+            frame_hi: AtomicU32::new(0),
             clock_rtt: AtomicU32::new(0),
             last_rtt: AtomicU32::new(0),
             host_notice: std::sync::atomic::AtomicU8::new(0),
@@ -1746,6 +1764,17 @@ fn spawn_receiver(
                     last_packet_us: f.last_packet_us,
                     queued_us: clock::now_us(),
                 };
+                // Its network time: sent by the host (capture + encode, host
+                // clock) to its last packet here.
+                if f.flags & crate::protocol::FLAG_IDR == 0
+                    && sh.clock_valid.load(Ordering::Acquire)
+                {
+                    let off = sh.clock_offset.load(Ordering::Relaxed);
+                    let sent = clock::host_to_local(f.capture_ts_us + f.encode_us as u64, off);
+                    let d = f.last_packet_us.saturating_sub(sent).min(u32::MAX as u64) as u32;
+                    sh.frame_lo.fetch_min(d, Ordering::Relaxed);
+                    sh.frame_hi.fetch_max(d, Ordering::Relaxed);
+                }
                 if !sh.queue.push(meta, f.data) {
                     sh.queue_full.fetch_add(1, Ordering::Relaxed);
                     r.resync();
@@ -1778,6 +1807,7 @@ fn spawn_control(
         let mut seq = 0u32;
         let mut last_ping = 0u64;
         let mut file_rate = crate::clipboard::RateControl::default();
+        let mut last_rate = 0u64;
         let mut last_kf = 0u64;
         loop {
             if sh.stop.load(Ordering::Relaxed) {
@@ -1799,12 +1829,18 @@ fn spawn_control(
                     client_ts: clock::now_us(),
                 };
                 ok &= send_control(&out, ping).is_ok();
-                // File speed, both ways, from how the picture is doing.
+            }
+            // File speed, both ways, from how the picture is doing.
+            if now.saturating_sub(last_rate) >= crate::clipboard::RATE_TICK_US {
+                last_rate = now;
                 let st = sh.rx.load();
+                let lo = sh.frame_lo.swap(u32::MAX, Ordering::Relaxed);
+                let hi = sh.frame_hi.swap(0, Ordering::Relaxed);
                 let r = file_rate.tick(
                     now,
                     st.frames_lost + st.late,
                     sh.last_rtt.load(Ordering::Relaxed),
+                    (lo != u32::MAX).then_some((lo, hi)),
                     sh.clip.moving(),
                 );
                 sh.clip.set_rate(r);

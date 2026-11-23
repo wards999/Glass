@@ -1623,6 +1623,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Typing: when the keyboard hook takes a key it never gets here;
             // when Windows has dropped the hook (m3f-test5: 0 presses seen
             // by it) the focused viewer still gets every key as a message.
+            // Keys a Glass host on this PC typed into this window (a test on
+            // one PC) aren't the user's: sending them back loops for ever.
+            WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
+                if windows::Win32::UI::WindowsAndMessaging::GetMessageExtraInfo().0 as usize
+                    == super::inject::GLASS_MARK =>
+            {
+                Some(LRESULT(0))
+            }
             WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP => {
                 let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
                 let vk = wparam.0 as u16;

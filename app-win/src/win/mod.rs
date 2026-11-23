@@ -4,6 +4,7 @@
 pub mod app;
 mod bar;
 mod blocker;
+mod broker;
 pub mod browse;
 mod capture;
 mod clip;
@@ -17,8 +18,10 @@ pub mod desktop;
 mod display;
 pub mod dpapi;
 mod encode;
+mod helper;
 mod inject;
 mod mdns;
+mod pipe;
 mod present;
 pub mod service;
 mod stats_box;
@@ -62,31 +65,33 @@ pub fn list() -> Res<()> {
     Ok(())
 }
 
-struct Args {
-    monitor: usize,
-    seconds: f64,
-    chroma444: bool,
-    mbps: u32,
-    port: u16,
-    log: Option<String>,
+pub(crate) struct Args {
+    pub(crate) monitor: usize,
+    pub(crate) seconds: f64,
+    pub(crate) chroma444: bool,
+    pub(crate) mbps: u32,
+    pub(crate) port: u16,
+    pub(crate) log: Option<String>,
     /// Listen on 127.0.0.1 only (local tests; no firewall prompt).
-    local: bool,
+    pub(crate) local: bool,
     /// Ask on the console before each (paired) viewer connects.
-    ask: bool,
+    pub(crate) ask: bool,
     /// A fixed pairing PIN (tests and local checks only).
-    pin: Option<String>,
+    pub(crate) pin: Option<String>,
     /// The service's agent: Desktop Duplication following the lock screen
     /// and UAC prompts, input on whichever desktop is showing (M3f).
-    desktops: bool,
+    pub(crate) desktops: bool,
     /// Switch this screen to the mode that best fits the viewer while it's
     /// connected (`--keep-resolution` turns it off).
-    match_res: bool,
+    pub(crate) match_res: bool,
     /// Share the clipboard with the viewer (M5c; `--no-clipboard` turns it off).
-    clipboard: bool,
-    out: String,
+    pub(crate) clipboard: bool,
+    /// The service's pipes to its helpers (ADR 0017): their name prefix.
+    pub(crate) pipes: String,
+    pub(crate) out: String,
 }
 
-fn parse(args: &[String]) -> Res<Args> {
+pub(crate) fn parse(args: &[String]) -> Res<Args> {
     let mut a = Args {
         monitor: 0,
         seconds: 10.0,
@@ -100,6 +105,7 @@ fn parse(args: &[String]) -> Res<Args> {
         desktops: false,
         match_res: true,
         clipboard: true,
+        pipes: "Glass".to_string(),
         out: String::new(),
     };
     let mut it = args.iter();
@@ -117,6 +123,7 @@ fn parse(args: &[String]) -> Res<Args> {
             "--desktops" => a.desktops = true,
             "--keep-resolution" => a.match_res = false,
             "--no-clipboard" => a.clipboard = false,
+            "--pipes" => a.pipes = val()?.to_string(),
             "--chroma" => {
                 a.chroma444 = match val()?.as_str() {
                     "444" => true,
@@ -342,9 +349,9 @@ impl HostRun {
 
     /// Encoder output -> network. Called from inside the encode callback.
     /// `input_seq`: input applied when the frame was captured.
-    fn on_packet(
+    fn on_packet<V: ViewerLink>(
         &mut self,
-        session: &mut HostSession,
+        session: &mut V,
         capture_us: u64,
         input_seq: u32,
         data: &[u8],
@@ -406,100 +413,111 @@ pub fn host(args: &[String]) -> Res<()> {
     )
 }
 
-/// `glass-cli agent`: what the Glass service runs as SYSTEM in the PC's
-/// console session (M3f). Shares until the service stops it, telling the
-/// Glass window how it's going through `C:\ProgramData\Glass\status.txt`.
+/// `glass-cli agent`: the Glass service's screen helper (ADR 0017). Runs as
+/// SYSTEM in the session on the PC's screen; the service keeps the viewer's
+/// connection and starts a new helper when that session changes.
 pub fn agent(args: &[String]) -> Res<()> {
-    service::agent_env();
-    open_com_to_desktop();
-    let end = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    service::watch_end(end.clone());
-    let status = Arc::new(std::sync::Mutex::new(service::Status::default()));
-    let (s1, s2, s3) = (status.clone(), status.clone(), status.clone());
-    let update = |s: &Arc<std::sync::Mutex<service::Status>>,
-                  f: &mut dyn FnMut(&mut service::Status)| {
-        let mut g = s.lock().unwrap_or_else(|e| e.into_inner());
-        f(&mut g);
-        g.write();
-    };
-    let ui = HostUi {
-        event: Box::new(move |e| {
-            update(&s1, &mut |st| match &e {
-                HostEvent::PairingPin { device, pin, .. } => {
-                    st.pin = Some((pin.clone(), device.clone()))
-                }
-                HostEvent::Paired { .. } | HostEvent::PairingLocked => st.pin = None,
-                _ => {}
-            });
-            crate::print_event(e);
-        }),
-        line: Box::new(move |l| {
-            let l = l.trim();
-            update(&s2, &mut |st| {
-                if l.starts_with("Viewer connected") {
-                    st.connected = true;
-                    st.pin = None;
-                    st.line = l.to_string();
-                } else if l.starts_with("Waiting for a viewer") {
-                    st.connected = false;
-                    st.line = "Waiting for a viewer".to_string();
-                }
-            });
-            println!("{l}");
-        }),
-        report: Box::new(move |r| {
-            update(&s3, &mut |st| st.connected = false);
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(service::data_dir().join("agent-results.txt"))
-            {
-                let _ = writeln!(f, "{r}");
-            }
-        }),
-        stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        end: end.clone(),
-    };
-    let mut a = args.to_vec();
-    a.push("--desktops".into());
-    if service::clipboard_off() {
-        a.push("--no-clipboard".into());
-    }
-    // A heartbeat, so the window knows the agent is alive while it waits.
-    let beat = status.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(20));
-        beat.lock().unwrap_or_else(|e| e.into_inner()).write();
-    });
-    host_with(&a, ui)
+    helper::screen(args)
 }
 
-/// The agent runs as SYSTEM, and files pasted on this PC come from its
-/// virtual-files object (`vfiles.rs`): by default COM refuses the signed-in
-/// user's Explorer any call into a SYSTEM process, so the paste failed
-/// (m5c-test4). The object only hands out what's on the clipboard, which any
-/// program on this desktop can read anyway, so calls aren't checked.
-fn open_com_to_desktop() {
-    use windows::Win32::System::Com::{
-        CoInitializeEx, CoInitializeSecurity, COINIT_MULTITHREADED, EOAC_NONE,
-        RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IDENTIFY,
-    };
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        if let Err(e) = CoInitializeSecurity(
-            None,
-            -1,
-            None,
-            None,
-            RPC_C_AUTHN_LEVEL_DEFAULT,
-            RPC_C_IMP_LEVEL_IDENTIFY,
-            None,
-            EOAC_NONE,
-            None,
-        ) {
-            println!("Couldn't open the clipboard's files to this desktop: {e}");
-        }
+/// `glass-cli clip-agent`: the service's clipboard helper, as the signed-in
+/// user (ADR 0017).
+pub fn clip_agent(args: &[String]) -> Res<()> {
+    helper::clipboard(args)
+}
+
+/// `glass-cli broker [--local] [--pin N] [--pipes NAME]`: the service's
+/// broker in a console, for tests: helpers started by hand (`agent`,
+/// `clip-agent` with the same `--pipes`) connect to it as this user.
+pub fn broker_cli(args: &[String]) -> Res<()> {
+    let me = pipe::current_user_sid().ok_or("couldn't read this user's id")?;
+    broker::run(
+        args,
+        HostUi {
+            event: Box::new(crate::print_event),
+            line: Box::new(|l| println!("{l}")),
+            report: Box::new(|_| {}),
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            end: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+        vec![me.clone()],
+        vec![me],
+        Box::new(|_| true),
+    )
+}
+
+/// What a host session's capture, encoding and input talk to: the viewer's
+/// connection itself (the in-app host), or the broker over a pipe (the
+/// service's screen helper, ADR 0017).
+pub(crate) trait ViewerLink {
+    fn viewer(&self) -> glass_core::net::ViewerHello;
+    fn connected(&self) -> bool;
+    fn streaming(&self) -> bool;
+    fn take_keyframe_request(&self) -> bool;
+    fn take_mode_request(&self) -> Option<(u8, bool)>;
+    fn send_stream_change(&mut self, info: StreamInfo) -> std::io::Result<()>;
+    fn input_seq(&self) -> u32;
+    fn send_frame(&mut self, f: &OutFrame, data: &[u8]) -> std::io::Result<bool>;
+    fn send_cursor(&mut self, s: &CursorShape) -> std::io::Result<()>;
+    fn send_cursor_visible(&mut self, visible: bool) -> std::io::Result<()>;
+    fn send_notice(&mut self, code: u8) -> std::io::Result<()>;
+    /// Who's viewing, for the results.
+    fn peer(&self) -> String;
+    /// The connection's own counters (the broker keeps them otherwise).
+    fn counters(&self) -> Option<glass_core::net::HostCounters>;
+    /// The session, when this process runs the clipboard too (the in-app
+    /// host; the service's clipboard runs as the user, in its own helper).
+    fn clip_session(&self) -> Option<&HostSession>;
+    /// Always tell the viewer the stream's parameters first: a helper that
+    /// starts mid-session doesn't know what the last one sent.
+    fn announce_stream(&self) -> bool;
+}
+
+impl ViewerLink for HostSession {
+    fn viewer(&self) -> glass_core::net::ViewerHello {
+        self.viewer
+    }
+    fn connected(&self) -> bool {
+        HostSession::connected(self)
+    }
+    fn streaming(&self) -> bool {
+        HostSession::streaming(self)
+    }
+    fn take_keyframe_request(&self) -> bool {
+        HostSession::take_keyframe_request(self)
+    }
+    fn take_mode_request(&self) -> Option<(u8, bool)> {
+        HostSession::take_mode_request(self)
+    }
+    fn send_stream_change(&mut self, info: StreamInfo) -> std::io::Result<()> {
+        HostSession::send_stream_change(self, info)
+    }
+    fn input_seq(&self) -> u32 {
+        HostSession::input_seq(self)
+    }
+    fn send_frame(&mut self, f: &OutFrame, data: &[u8]) -> std::io::Result<bool> {
+        HostSession::send_frame(self, f, data)
+    }
+    fn send_cursor(&mut self, s: &CursorShape) -> std::io::Result<()> {
+        HostSession::send_cursor(self, s)
+    }
+    fn send_cursor_visible(&mut self, visible: bool) -> std::io::Result<()> {
+        HostSession::send_cursor_visible(self, visible)
+    }
+    fn send_notice(&mut self, code: u8) -> std::io::Result<()> {
+        HostSession::send_notice(self, code)
+    }
+    fn peer(&self) -> String {
+        self.peer_tcp.to_string()
+    }
+    fn counters(&self) -> Option<glass_core::net::HostCounters> {
+        Some(HostSession::counters(self))
+    }
+    fn clip_session(&self) -> Option<&HostSession> {
+        Some(self)
+    }
+    fn announce_stream(&self) -> bool {
+        false
     }
 }
 
@@ -517,6 +535,54 @@ pub struct HostUi {
     pub end: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Injects a viewer's input on monitor `mon`. `blocked` counts what Windows
+/// dropped while it was known to be blocking (an admin window in front, the
+/// secure desktop); `remap` takes the monitor's new rectangle after a
+/// resolution switch.
+pub(crate) fn input_sink(
+    mon: &capture::Monitor,
+    follow: bool,
+    blocked: Arc<AtomicU64>,
+    blocking: Arc<AtomicU8>,
+    remap: Arc<std::sync::Mutex<Option<inject::Rect>>>,
+) -> glass_core::net::InputSink {
+    let mut injector = inject::Injector {
+        mapper: inject::Mapper::for_monitor(inject::Rect {
+            left: mon.left,
+            top: mon.top,
+            width: mon.width as i32,
+            height: mon.height as i32,
+        }),
+        failed: 0,
+        pointer: (0, 0),
+    };
+    let mut follower = desktop::Follower::new();
+    Box::new(move |action| {
+        if let Ok(mut g) = remap.try_lock() {
+            if let Some(r) = g.take() {
+                injector.mapper = inject::Mapper::for_monitor(r);
+            }
+        }
+        // The service's helper: put input on whichever desktop is showing
+        // (the lock screen, a UAC prompt) once the capture thread is there.
+        if follow {
+            follower.check();
+        }
+        // Without admin rights Windows drops every injected event while an
+        // admin window has focus, so a click can't move focus away. Try
+        // bringing the clicked window forward instead (best effort).
+        if blocking.load(Ordering::Relaxed) == glass_core::protocol::NOTICE_INPUT_BLOCKED_ELEVATED {
+            if let InputAction::Button { down: true, .. } = action {
+                blocker::try_focus_at(injector.pointer);
+            }
+        }
+        let ok = injector.inject(&action);
+        if !ok || blocking.load(Ordering::Relaxed) != 0 {
+            blocked.fetch_add(1, Ordering::Relaxed);
+        }
+    })
+}
+
 /// Shares this PC until `ui.stop` is set (the window's "Share this PC").
 pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
     let HostUi {
@@ -527,8 +593,9 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
         end,
     } = ui;
     let line = std::sync::Mutex::new(line);
+    let say = |s: &str| (line.lock().unwrap_or_else(|e| e.into_inner()))(s);
     macro_rules! say {
-        ($($t:tt)*) => { (line.lock().unwrap_or_else(|e| e.into_inner()))(&format!($($t)*)) };
+        ($($t:tt)*) => { say(&format!($($t)*)) };
     }
     let a = parse(args)?;
     d3d::init_process();
@@ -617,10 +684,9 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
         }
     }
 
-    let port = listener.port();
     while !stop.load(Ordering::Relaxed) {
         let mut cap = capture::Capture::start(&gpu, mon, a.desktops)?;
-        let (mut w, mut h) = cap.size();
+        let (w, h) = cap.size();
         let info = StreamInfo {
             codec: CODEC_HEVC,
             chroma: if a.chroma444 { CHROMA_444 } else { CHROMA_420 },
@@ -630,51 +696,16 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
             mode: glass_core::protocol::MODE_HOST_SCREEN, // LATER(M7): IddCx virtual display
         };
         say!("\nWaiting for a viewer on port {} ...", listener.port());
-        let mut injector = inject::Injector {
-            mapper: inject::Mapper::for_monitor(inject::Rect {
-                left: mon.left,
-                top: mon.top,
-                width: mon.width as i32,
-                height: mon.height as i32,
-            }),
-            failed: 0,
-            pointer: (0, 0),
-        };
-        // Windows drops input into admin windows and the secure desktop while
-        // still reporting success, so count what arrived during a known block.
         let blocked = Arc::new(AtomicU64::new(0));
         let blocking = Arc::new(AtomicU8::new(0));
-        let (b, bl) = (blocked.clone(), blocking.clone());
-        let follow = a.desktops;
-        let mut follower = desktop::Follower::new();
-        // A new monitor rectangle after the resolution changed for a viewer.
-        let remap: Arc<std::sync::Mutex<Option<inject::Rect>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        let remap_in = remap.clone();
-        let sink = Box::new(move |action| {
-            if let Ok(mut g) = remap_in.try_lock() {
-                if let Some(r) = g.take() {
-                    injector.mapper = inject::Mapper::for_monitor(r);
-                }
-            }
-            // The agent: put input on whichever desktop is showing (the lock
-            // screen, a UAC prompt) once the capture thread has moved there.
-            if follow {
-                follower.check();
-            }
-            // Without admin rights Windows drops every injected event while an
-            // admin window has focus, so a click can't move focus away. Try
-            // bringing the clicked window forward instead (best effort).
-            if bl.load(Ordering::Relaxed) == glass_core::protocol::NOTICE_INPUT_BLOCKED_ELEVATED {
-                if let InputAction::Button { down: true, .. } = action {
-                    blocker::try_focus_at(injector.pointer);
-                }
-            }
-            let ok = injector.inject(&action);
-            if !ok || bl.load(Ordering::Relaxed) != 0 {
-                b.fetch_add(1, Ordering::Relaxed);
-            }
-        });
+        let remap = Arc::new(std::sync::Mutex::new(None));
+        let sink = input_sink(
+            mon,
+            a.desktops,
+            blocked.clone(),
+            blocking.clone(),
+            remap.clone(),
+        );
         let accepted = listener.accept(info, sink);
         if stop.load(Ordering::Relaxed) {
             break;
@@ -695,101 +726,22 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
             session.peer_name,
             session.peer_tcp.ip()
         );
-        // Match the viewer's resolution for the session, where this screen
-        // offers a better mode (M3f).
-        let mut fps = mon.refresh_hz;
-        let mut switched = None;
-        if a.match_res {
-            let v = session.viewer;
-            if let Some(cur) = display::current(&mon.name) {
-                let best = display::best(
-                    &display::modes(&mon.name),
-                    v.display_w as u32,
-                    v.display_h as u32,
-                    cur,
-                );
-                if let Some(m) = best {
-                    if display::switch(&mon.name, m) {
-                        switched = Some(cur);
-                        std::thread::sleep(std::time::Duration::from_millis(400));
-                        let now = capture::monitors()?
-                            .into_iter()
-                            .find(|x| x.name == mon.name);
-                        if let Some(nm) = now {
-                            drop(cap);
-                            cap = capture::Capture::start(&gpu, &nm, a.desktops)?;
-                            (w, h) = cap.size();
-                            fps = nm.refresh_hz;
-                            *remap.lock().unwrap_or_else(|e| e.into_inner()) = Some(inject::Rect {
-                                left: nm.left,
-                                top: nm.top,
-                                width: nm.width as i32,
-                                height: nm.height as i32,
-                            });
-                            session.send_stream_change(StreamInfo {
-                                width: w as u16,
-                                height: h as u16,
-                                fps: fps as u16,
-                                ..info
-                            })?;
-                            say!(
-                                "Matched the viewer: this screen is {}x{} for now (was {}x{}).",
-                                w,
-                                h,
-                                cur.width,
-                                cur.height
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        let (mut report, blocked_by, blocked_us) = run_session(
+        let body = media_session(
             &gpu,
+            mon,
+            &a,
             &mut cap,
             &mut session,
-            &a,
-            (w, h),
-            fps,
+            &remap,
             &blocking,
+            &blocked,
             &stop,
             &end,
+            &say,
         )?;
         end.store(false, Ordering::Relaxed);
-        let counters = session.counters();
-        let ic = counters.input;
         drop(session); // releases anything the viewer still held
-        if let Some(orig) = switched {
-            display::restore(&mon.name);
-            let _ = writeln!(
-                report,
-                "  resolution: matched the viewer at {}x{} (this screen is {}x{}; put back)",
-                w, h, orig.width, orig.height
-            );
-            say!("Screen back to {}x{}.", orig.width, orig.height);
-        }
-        let _ = writeln!(
-            report,
-            "  input: {} packets | {} keys, {} clicks, {} scrolls, {} moves | repaired {}",
-            ic.packets, ic.keys, ic.clicks, ic.scrolls, ic.moves, ic.repaired
-        );
-        let _ = writeln!(
-            report,
-            "  rejected UDP datagrams (failed decryption or replays): {}",
-            counters.rejected_datagrams
-        );
-        let _ = writeln!(
-            report,
-            "  input blocked by Windows: {} actions over {:.1} s{}",
-            blocked.load(Ordering::Relaxed),
-            blocked_us as f64 / 1e6,
-            if blocked_by.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", blocked_by.join(", "))
-            }
-        );
-        let report = format!("{head}{report}");
+        let report = format!("{head}{body}");
         say!("{report}");
         on_report(&report);
         if let Some(path) = &a.log {
@@ -803,18 +755,121 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
         }
     }
     mdns::unadvertise();
-    let _ = port;
     Ok(())
 }
 
+/// One viewer's session on this screen: match its resolution where the
+/// screen offers a better mode (M3f), stream until it goes, put the screen
+/// back. Returns the results (after the header line).
 #[allow(clippy::too_many_arguments)]
-fn run_session(
+pub(crate) fn media_session<V: ViewerLink>(
+    gpu: &d3d::Gpu,
+    mon: &capture::Monitor,
+    a: &Args,
+    cap: &mut capture::Capture,
+    session: &mut V,
+    remap: &std::sync::Mutex<Option<inject::Rect>>,
+    blocking: &AtomicU8,
+    blocked: &AtomicU64,
+    stop: &std::sync::atomic::AtomicBool,
+    end: &std::sync::atomic::AtomicBool,
+    say: &dyn Fn(&str),
+) -> Res<String> {
+    let (mut w, mut h) = cap.size();
+    let mut fps = mon.refresh_hz;
+    let mut switched = None;
+    if a.match_res {
+        let v = session.viewer();
+        if let Some(cur) = display::current(&mon.name) {
+            let best = display::best(
+                &display::modes(&mon.name),
+                v.display_w as u32,
+                v.display_h as u32,
+                cur,
+            );
+            if let Some(m) = best {
+                if display::switch(&mon.name, m) {
+                    switched = Some(cur);
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    let now = capture::monitors()?
+                        .into_iter()
+                        .find(|x| x.name == mon.name);
+                    if let Some(nm) = now {
+                        *cap = capture::Capture::start(gpu, &nm, a.desktops)?;
+                        (w, h) = cap.size();
+                        fps = nm.refresh_hz;
+                        *remap.lock().unwrap_or_else(|e| e.into_inner()) = Some(inject::Rect {
+                            left: nm.left,
+                            top: nm.top,
+                            width: nm.width as i32,
+                            height: nm.height as i32,
+                        });
+                        say(&format!(
+                            "Matched the viewer: this screen is {}x{} for now (was {}x{}).",
+                            w, h, cur.width, cur.height
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    let (mut report, blocked_by, blocked_us) = run_session(
+        gpu,
+        cap,
+        session,
+        a,
+        (w, h),
+        fps,
+        switched.is_some(),
+        blocking,
+        stop,
+        end,
+    )?;
+    if let Some(orig) = switched {
+        display::restore(&mon.name);
+        let _ = writeln!(
+            report,
+            "  resolution: matched the viewer at {}x{} (this screen is {}x{}; put back)",
+            w, h, orig.width, orig.height
+        );
+        say(&format!("Screen back to {}x{}.", orig.width, orig.height));
+    }
+    if let Some(counters) = session.counters() {
+        let ic = counters.input;
+        let _ = writeln!(
+            report,
+            "  input: {} packets | {} keys, {} clicks, {} scrolls, {} moves | repaired {}",
+            ic.packets, ic.keys, ic.clicks, ic.scrolls, ic.moves, ic.repaired
+        );
+        let _ = writeln!(
+            report,
+            "  rejected UDP datagrams (failed decryption or replays): {}",
+            counters.rejected_datagrams
+        );
+    }
+    let _ = writeln!(
+        report,
+        "  input blocked by Windows: {} actions over {:.1} s{}",
+        blocked.load(Ordering::Relaxed),
+        blocked_us as f64 / 1e6,
+        if blocked_by.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", blocked_by.join(", "))
+        }
+    );
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_session<V: ViewerLink>(
     gpu: &d3d::Gpu,
     cap: &mut capture::Capture,
-    session: &mut HostSession,
+    session: &mut V,
     a: &Args,
     (w, h): (u32, u32),
     fps: u32,
+    resized: bool,
     blocking: &AtomicU8,
     stop: &std::sync::atomic::AtomicBool,
     end: &std::sync::atomic::AtomicBool,
@@ -851,10 +906,10 @@ fn run_session(
     };
     // Colour: what the viewer asked for if it can decode 4:4:4 (M3d);
     // otherwise 4:2:0. `--chroma` only sets what Welcome announced.
-    let v = session.viewer;
+    let v = session.viewer();
     let can_444 = v.caps & glass_core::protocol::CAP_HEVC_444 != 0;
     let mut chroma444 = can_444 && v.caps & glass_core::protocol::CAP_PREFER_420 == 0;
-    if chroma444 != a.chroma444 {
+    if chroma444 != a.chroma444 || resized || session.announce_stream() {
         session.send_stream_change(info(chroma444))?;
     }
     let mut enc = make(chroma444)?;
@@ -862,14 +917,13 @@ fn run_session(
     let mut pointer = cursor::CursorWatch::new();
     let mut watch = blocker::BlockerWatch::new();
     let mut blocked_since = None;
-    // The clipboard, both ways (M5c): a thread of its own, talking to the
-    // session's clipboard link; nothing of it runs in this loop.
-    if a.clipboard {
-        session.set_file_dir(Some(clip::file_dir(a.desktops, "host")));
-    }
-    let _clip = a
-        .clipboard
-        .then(|| clip::ClipSync::start(session.clip_link(), false));
+    // The clipboard, both ways (M5c), when this process runs it: a thread
+    // of its own, talking to the session's clipboard link.
+    let clip_here = a.clipboard && session.clip_session().is_some();
+    let _clip = session.clip_session().filter(|_| a.clipboard).map(|s| {
+        s.set_file_dir(Some(clip::file_dir(a.desktops, "host")));
+        clip::ClipSync::start(s.clip_link(), false)
+    });
     let t0 = clock::now_us();
     let mut pending_idr = true;
     if let Some(frame) = first.take().filter(|f| f.size == (w, h)) {
@@ -909,8 +963,9 @@ fn run_session(
             }
         }
         let now = clock::now_us();
-        // The agent runs as SYSTEM on whichever desktop is showing: nothing
-        // blocks it (the lock screen and UAC prompts are what it's for).
+        // The service's helper runs as SYSTEM on whichever desktop is
+        // showing: nothing blocks it (the lock screen and UAC prompts are
+        // what it's for).
         let polled = if a.desktops {
             None
         } else {
@@ -986,32 +1041,43 @@ fn run_session(
         }
     }
     let secs = (clock::now_us() - t0) as f64 / 1e6;
-    let c = session.counters();
     let mut r = String::new();
     let _ = writeln!(
         r,
         "Session with {} ended after {:.1} s ({})",
-        session.peer_tcp,
+        session.peer(),
         secs,
         run.error.as_deref().unwrap_or("viewer left")
     );
-    let _ = writeln!(
-        r,
-        "  frames sent {} ({:.1} fps), IDRs {} (idle re-sends {}), viewer keyframe requests {}, not sent (viewer not ready) {}, skipped {}",
-        c.frames_sent,
-        c.frames_sent as f64 / secs,
-        run.idrs,
-        run.idle_idrs,
-        c.keyframe_requests,
-        run.not_sent,
-        run.skipped
-    );
-    let _ = writeln!(
-        r,
-        "  bitrate {:.1} Mbps avg | {} packets",
-        c.bytes_sent as f64 * 8.0 / secs / 1e6,
-        c.packets_sent
-    );
+    if let Some(c) = session.counters() {
+        let _ = writeln!(
+            r,
+            "  frames sent {} ({:.1} fps), IDRs {} (idle re-sends {}), viewer keyframe requests {}, not sent (viewer not ready) {}, skipped {}",
+            c.frames_sent,
+            c.frames_sent as f64 / secs,
+            run.idrs,
+            run.idle_idrs,
+            c.keyframe_requests,
+            run.not_sent,
+            run.skipped
+        );
+        let _ = writeln!(
+            r,
+            "  bitrate {:.1} Mbps avg | {} packets",
+            c.bytes_sent as f64 * 8.0 / secs / 1e6,
+            c.packets_sent
+        );
+    } else {
+        let _ = writeln!(
+            r,
+            "  frames encoded {} ({:.1} fps), IDRs {} (idle re-sends {}), skipped {}",
+            run.frame_id,
+            run.frame_id as f64 / secs,
+            run.idrs,
+            run.idle_idrs,
+            run.skipped
+        );
+    }
     let _ = writeln!(r, "{}", fmt_line("encode", &run.encode.summary()));
     let _ = writeln!(r, "{}", fmt_line("send (packetise)", &run.send.summary()));
     let _ = writeln!(
@@ -1020,15 +1086,17 @@ fn run_session(
         fmt_line("capture interval", &run.intervals.intervals.summary())
     );
     let _ = writeln!(r, "{}", size_line(&run.size.summary()));
-    let _ = writeln!(
-        r,
-        "  clipboard: {}",
-        if a.clipboard {
-            clip::summary(&session.clip_progress(), "viewer")
-        } else {
-            "off".to_string()
+    if clip_here {
+        if let Some(s) = session.clip_session() {
+            let _ = writeln!(
+                r,
+                "  clipboard: {}",
+                clip::summary(&s.clip_progress(), "viewer")
+            );
         }
-    );
+    } else if !a.clipboard {
+        let _ = writeln!(r, "  clipboard: off");
+    }
     if a.desktops {
         let _ = writeln!(
             r,

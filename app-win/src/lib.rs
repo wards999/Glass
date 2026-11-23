@@ -314,6 +314,8 @@ pub fn cli_main() {
         Some("host") => win::host(&args[1..]),
         #[cfg(windows)]
         Some("agent") => win::agent(&args[1..]),
+        Some("clip-agent") => win::clip_agent(&args[1..]),
+        Some("broker") => win::broker_cli(&args[1..]),
         #[cfg(windows)]
         Some("debug-keys") => connect::debug_keys(&args[1..]),
         #[cfg(windows)]

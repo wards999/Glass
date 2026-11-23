@@ -1,17 +1,22 @@
 //! The Glass service (M3f): unattended access, including the lock screen,
 //! the sign-in screen and UAC prompts.
 //!
-//! Split so the service itself stays small and rarely changes (ADR 0015):
-//! - `glass-cli service run` is the service (LocalSystem, auto start). It
-//!   only keeps one agent running in the PC's console session (the one on its
-//!   physical screen), starting a new one when that session changes (sign-in,
-//!   sign-out, fast user switching) or the agent stops.
-//! - `glass-cli agent` (started by the service as SYSTEM in that session) does
-//!   the sharing: Desktop Duplication that follows the input desktop, input
-//!   on whichever desktop is showing, this PC's identity kept with
-//!   machine-scope DPAPI in a folder only SYSTEM and administrators can read.
-//!   It writes a small status file (who's connected, a pairing code) that the
-//!   Glass window shows.
+//! Split so a viewer's connection survives Windows switching sessions (ADR
+//! 0015, ADR 0017):
+//! - `glass-cli service run` is the service (LocalSystem, auto start). It runs
+//!   the **broker**: the listener, pairing, the viewer's session, the network
+//!   listing, and a small status file (who's connected, a pairing code) that
+//!   the Glass window shows. Its identity is kept with machine-scope DPAPI in
+//!   a folder only SYSTEM and administrators can read. It never restarts for
+//!   a session switch.
+//! - It keeps two helpers in the PC's console session (the one on its
+//!   physical screen), starting new ones when that session changes (sign-in,
+//!   sign-out, Remote Desktop, fast user switching):
+//!   - `glass-cli agent`, the screen helper, as SYSTEM: Desktop Duplication
+//!     that follows the input desktop (lock screen, UAC), encoding, input on
+//!     whichever desktop is showing;
+//!   - `glass-cli clip-agent`, the clipboard helper, as the signed-in user
+//!     (none at the sign-in screen).
 //! - `glass-cli service install` / `uninstall` (as administrator): copies
 //!   this build to Program Files, moves this PC's identity over so pairings
 //!   carry on, registers the service, allows it through Windows Firewall on
@@ -29,7 +34,10 @@ use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId,
     TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
 };
-use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
+use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+use windows::Win32::System::RemoteDesktop::{
+    ProcessIdToSessionId, WTSGetActiveConsoleSessionId, WTSQueryUserToken,
+};
 use windows::Win32::System::Services::*;
 use windows::Win32::System::Threading::{
     CreateEventW, CreateProcessAsUserW, GetCurrentProcess, GetCurrentProcessId, OpenProcessToken,
@@ -106,26 +114,6 @@ pub fn request_end() -> bool {
     std::fs::write(control_dir().join("end-session"), b"1").is_ok()
 }
 
-/// The agent: watches for End session from the window.
-pub fn watch_end(end: std::sync::Arc<AtomicBool>) {
-    std::thread::spawn(move || loop {
-        let f = control_dir().join("end-session");
-        if f.exists() {
-            let _ = std::fs::remove_file(&f);
-            end.store(true, Ordering::Relaxed);
-        }
-        if sharing_off() {
-            // Switched off: end any session properly (the viewer is told,
-            // so it doesn't reconnect), then stop.
-            end.store(true, Ordering::Relaxed);
-            std::thread::sleep(std::time::Duration::from_millis(1200));
-            let _ = std::fs::remove_file(status_path());
-            std::process::exit(0);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    });
-}
-
 fn log(line: &str) {
     use std::io::Write;
     let _ = std::fs::create_dir_all(data_dir());
@@ -188,7 +176,7 @@ unsafe extern "system" fn handler(
     0 // NO_ERROR
 }
 
-/// A running agent.
+/// A running helper.
 struct Agent {
     process: HANDLE,
     session: u32,
@@ -208,31 +196,57 @@ impl Agent {
     }
 }
 
-/// Starts `glass-cli agent` as SYSTEM in `session` (on its interactive
-/// window station, so it can reach that session's desktops).
-fn launch_agent(session: u32) -> Res<Agent> {
+/// The signed-in user's token in `session` (none at the sign-in screen).
+fn user_token(session: u32) -> Option<HANDLE> {
+    let mut t = HANDLE::default();
+    unsafe { WTSQueryUserToken(session, &mut t) }.ok()?;
+    Some(t)
+}
+
+/// The signed-in user of `session`, as a SID string.
+fn session_user_sid(session: u32) -> Option<String> {
+    let t = user_token(session)?;
+    let sid = super::pipe::token_sid(t);
     unsafe {
-        let mut me = HANDLE::default();
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
-            &mut me,
-        )?;
-        let mut token = HANDLE::default();
-        let dup = DuplicateTokenEx(
-            me,
-            TOKEN_ALL_ACCESS,
-            None,
-            SecurityImpersonation,
-            TokenPrimary,
-            &mut token,
-        );
-        let _ = CloseHandle(me);
-        dup?;
-        SetTokenInformation(token, TokenSessionId, &session as *const u32 as *const _, 4)?;
+        let _ = CloseHandle(t);
+    }
+    sid
+}
+
+/// Starts `glass-cli <args>` in `session` (on its interactive window
+/// station, so it can reach that session's desktops): as SYSTEM, or as the
+/// user signed in there (`as_user`; fails if nobody is).
+fn launch(session: u32, args: &str, as_user: bool) -> Res<Agent> {
+    unsafe {
+        let token = if as_user {
+            user_token(session).ok_or("nobody is signed in there")?
+        } else {
+            let mut me = HANDLE::default();
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+                &mut me,
+            )?;
+            let mut token = HANDLE::default();
+            let dup = DuplicateTokenEx(
+                me,
+                TOKEN_ALL_ACCESS,
+                None,
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut token,
+            );
+            let _ = CloseHandle(me);
+            dup?;
+            SetTokenInformation(token, TokenSessionId, &session as *const u32 as *const _, 4)?;
+            token
+        };
+        // The user's own environment (their TEMP for the clipboard's files).
+        let mut env: *mut core::ffi::c_void = std::ptr::null_mut();
+        let have_env = as_user && CreateEnvironmentBlock(&mut env, Some(token), false).is_ok();
         let exe = std::env::current_exe()?;
         let app = HSTRING::from(exe.as_os_str());
-        let mut cmd = wide(&format!("\"{}\" agent", exe.display()));
+        let mut cmd = wide(&format!("\"{}\" {args}", exe.display()));
         let mut desk = wide("winsta0\\default");
         let si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
@@ -249,11 +263,14 @@ fn launch_agent(session: u32) -> Res<Agent> {
             None,
             false,
             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-            None,
+            have_env.then_some(env as *const _),
             &dir,
             &si,
             &mut pi,
         );
+        if have_env {
+            let _ = DestroyEnvironmentBlock(env);
+        }
         let _ = CloseHandle(token);
         r?;
         let _ = CloseHandle(pi.hThread);
@@ -262,6 +279,118 @@ fn launch_agent(session: u32) -> Res<Agent> {
             session,
         })
     }
+}
+
+/// The broker, running in the service (ADR 0017).
+struct BrokerRun {
+    stop: std::sync::Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// What the broker tells the Glass window (`status.txt`), and where its
+/// results go (`agent-results.txt`).
+fn service_ui(stop: std::sync::Arc<AtomicBool>, end: std::sync::Arc<AtomicBool>) -> super::HostUi {
+    use glass_core::net::HostEvent;
+    use std::sync::{Arc, Mutex};
+    let status = Arc::new(Mutex::new(Status::default()));
+    let (s1, s2, s3, s4) = (status.clone(), status.clone(), status.clone(), status);
+    fn update(s: &Mutex<Status>, f: &mut dyn FnMut(&mut Status)) {
+        let mut g = s.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut g);
+        g.write();
+    }
+    // A heartbeat, so the window knows the service is sharing.
+    let beat_stop = stop.clone();
+    std::thread::spawn(move || {
+        while !beat_stop.load(Ordering::Relaxed) {
+            s4.lock().unwrap_or_else(|e| e.into_inner()).write();
+            std::thread::sleep(std::time::Duration::from_secs(20));
+        }
+    });
+    super::HostUi {
+        event: Box::new(move |e| {
+            update(&s1, &mut |st| match &e {
+                HostEvent::PairingPin { device, pin, .. } => {
+                    st.pin = Some((pin.clone(), device.clone()))
+                }
+                HostEvent::Paired { .. } | HostEvent::PairingLocked => st.pin = None,
+                _ => {}
+            });
+            crate::print_event(e);
+        }),
+        line: Box::new(move |l| {
+            let l = l.trim();
+            update(&s2, &mut |st| {
+                if l.starts_with("Viewer connected") {
+                    st.connected = true;
+                    st.pin = None;
+                    st.line = l.to_string();
+                } else if l.starts_with("Waiting for a viewer") {
+                    st.connected = false;
+                    st.line = "Waiting for a viewer".to_string();
+                }
+            });
+        }),
+        report: Box::new(move |r| {
+            update(&s3, &mut |st| st.connected = false);
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(data_dir().join("agent-results.txt"))
+            {
+                let _ = writeln!(f, "{r}");
+            }
+        }),
+        stop,
+        end,
+    }
+}
+
+fn start_broker() -> BrokerRun {
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    let end = Arc::new(AtomicBool::new(false));
+    // The window's End session.
+    let (st, en) = (stop.clone(), end.clone());
+    std::thread::spawn(move || {
+        while !st.load(Ordering::Relaxed) {
+            let f = control_dir().join("end-session");
+            if f.exists() {
+                let _ = std::fs::remove_file(&f);
+                en.store(true, Ordering::Relaxed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    });
+    let ui = service_ui(stop.clone(), end);
+    let thread = std::thread::spawn(move || {
+        let args: Vec<String> = if clipboard_off() {
+            vec!["--no-clipboard".into()]
+        } else {
+            Vec::new()
+        };
+        // The clipboard helper: Glass, run as whoever is signed in on the
+        // PC's screen, and nobody else.
+        let clip_ok: super::broker::ClipCheck = Box::new(|pid| {
+            let session = unsafe { WTSGetActiveConsoleSessionId() };
+            let mut in_session = u32::MAX;
+            let _ = unsafe { ProcessIdToSessionId(pid, &mut in_session) };
+            in_session == session
+                && session_user_sid(session)
+                    .is_some_and(|u| super::pipe::process_user_sid(pid).is_some_and(|p| p == u))
+        });
+        if let Err(e) = super::broker::run(&args, ui, Vec::new(), vec!["IU".into()], clip_ok) {
+            log(&format!("the broker stopped: {e}"));
+        }
+    });
+    BrokerRun { stop, thread }
+}
+
+fn stop_broker(b: BrokerRun) {
+    b.stop.store(true, Ordering::Relaxed);
+    super::broker::wake(glass_core::protocol::DEFAULT_PORT);
+    let _ = b.thread.join();
 }
 
 unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
@@ -276,8 +405,13 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
     STOP_EVENT.store(stop.0 as isize, Ordering::Relaxed);
     set_state(SERVICE_RUNNING, 0);
     log("service started");
-    let mut agent: Option<Agent> = None;
-    let mut failures = 0u32;
+    // This PC's identity, for the broker.
+    agent_env();
+    let mut broker: Option<BrokerRun> = None;
+    let mut screen: Option<Agent> = None;
+    let mut clip: Option<Agent> = None;
+    let (mut screen_fails, mut clip_fails) = (0u32, 0u32);
+    let mut clip_waiting_since = None;
     loop {
         // Every second, or at once after a session change.
         let waited = WaitForSingleObject(
@@ -291,56 +425,96 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         if waited == WAIT_OBJECT_0 {
             break;
         }
-        // Switched off in the window: no agent until it's switched on.
+        // Switched off in the window: nothing runs until it's switched on.
         if sharing_off() {
-            if let Some(a) = agent.take() {
-                // The agent ends the session and stops by itself; wait a
-                // moment before making sure.
-                let _ = WaitForSingleObject(a.process, 3000);
-                a.kill();
+            if let Some(b) = broker.take() {
+                stop_broker(b); // ends any session properly (the viewer is told)
                 let _ = std::fs::remove_file(status_path());
                 log("sharing switched off");
             }
-            failures = 0;
+            for a in [screen.take(), clip.take()].into_iter().flatten() {
+                a.kill();
+            }
+            (screen_fails, clip_fails) = (0, 0);
             continue;
+        }
+        if broker.as_ref().is_none_or(|b| b.thread.is_finished()) {
+            if let Some(b) = broker.take() {
+                stop_broker(b);
+            }
+            broker = Some(start_broker());
+            log("broker started");
         }
         let session = WTSGetActiveConsoleSessionId();
         if session == u32::MAX {
             continue; // between sessions (switching users)
         }
-        let stale = agent
+        // The screen helper: SYSTEM, in the session on screen.
+        if screen
             .as_ref()
-            .is_some_and(|a| a.session != session || a.exited());
-        if stale {
-            if let Some(a) = agent.take() {
+            .is_some_and(|a| a.session != session || a.exited())
+        {
+            if let Some(a) = screen.take() {
+                if a.exited() {
+                    screen_fails += 1;
+                }
                 a.kill();
             }
         }
-        if agent.is_none() {
+        if screen.is_none() {
             // Back off if it keeps failing (no GPU, a bad build): 1 s up to 30 s.
-            if failures > 0 {
-                let wait = 1000 * failures.min(30);
-                if WaitForSingleObject(stop, wait) == WAIT_OBJECT_0 {
-                    break;
-                }
+            if screen_fails > 0
+                && WaitForSingleObject(stop, 1000 * screen_fails.min(30)) == WAIT_OBJECT_0
+            {
+                break;
             }
-            match launch_agent(session) {
+            match launch(session, "agent --desktops", false) {
                 Ok(a) => {
-                    log(&format!("agent started in session {session}"));
-                    agent = Some(a);
-                    failures = 0;
+                    log(&format!("screen helper started in session {session}"));
+                    screen = Some(a);
                 }
                 Err(e) => {
-                    log(&format!("couldn't start the agent: {e}"));
-                    failures += 1;
+                    log(&format!("couldn't start the screen helper: {e}"));
+                    screen_fails += 1;
                 }
             }
-        } else if agent.as_ref().is_some_and(|a| a.exited()) {
-            failures += 1;
+        } else {
+            screen_fails = 0;
+        }
+        // The clipboard helper: the signed-in user, in that session.
+        if clip
+            .as_ref()
+            .is_some_and(|a| a.session != session || a.exited() || clipboard_off())
+        {
+            if let Some(a) = clip.take() {
+                if a.exited() {
+                    clip_fails += 1;
+                }
+                a.kill();
+            }
+        }
+        if clip.is_none() && !clipboard_off() {
+            if clip_fails > 0 && clip_waiting_since.is_none() {
+                clip_waiting_since = Some(std::time::Instant::now());
+            }
+            let wait = std::time::Duration::from_secs(clip_fails.min(30) as u64);
+            if clip_waiting_since.is_none_or(|t| t.elapsed() >= wait) {
+                clip_waiting_since = None;
+                // Nobody signed in (the sign-in screen): it fails; try again later.
+                if let Ok(a) = launch(session, "clip-agent", true) {
+                    log(&format!("clipboard helper started in session {session}"));
+                    clip = Some(a);
+                }
+            }
+        } else if clip.is_some() {
+            clip_fails = 0;
         }
     }
-    if let Some(a) = agent.take() {
+    for a in [screen.take(), clip.take()].into_iter().flatten() {
         a.kill();
+    }
+    if let Some(b) = broker.take() {
+        stop_broker(b);
     }
     let _ = std::fs::remove_file(status_path());
     log("service stopped");

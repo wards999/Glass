@@ -25,6 +25,7 @@ use windows::Win32::System::WinRT::Direct3D11::{
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows_core::{BOOL, PCWSTR};
 
+#[derive(Clone)]
 pub struct Monitor {
     pub name: String,
     /// Top-left in virtual-desktop pixels.

@@ -10,6 +10,32 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M3f test 2 (the service keeps the connection, ADR 0017)
+The service changed a lot. Update it on QUIETPC first: from the new zip, run
+`glass-cli service install` as administrator, or use Settings > Unattended
+access. Update QUIETPC22 and the Mac too.
+
+From QUIETPC22 (and then from the Mac), view QUIETPC:
+1. **Sign in without a drop:** lock QUIETPC (Win+L in the viewer), then sign
+   in with your PIN in the viewer. The picture may pause for a moment, but
+   the viewer stays connected: no window closing, no reconnecting.
+2. **Remote Desktop:** while viewing, connect to QUIETPC with Remote Desktop,
+   then disconnect it (or use "Move it to the PC's screen"). The Glass viewer
+   stays connected throughout. It shows the lock screen while Remote
+   Desktop has the session.
+3. **UAC:** run something as administrator on QUIETPC. Answer the prompt in
+   the viewer.
+4. **Clipboard with the service:** text, a picture, and files, both ways
+   (copy on QUIETPC, paste on QUIETPC22, and the other way round). Files
+   are pasted with Explorer's own copy window.
+5. **At the lock screen:** before anyone signs in, the clipboard doesn't
+   cross (nobody's clipboard to use). After signing in it works again.
+6. **Stop sharing and End session** in the Glass window on QUIETPC still work.
+7. Send back the viewer results, and from QUIETPC
+   `C:\ProgramData\Glass\agent-results.txt` (last two sessions) and the end of
+   `C:\ProgramData\Glass\service.log`. The results have a line "session
+   switches with the viewer kept connected: N (picture paused for …)".
+
 ## M5c test 4 (clipboard: text, pictures and files, both ways)
 Update **both** machines first. This is protocol v8, so an old build on either
 side refuses to connect. On the PC with the service, run

@@ -340,15 +340,18 @@ impl Drop for FineTimer {
     }
 }
 
-/// Still-picture refinement: this long after the last change...
-const REFINE_AFTER_US: u64 = 200_000;
-/// ...after changes worth it (bytes encoded since the last one)...
-const REFINE_MIN_CHANGE: usize = 40_000;
+/// Still-picture refinement: this long after the last change (m5-test25:
+/// 200 ms sent 122 quality keyframes in 3.5 minutes of scrolling, ~430 KB
+/// each across QUIETPC's eero mesh hop; input -> screen went from ~35 to
+/// 49 ms p50)...
+const REFINE_AFTER_US: u64 = 400_000;
+/// ...after changes worth it (bytes of real changes since the last one)...
+const REFINE_MIN_CHANGE: usize = 100_000;
 /// ...one high-quality keyframe of the last picture (m5-test22: three
 /// passes at the normal per-frame budget never sharpened photos)...
 const REFINE_PASSES: u32 = 1;
-/// ...this far apart.
-const REFINE_EVERY_US: u64 = 60_000;
+/// ...and at most one this often.
+const REFINE_EVERY_US: u64 = 2_000_000;
 
 /// The encoder's bitrate for a viewer's limit: coarse steps (each change
 /// costs a keyframe with FFmpeg's NVENC), the largest at or under the limit,

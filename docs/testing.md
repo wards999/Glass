@@ -10,6 +10,11 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 26 (Full colour photos sharp too)
+As test 25: from QUIETPC22 view QUIETPC; photos in Fast and Full colour,
+each still for a second; then normal use (scrolling, the pool game).
+Full colour photos should now sharpen as Fast ones did. Then "done".
+
 ## M5 test 25 (direct NVENC: sharp photos)
 Update QUIETPC22, QUIETPC (Glass and the service).
 1. From QUIETPC22 view QUIETPC: photos, in Fast and in Full colour, each

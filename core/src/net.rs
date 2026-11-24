@@ -1147,6 +1147,16 @@ impl HostSession {
             if queued {
                 Ok(())
             } else {
+                // The queue is full (a frame of more than `pacer::SLOTS`
+                // datagrams): what's waiting goes first, in order, then
+                // this one. Sending it ahead put it more than the viewer's
+                // replay window past the waiting ones, which were then
+                // refused as replays (a 2.2 MB still picture in 4:4:4:
+                // 15,360 refused, the frame lost, never sharp).
+                while let Some(d) = pace.front_due(u64::MAX) {
+                    let _ = udp.send_to(d, peer);
+                    pace.pop();
+                }
                 udp.send_to(&wire[..len], peer).map(|_| ())
             }
         })?;

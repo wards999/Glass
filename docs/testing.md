@@ -10,6 +10,18 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 17 (sound from the Mac; the Mac at the PC's refresh)
+Protocol v14, as before. Update QUIETPC22 and the Mac.
+1. **The Mac viewing QUIETPC22** (pool, as before): a minute with the
+   stats showing, two minutes hidden with the pointer away from the top.
+   The bar should fit, with its status on a second line.
+2. **QUIETPC22 viewing the Mac:** play something with sound on the Mac (a
+   video or music). Expected: it plays from QUIETPC22's speakers, not the
+   Mac's, in step with the picture. Move a window around: the PC's stats
+   should show more than 60 fps (the Mac's screen at the PC's refresh).
+3. Send all four results: the Mac's viewer and host results, and
+   QUIETPC22's host and viewer results.
+
 ## M5 test 16 (the Keys menu on the Mac too)
 Everything in test 15 below, plus: on the Mac viewing QUIETPC22, open the
 bar and try "Keys": Start should open the PC's Start menu, Switch apps

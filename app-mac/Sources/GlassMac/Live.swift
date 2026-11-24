@@ -111,7 +111,9 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     /// suit the host sending twice the refresh.
     private let presentPath = "late in each refresh, the newest frame"
     /// How long before the next refresh the frame goes (s).
-    private let presentLead = 0.005
+    /// 3 ms (was 5): every ms here is a ms of lag; a present that misses
+    /// costs a whole refresh, counted as "late" in the results (m5-test17).
+    private let presentLead = 0.003
     private var keyMonitor: Any?
     private var finished = false
     private let started = GlassClock.nowUs()
@@ -155,6 +157,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     private var decodeErrors = 0
     private var usingHardware = false
     private var lastPresentedUs: UInt64 = 0
+    /// The host's capture time of the last frame shown (µs, ours).
+    private var lastShownCaptureUs: UInt64 = 0
     private var lastInputMeasured: UInt32 = 0
     private var finalStats = GLASS_ClientStats()
     private let session = LiveStats()
@@ -764,10 +768,12 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         let submitted = GlassClock.nowUs()
         lock.withLock { submittedCount += 1 }
         let client = self.client
-        // On time: shown at the refresh it was presented for. A refresh
-        // later: the window compositor took it (m5-test13: present 20 ms
-        // p50, 5 ms early plus a whole refresh).
-        let onTimeBy = target + refreshPeriod / 2
+        // On time: shown one refresh after the deadline it was presented
+        // for, which is macOS's own pipeline even straight to the display
+        // (m5-test16: the Metal overlay said Direct while every frame
+        // showed then). Later: it missed (the lead too short) or the
+        // compositor took it.
+        let onTimeBy = target + refreshPeriod * 1.5
         drawable.addPresentedHandler { [weak self] d in
             guard let self, d.presentedTime > 0 else { return }
             let shown = GlassClock.us(fromMediaTime: d.presentedTime)
@@ -786,9 +792,17 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                     if self.lastPresentedUs > 0 { s.interval.push(span(shown, self.lastPresentedUs)) }
                     if newInput, let sentAt { s.input.push(span(shown, sentAt)) }
                 }
-                // The longest gaps on screen, after the first 2 s (start-up).
-                if self.lastPresentedUs > 0, shown > self.started + 2_000_000 {
-                    let gap = shown &- self.lastPresentedUs
+                // The longest gaps on screen, after the first 2 s (start-up),
+                // but not when the host's own screen stood still: frames
+                // captured that far apart are a still picture, not a stall
+                // (m5-test16: 1 s gaps from Show desktop, the clock ticking).
+                let captureGap = t.captureLocal > 0 && self.lastShownCaptureUs > 0
+                    ? t.captureLocal &- self.lastShownCaptureUs : 0
+                if t.captureLocal > 0 { self.lastShownCaptureUs = t.captureLocal }
+                let gapUs = self.lastPresentedUs > 0 ? shown &- self.lastPresentedUs : 0
+                if self.lastPresentedUs > 0, shown > self.started + 2_000_000,
+                   captureGap == 0 || gapUs > captureGap + 50_000 || captureGap < 100_000 {
+                    let gap = gapUs
                     if self.worst.count < 6 || gap > (self.worst.last?.gap ?? 0) {
                         self.worst.append(Moment(at: shown - self.started, gap: gap,
                                                  total: t.captureLocal > 0 ? shown &- t.captureLocal : 0,
@@ -823,7 +837,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 : "input → screen    (move or type to measure)"
             var lines = [
                 "Glass  \(client.hostName) \(client.host)  \(streamDesc)  [\(pcStyleModifiers ? "⌘→Win ⌃→Ctrl" : "⌘→Ctrl ⌃→Win")]",
-                String(format: "shown %.0f fps  received %.0f fps  %.1f Mbps  direct %ld%%", Double(r.presented) / secs, Double(r.frames) / secs, Double(r.bytes) * 8 / secs / 1e6, r.onTime * 100 / max(r.onTime + r.later, 1)),
+                String(format: "shown %.0f fps  received %.0f fps  %.1f Mbps  on time %ld%%", Double(r.presented) / secs, Double(r.frames) / secs, Double(r.bytes) * 8 / secs / 1e6, r.onTime * 100 / max(r.onTime + r.later, 1)),
                 totalLine,
                 inputLine,
                 "  encode \(p50(r.encode)) | network \(p50(r.network)) | queue \(p50(r.queue)) | decode \(p50(r.decode)) | wait \(p50(r.wait)) | present \(p50(r.present))   (p50 ms)",
@@ -971,7 +985,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 out.append("  PC notices: \(noticesSeen.sorted().map { $0 == UInt8(GLASS_NOTICE_INPUT_BLOCKED_ELEVATED) ? "input blocked by an admin window" : "UAC prompt / lock screen" }.joined(separator: ", "))")
             }
             let shownAll = max(s.onTime + s.later, 1)
-            out.append("  decoder: \(usingHardware ? "hardware" : "SOFTWARE") | presented by: \(presentPath) | on screen at its own refresh \(s.onTime * 100 / shownAll)% (straight to the display), a refresh later \(s.later * 100 / shownAll)% (through the compositor: stats, the bar or its handle showing)")
+            out.append("  decoder: \(usingHardware ? "hardware" : "SOFTWARE") | presented by: \(presentPath) | on time \(s.onTime * 100 / shownAll)% (one refresh after its deadline, macOS's own pipeline), late \(s.later * 100 / shownAll)% (missed the deadline, or composited) | lead \(Int(presentLead * 1000)) ms")
             out.append("  clipboard: \(clipSummary)")
             out.append(s.encode.line("encode (host)"))
             out.append(s.network.line("network"))

@@ -165,6 +165,8 @@ private final class HostSessionRun {
     var clipSummary = "off"
     /// The viewer's screen refresh (Hz, 0 = unknown), from its Hello.
     var viewerHz: UInt16 = 0
+    /// The Mac's sound, to the viewer (M4b step 3).
+    var audio: HostAudio?
     /// This Mac's Wi-Fi link during the session (M4 step 5).
     let wifi = WifiWatch()
     let failLock = NSLock()
@@ -193,6 +195,20 @@ private final class HostSessionRun {
 
     /// Position in the PC's Ctrl+Alt+Shift+R cycle (Fit is 1).
     static func viewNumber(_ m: UInt8) -> Int { Int(m) == 0 ? 4 : Int(m) }
+
+    /// A virtual display at the viewer's refresh (30 to 240 Hz; 60 if it
+    /// didn't say, or if macOS refuses the rate), and the rate it got.
+    static func virtualDisplay(name: String, pointsW: Int, pointsH: Int, hiDPI: Bool, viewerHz: Int,
+                               mirror: CGDirectDisplayID) -> (VirtualDisplay, Int)? {
+        let want = viewerHz > 0 ? min(max(viewerHz, 30), 240) : 60
+        for hz in want == 60 ? [60] : [want, 60] {
+            if let v = VirtualDisplay(name: name, pointsW: pointsW, pointsH: pointsH, hiDPI: hiDPI,
+                                      hz: Double(hz), mirror: mirror) {
+                return (v, hz)
+            }
+        }
+        return nil
+    }
 
     /// Sets up capture and encode for `mode`; tells the viewer if the stream
     /// changes. On the accept thread, with no pipeline running.
@@ -235,13 +251,16 @@ private final class HostSessionRun {
                 actual = mode
                 note = virtualNote
             } else if VirtualDisplay.available,
-                      let v = VirtualDisplay(name: "Glass \(vw)x\(vh)", pointsW: pw, pointsH: ph, hiDPI: hidpi,
-                                             hz: 60, mirror: runner.display.id) {
+                      let made = Self.virtualDisplay(name: "Glass \(vw)x\(vh)", pointsW: pw, pointsH: ph,
+                                                        hiDPI: hidpi, viewerHz: Int(viewer.refresh_hz),
+                                                        mirror: runner.display.id) {
+                let (v, hz) = made
                 virtual = v
-                // Captured at the viewer's pixel size: 1:1 on its screen.
-                disp = HostDisplay(id: v.id, width: vw, height: vh, fps: 60, bounds: CGDisplayBounds(v.id))
+                // Captured at the viewer's pixel size and refresh: 1:1 on
+                // its screen, motion at its rate (was a fixed 60 Hz).
+                disp = HostDisplay(id: v.id, width: vw, height: vh, fps: hz, bounds: CGDisplayBounds(v.id))
                 actual = mode
-                note = " (virtual display, looks like \(pw)x\(ph)\(hidpi ? " HiDPI" : ""))"
+                note = " (virtual display, looks like \(pw)x\(ph)\(hidpi ? " HiDPI" : "") at \(hz) Hz)"
                 virtualDisp = disp
                 virtualNote = note
             } else {
@@ -283,6 +302,12 @@ private final class HostSessionRun {
         viewerHz = viewer.refresh_hz
         // 4:4:4 from the start unless the viewer prefers 4:2:0.
         configure(mode: viewer.mode, allow444: viewer.caps & UInt8(GLASS_CAP_PREFER_420) == 0)
+        // The sound (M4b step 3): its own capture, kept across view changes.
+        if !runner.options.testPattern, let out = q.sync(execute: { s.audioOut() }) {
+            let a = HostAudio(out: out)
+            a.start(display: runner.display.id)
+            audio = a
+        }
 
         let cursorTimer = DispatchSource.makeTimerSource(queue: .main)
         cursorTimer.schedule(deadline: .now(), repeating: .milliseconds(33))
@@ -354,6 +379,7 @@ private final class HostSessionRun {
         }
         cursorTimer.cancel()
         clipTimer?.cancel()
+        audio?.stop()
         if clipTimer != nil { clipSummary = ClipboardSync.summary(q.sync { s.clipProgress }, other: "viewer") }
         pipeline?.stop()
         pipeline = nil
@@ -413,6 +439,9 @@ private final class HostSessionRun {
                                   : "\(o.mbps) Mbps (no limit from the viewer)",
                           t.rateChanges,
                           t.rateLow > 0 && t.rateLow < ours ? String(format: ", lowest %.1f Mbps", Double(t.rateLow) / 1e6) : ""))
+        if let a = audio {
+            out.append("  sound (M4b): \(a.frames) frames sent (\(a.silent) silent) | this Mac's speakers \(a.muted ? "muted during the session" : "not muted (this output has no mute)")\(a.problem.map { " | \($0)" } ?? "")")
+        }
         if !running, !t.psnrY.isEmpty {
             func p50(_ a: [Double]) -> Double { a.sorted()[a.count / 2] }
             let good = t.psnrY.filter { $0 >= 45 }.count

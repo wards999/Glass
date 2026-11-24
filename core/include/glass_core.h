@@ -156,6 +156,12 @@
 #define GLASS_INPUT_SCROLL 4
 
 /**
+ * Interleaved stereo samples in one 10 ms sound frame (48 kHz): the C
+ * header's `GLASS_AUDIO_FRAME_LEN` (a literal, for cbindgen).
+ */
+#define GLASS_AUDIO_FRAME_LEN 960
+
+/**
  * We paired with it as a viewer: it's a host we trust.
  */
 #define GLASS_ROLE_HOST (1 << 0)
@@ -666,6 +672,13 @@ typedef enum GLASS_ConnectError GLASS_ConnectError;
 #else
 typedef int32_t GLASS_ConnectError;
 #endif // __STDC_VERSION__ >= 202311L
+
+/**
+ * Sends the host's sound to the viewer, from the capture thread (M4b).
+ * Encodes, then seals and sends on the video's socket (one sealer: the
+ * nonce never repeats). Lock order: `audio`, then `tx`.
+ */
+typedef struct GLASS_AudioOut GLASS_AudioOut;
 
 /**
  * A viewer connection. Exactly one thread may call `wait_frame`/`release_frame`.
@@ -1947,6 +1960,34 @@ size_t glass_audio_stats_text(const GLASS_AudioStats *s, char *buf, size_t len);
  * `s` from `glass_host_accept`.
  */
 int64_t glass_session_take_video_rate(const GLASS_HostSession *s);
+
+/**
+ * The host's sound sender (M4b step 3: a Mac host), for its audio capture
+ * thread. Free with `glass_audio_out_free`.
+ *
+ * # Safety
+ * `s` from `glass_host_accept`.
+ */
+GLASS_AudioOut *glass_session_audio_out(const GLASS_HostSession *s);
+
+/**
+ * Sends one 10 ms frame of sound: `n` must be `AUDIO_FRAME_LEN`
+ * interleaved stereo samples at 48 kHz, captured at `capture_ts_us` (this
+ * machine's clock). False if the viewer isn't reachable yet.
+ *
+ * # Safety
+ * `a` from `glass_session_audio_out`; `pcm` valid for `n` floats.
+ */
+bool glass_audio_out_send(const GLASS_AudioOut *a,
+                          const float *pcm,
+                          size_t n,
+                          uint64_t capture_ts_us);
+
+/**
+ * # Safety
+ * `a` from `glass_session_audio_out`, not used after.
+ */
+void glass_audio_out_free(GLASS_AudioOut *a);
 
 /**
  * The weak-link test mode (Mbps, 0 = off): received packets go through a

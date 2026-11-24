@@ -234,6 +234,13 @@ struct Shared {
     stats_gen: AtomicU32,
     /// Key presses this viewer sent (for the report).
     keys_sent: AtomicU32,
+    /// Capture → screen p50 (µs, 0 = not yet), for keeping the sound with
+    /// the picture (render thread → UI thread).
+    picture_us: AtomicU32,
+    /// The host's sound playing here (M4b step 3): the output's own delay
+    /// (ms), and why it isn't playing, for the results.
+    sound_output_ms: AtomicU32,
+    sound_problem: Mutex<Option<String>>,
     clipboard: bool,
     /// The keyboard hook is wanted (`Options::hook_shortcuts`).
     hook: bool,
@@ -313,6 +320,10 @@ struct Ui {
     _clip: Option<super::clip::ClipSync>,
     /// The file-transfer line the box is showing ("" = none).
     files_shown: String,
+    /// The host's sound, once it arrives (M4b step 3), and the A/V hold.
+    player: Option<super::play::Player>,
+    audio_floor_ms: f64,
+    last_sync_us: u64,
 }
 
 thread_local! {
@@ -474,6 +485,9 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         stats_text: Mutex::new(String::new()),
         stats_gen: AtomicU32::new(0),
         keys_sent: AtomicU32::new(0),
+        picture_us: AtomicU32::new(0),
+        sound_output_ms: AtomicU32::new(0),
+        sound_problem: Mutex::new(None),
         clipboard: opts.clipboard,
         hook: opts.hook_shortcuts,
         rule: opts.rule.unwrap_or(if client_os == HOST_OS_MAC {
@@ -661,10 +675,21 @@ fn session_report(sh: &Shared, r: &Report, head: &ReportHead, reason: &str) -> S
     if let Some(t) = sh.client.test_link_line() {
         let _ = writeln!(out, "  {t}");
     }
-    // LATER(M4b step 3): played on Windows too.
+    let played = match sh
+        .sound_problem
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        Some(e) => format!("not played here: {e}"),
+        None => match sh.sound_output_ms.load(Ordering::Relaxed) {
+            0 => "none came".to_string(),
+            ms => format!("played here, the output's own delay {ms} ms"),
+        },
+    };
     let _ = writeln!(
         out,
-        "  {} (not played on Windows yet)",
+        "  {} | {played}",
         glass_core::audio::describe(&sh.client.audio_stats())
     );
     let _ = writeln!(
@@ -969,6 +994,7 @@ fn render_loop(
     let mut stats_failures = 0u32;
     let end = seconds.map(|s| clock::now_us() + (s * 1e6) as u64);
     let mut next_stats = 0u64;
+    let mut next_picture = 0u64;
     let mut next_log = 0u64;
     let mut rates = Rates::default();
     // Frames that queued up while the window and decoder were being made
@@ -1112,6 +1138,14 @@ fn render_loop(
 
         // The on-screen stats, four times a second while they're shown.
         let now = clock::now_us();
+        // The picture's delay, once a second, for the sound to follow.
+        if now >= next_picture {
+            next_picture = now + 1_000_000;
+            let t = r.total.summary();
+            if t.count > 30 {
+                sh.picture_us.store(t.p50_us, Ordering::Relaxed);
+            }
+        }
         if now >= next_log {
             next_log = now + super::slog::EVERY_US;
             running(r);
@@ -1240,6 +1274,9 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
                 super::clip::ClipSync::start(sh.client.clip_link(), true)
             }),
             files_shown: String::new(),
+            player: None,
+            audio_floor_ms: 20.0,
+            last_sync_us: 0,
         })
     });
     with_ui(|ui| ui.layout());
@@ -1281,6 +1318,43 @@ fn save_handle_frac(f: f64) {
 }
 
 impl Ui {
+    /// The host's sound (M4b step 3): plays once it arrives; once a
+    /// second, holds it so it plays just after the picture (as the Mac
+    /// viewer does: sound a little late is far less noticeable than early).
+    fn tick_sound(&mut self) {
+        let sh = self.sh.clone();
+        if self.player.is_none() {
+            if let Some(ring) = sh.client.audio_ring() {
+                self.player = Some(super::play::Player::start(ring));
+            }
+            return;
+        }
+        let Some(p) = &self.player else { return };
+        if let Some(e) = p.problem() {
+            *sh.sound_problem.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+        }
+        if !p.playing.load(Ordering::Relaxed) {
+            return;
+        }
+        let out_ms = p.output_ms.load(Ordering::Relaxed);
+        sh.sound_output_ms.store(out_ms, Ordering::Relaxed);
+        let now = clock::now_us();
+        let picture_ms = sh.picture_us.load(Ordering::Relaxed) as f64 / 1e3;
+        if now < self.last_sync_us + 1_000_000 || picture_ms <= 0.0 || out_ms == 0 {
+            return;
+        }
+        self.last_sync_us = now;
+        let st = sh.client.audio_stats();
+        if st.latency_ms == 0 {
+            return;
+        }
+        let sound = st.latency_ms as f64 + out_ms as f64;
+        let want = st.queued_ms as f64 + (picture_ms + 5.0 - sound);
+        self.audio_floor_ms += (want.clamp(20.0, 80.0) - self.audio_floor_ms) * 0.5;
+        sh.client
+            .set_audio_min_target((self.audio_floor_ms * 1_000.0) as u64);
+    }
+
     /// The viewer's client area in screen coordinates.
     fn client_on_screen(&self) -> RECT {
         let mut r = RECT::default();
@@ -1481,7 +1555,6 @@ impl Ui {
                 ("Show desktop  (Win+D)", &[GUI, 0x07]),
                 ("File Explorer  (Win+E)", &[GUI, 0x08]),
                 ("Screenshot  (Win+Shift+S)", &[GUI, SHIFT, 0x16]),
-                ("Task Manager  (Ctrl+Shift+Esc)", &[CTRL, SHIFT, ESC]),
             ]
         };
         let chosen = unsafe {
@@ -1939,6 +2012,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 Some(LRESULT(0))
             }
             WM_TIMER if wparam.0 == TIMER_CURSOR => {
+                ui.tick_sound();
                 ui.poll_cursor();
                 ui.tick_bar();
                 ui.tick_stats();

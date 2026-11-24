@@ -23,6 +23,7 @@ mod inject;
 mod mdns;
 mod netif;
 mod pipe;
+mod play;
 mod present;
 pub mod service;
 mod slog;

@@ -17,12 +17,12 @@ final class ControlBar: NSVisualEffectView {
     private let colour = NSSegmentedControl()
     private let full = NSButton()
     private let stats = NSButton()
-    private let keys = NSButton()
     private let pin = NSButton()
     /// The Keys menu: shortcuts macOS keeps for itself, sent to the host on
     /// a click (as on the Windows viewer, ADR 0029).
     private let keysMenu = NSPopUpButton(frame: .zero, pullsDown: true)
     private var keySets: [[UInt8]] = []
+    private static let shortcutTag = 100
     /// The weak-link test mode (M5), orange while on.
     private let testLink = NSButton()
     private let status = NSTextField(labelWithString: "")
@@ -56,8 +56,10 @@ final class ControlBar: NSVisualEffectView {
 
         colour.segmentStyle = .rounded
         colour.segmentCount = 2
-        colour.setLabel("Fast (4:2:0)", forSegment: 0)
-        colour.setLabel("Full colour (4:4:4)", forSegment: 1)
+        colour.setLabel("Fast", forSegment: 0)
+        colour.setLabel("Full colour", forSegment: 1)
+        colour.setToolTip("4:2:0: the lowest lag", forSegment: 0)
+        colour.setToolTip("4:4:4: exact colour, sharper coloured text", forSegment: 1)
         colour.setEnabled(fullColourOK, forSegment: 1)
         colour.trackingMode = .selectOne
         colour.target = self
@@ -86,12 +88,15 @@ final class ControlBar: NSVisualEffectView {
             ("Show desktop  (Win+D)", [gui, 0x07]),
             ("File Explorer  (Win+E)", [gui, 0x08]),
             ("Screenshot  (Win+Shift+S)", [gui, shift, 0x16]),
-            ("Task Manager  (Ctrl+Shift+Esc)", [ctrl, shift, esc]),
         ]
         keysMenu.bezelStyle = .rounded
         keysMenu.addItem(withTitle: "Keys") // a pull-down's title item
-        for (title, keys) in entries {
+        // How ⌘ and ⌃ act with a PC is a lasting preference, in the app's
+        // Connection menu ("PC-Style Modifiers"), not the bar: a "PC keys"
+        // toggle beside the Keys menu confused.
+        for (i, (title, keys)) in entries.enumerated() {
             keysMenu.addItem(withTitle: title)
+            keysMenu.lastItem?.tag = Self.shortcutTag + i
             keySets.append(keys)
         }
         keysMenu.target = self
@@ -101,9 +106,6 @@ final class ControlBar: NSVisualEffectView {
             : "Windows shortcuts sent to the PC on a click. (Ctrl+Alt+Del comes later: it needs the Glass service on the PC.)"
 
         button(stats, "Stats", #selector(statsTapped), toggle: true)
-        button(keys, "PC keys", #selector(keysTapped), toggle: true)
-        keys.isHidden = hostIsMac // between Macs, ⌘ is ⌘
-        keys.toolTip = "On: ⌘ acts as the Windows key and ⌃ as Ctrl. Off: ⌘ acts as Ctrl (⌘C copies)."
         button(testLink, "Weak Wi-Fi test", #selector(testLinkTapped), toggle: true)
         testLink.toolTip = "Test mode: what arrives goes through a pretend 15 Mbps link, to try rate control. Logged in the results."
         button(pin, "Pin", #selector(pinTapped), toggle: true)
@@ -115,14 +117,23 @@ final class ControlBar: NSVisualEffectView {
         status.lineBreakMode = .byTruncatingTail
         status.setContentCompressionResistancePriority(.init(1), for: .horizontal)
 
-        for c in [views, colour, full, keysMenu, stats, keys, testLink, pin, disconnect] as [NSControl] { c.refusesFirstResponder = true }
-        let row = NSStackView(views: [views, colour, full, keysMenu, stats, keys, testLink, pin, disconnect, status])
-        row.orientation = .horizontal
-        row.spacing = 8
-        row.edgeInsets = NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 12)
+        for c in [views, colour, full, keysMenu, stats, testLink, pin, disconnect] as [NSControl] { c.refusesFirstResponder = true }
+        // Only one view to pick (a PC host shares its own screen): no switch.
+        views.isHidden = modes.count < 2
+        let buttons = NSStackView(views: [views, colour, full, keysMenu, stats, testLink, pin, disconnect])
+        buttons.orientation = .horizontal
+        buttons.spacing = 8
+        // The status on its own line under the buttons: the bar had grown
+        // wider than the screen (m5-test16).
+        let row = NSStackView(views: [buttons, status])
+        row.orientation = .vertical
+        row.alignment = .centerX
+        row.spacing = 4
+        row.edgeInsets = NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 10)
         // Too narrow a window clips the bar rather than widening the view
         // (m5-test12: a wider button pushed the picture off the screen).
         row.setClippingResistancePriority(.defaultLow, for: .horizontal)
+        buttons.setClippingResistancePriority(.defaultLow, for: .horizontal)
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
         NSLayoutConstraint.activate([
@@ -142,7 +153,6 @@ final class ControlBar: NSVisualEffectView {
         colour.selectedSegment = fullColour ? 1 : 0
         full.title = fullScreen ? "Window" : "Full screen"
         stats.state = statsShown ? .on : .off
-        keys.state = pcKeys ? .on : .off
         pin.state = pinned ? .on : .off
         let testOn = testLinkMbps > 0
         testLink.state = testOn ? .on : .off
@@ -159,10 +169,10 @@ final class ControlBar: NSVisualEffectView {
     @objc private func colourChanged() { onCommand(.colour(colour.selectedSegment == 1)) }
     @objc private func fullTapped() { onCommand(.fullScreen) }
     @objc private func statsTapped() { onCommand(.stats) }
-    @objc private func keysTapped() { onCommand(.pcKeys) }
     @objc private func testLinkTapped() { onCommand(.testLink) }
     @objc private func keysChosen() {
-        let i = keysMenu.indexOfSelectedItem - 1 // 0 is the title
+        guard let tag = keysMenu.selectedItem?.tag else { return }
+        let i = tag - Self.shortcutTag
         if i >= 0, i < keySets.count { onCommand(.keys(keySets[i])) }
     }
     @objc private func pinTapped() { pinned.toggle() }

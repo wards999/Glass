@@ -249,6 +249,12 @@ public final class GlassHostSession {
         return v < 0 ? nil : v
     }
 
+    /// The sound sender for this session (M4b step 3), for `HostAudio`.
+    public func audioOut() -> OpaquePointer? {
+        guard let ptr else { return nil }
+        return glass_session_audio_out(ptr)
+    }
+
     /// Text from the viewer, once.
     public func takeClipboard() -> ClipboardSync.Item? {
         guard let ptr, let h = glass_session_take_clipboard(ptr) else { return nil }

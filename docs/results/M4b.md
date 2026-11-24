@@ -80,3 +80,17 @@ Fixed in m4b-test3:
 ## To do
 - Steps 2–4 (ADR 0025), then real numbers: audio latency, A/V offset,
   concealed and gaps on Wi-Fi, with a file copy running.
+
+## Step 3: Mac → PC (m5-test17)
+- **Mac host:** ScreenCaptureKit captures everything the Mac plays (not
+  Glass's own sound) on its own stream, 48 kHz stereo, cut into 10 ms
+  frames and sent through core (`glass_session_audio_out`,
+  `glass_audio_out_send`): the same Opus path as a PC host. The Mac's
+  default output is muted for the session and restored after.
+- **Windows viewer:** plays the ring core fills (`play.rs`): WASAPI shared
+  mode, event-driven, 10 ms period. Once a second it holds the sound so it
+  plays about 5 ms after the picture, as the Mac viewer does.
+- Also PC → PC: a Windows viewer now plays a PC host's sound.
+- To see: whether ScreenCaptureKit still hears the Mac's sound with its
+  output muted, and whether it sends while nothing plays (the "silent"
+  count).

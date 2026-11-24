@@ -1439,6 +1439,51 @@ pub unsafe extern "C" fn glass_session_take_video_rate(s: *const HostSession) ->
     (*s).take_video_rate().map_or(-1, |b| b as i64)
 }
 
+/// The host's sound sender (M4b step 3: a Mac host), for its audio capture
+/// thread. Free with `glass_audio_out_free`.
+///
+/// # Safety
+/// `s` from `glass_host_accept`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_session_audio_out(
+    s: *const HostSession,
+) -> *mut crate::net::AudioOut {
+    Box::into_raw(Box::new((*s).audio_out()))
+}
+
+/// Sends one 10 ms frame of sound: `n` must be `AUDIO_FRAME_LEN`
+/// interleaved stereo samples at 48 kHz, captured at `capture_ts_us` (this
+/// machine's clock). False if the viewer isn't reachable yet.
+///
+/// # Safety
+/// `a` from `glass_session_audio_out`; `pcm` valid for `n` floats.
+#[no_mangle]
+pub unsafe extern "C" fn glass_audio_out_send(
+    a: *const crate::net::AudioOut,
+    pcm: *const f32,
+    n: usize,
+    capture_ts_us: u64,
+) -> bool {
+    if a.is_null() || pcm.is_null() || n != crate::audio::FRAME_LEN {
+        return false;
+    }
+    (*a).send(std::slice::from_raw_parts(pcm, n), capture_ts_us)
+}
+
+/// # Safety
+/// `a` from `glass_session_audio_out`, not used after.
+#[no_mangle]
+pub unsafe extern "C" fn glass_audio_out_free(a: *mut crate::net::AudioOut) {
+    if !a.is_null() {
+        drop(Box::from_raw(a));
+    }
+}
+
+/// Interleaved stereo samples in one 10 ms sound frame (48 kHz): the C
+/// header's `GLASS_AUDIO_FRAME_LEN` (a literal, for cbindgen).
+pub const AUDIO_FRAME_LEN: usize = 960;
+const _: () = assert!(AUDIO_FRAME_LEN == crate::audio::FRAME_LEN);
+
 /// The weak-link test mode (Mbps, 0 = off): received packets go through a
 /// pretend bottleneck. Each switch is logged.
 ///

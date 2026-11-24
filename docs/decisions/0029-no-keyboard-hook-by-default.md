@@ -31,3 +31,9 @@ it won't have an exclusion.
   With a Mac host that matters little (Ctrl already acts as ⌘).
 - Whether Defender stays quiet can only be seen over time; detections were
   occasional.
+
+## Addendum (m5-test16): the Mac viewer too
+The Mac viewer never needed a hook, but macOS keeps ⌘Tab, ⌘Space, the
+screenshot keys and Mission Control for itself. Its bar gets the same Keys
+menu, matched to the host: the Mac list for a Mac, the Windows list for a
+PC.

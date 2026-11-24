@@ -10,6 +10,11 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 16 (the Keys menu on the Mac too)
+Everything in test 15 below, plus: on the Mac viewing QUIETPC22, open the
+bar and try "Keys": Start should open the PC's Start menu, Switch apps
+Alt+Tab, Show desktop Win+D.
+
 ## M5 test 15 (lag on the Mac; no keyboard hook on Windows)
 Protocol v14, as before. Update all three machines, and the service on QUIETPC.
 1. The lag test: as test 14 below (a minute with the stats showing, then

@@ -7,6 +7,8 @@ import AppKit
 final class ControlBar: NSVisualEffectView {
     enum Command {
         case view(UInt8), colour(Bool), fullScreen, stats, pcKeys, testLink, disconnect
+        /// HID keys to press in order and release in reverse (the Keys menu).
+        case keys([UInt8])
     }
 
     var onCommand: (Command) -> Void = { _ in }
@@ -17,6 +19,10 @@ final class ControlBar: NSVisualEffectView {
     private let stats = NSButton()
     private let keys = NSButton()
     private let pin = NSButton()
+    /// The Keys menu: shortcuts macOS keeps for itself, sent to the host on
+    /// a click (as on the Windows viewer, ADR 0029).
+    private let keysMenu = NSPopUpButton(frame: .zero, pullsDown: true)
+    private var keySets: [[UInt8]] = []
     /// The weak-link test mode (M5), orange while on.
     private let testLink = NSButton()
     private let status = NSTextField(labelWithString: "")
@@ -65,6 +71,35 @@ final class ControlBar: NSVisualEffectView {
             b.action = action
         }
         button(full, "Full screen", #selector(fullTapped))
+        // HID usages: Ctrl, Shift, Alt/⌥, GUI (⌘ / Win), and keys.
+        let ctrl: UInt8 = 0xE0, shift: UInt8 = 0xE1, alt: UInt8 = 0xE2, gui: UInt8 = 0xE3
+        let tab: UInt8 = 0x2B, esc: UInt8 = 0x29, space: UInt8 = 0x2C, up: UInt8 = 0x52
+        let entries: [(String, [UInt8])] = hostIsMac ? [
+            ("Spotlight  (⌘Space)", [gui, space]),
+            ("Switch apps  (⌘Tab)", [gui, tab]),
+            ("Mission Control  (⌃↑)", [ctrl, up]),
+            ("Screenshot  (⌘⇧4)", [gui, shift, 0x21]),
+            ("Force Quit  (⌘⌥Esc)", [gui, alt, esc]),
+        ] : [
+            ("Start  (Win)", [gui]),
+            ("Switch apps  (Alt+Tab)", [alt, tab]),
+            ("Show desktop  (Win+D)", [gui, 0x07]),
+            ("File Explorer  (Win+E)", [gui, 0x08]),
+            ("Screenshot  (Win+Shift+S)", [gui, shift, 0x16]),
+            ("Task Manager  (Ctrl+Shift+Esc)", [ctrl, shift, esc]),
+        ]
+        keysMenu.bezelStyle = .rounded
+        keysMenu.addItem(withTitle: "Keys") // a pull-down's title item
+        for (title, keys) in entries {
+            keysMenu.addItem(withTitle: title)
+            keySets.append(keys)
+        }
+        keysMenu.target = self
+        keysMenu.action = #selector(keysChosen)
+        keysMenu.toolTip = hostIsMac
+            ? "Shortcuts this Mac keeps for itself, sent to the other Mac."
+            : "Windows shortcuts sent to the PC on a click. (Ctrl+Alt+Del comes later: it needs the Glass service on the PC.)"
+
         button(stats, "Stats", #selector(statsTapped), toggle: true)
         button(keys, "PC keys", #selector(keysTapped), toggle: true)
         keys.isHidden = hostIsMac // between Macs, ⌘ is ⌘
@@ -80,8 +115,8 @@ final class ControlBar: NSVisualEffectView {
         status.lineBreakMode = .byTruncatingTail
         status.setContentCompressionResistancePriority(.init(1), for: .horizontal)
 
-        for c in [views, colour, full, stats, keys, testLink, pin, disconnect] as [NSControl] { c.refusesFirstResponder = true }
-        let row = NSStackView(views: [views, colour, full, stats, keys, testLink, pin, disconnect, status])
+        for c in [views, colour, full, keysMenu, stats, keys, testLink, pin, disconnect] as [NSControl] { c.refusesFirstResponder = true }
+        let row = NSStackView(views: [views, colour, full, keysMenu, stats, keys, testLink, pin, disconnect, status])
         row.orientation = .horizontal
         row.spacing = 8
         row.edgeInsets = NSEdgeInsets(top: 6, left: 10, bottom: 6, right: 12)
@@ -126,6 +161,10 @@ final class ControlBar: NSVisualEffectView {
     @objc private func statsTapped() { onCommand(.stats) }
     @objc private func keysTapped() { onCommand(.pcKeys) }
     @objc private func testLinkTapped() { onCommand(.testLink) }
+    @objc private func keysChosen() {
+        let i = keysMenu.indexOfSelectedItem - 1 // 0 is the title
+        if i >= 0, i < keySets.count { onCommand(.keys(keySets[i])) }
+    }
     @objc private func pinTapped() { pinned.toggle() }
     @objc private func disconnectTapped() { onCommand(.disconnect) }
 }

@@ -637,6 +637,10 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             }
         case .testLink:
             toggleTestLink()
+        case .keys(let keys):
+            client.releaseAll()
+            for k in keys { client.key(k, down: true) }
+            for k in keys.reversed() { client.key(k, down: false) }
         case .disconnect:
             window.performClose(nil)
         }

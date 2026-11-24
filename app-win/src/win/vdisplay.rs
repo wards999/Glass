@@ -101,6 +101,14 @@ fn devices() -> Vec<(HDEVINFO, SP_DEVINFO_DATA)> {
 /// The virtual display's device instances as they appear in an adapter's
 /// device path (`ROOT#DISPLAY#0001`), to tell its screens apart.
 pub fn instance_keys() -> Vec<String> {
+    instance_ids()
+        .iter()
+        .map(|id| id.to_ascii_uppercase().replace('\\', "#"))
+        .collect()
+}
+
+/// The virtual display's device instance ids (`ROOT\DISPLAY\0001`).
+fn instance_ids() -> Vec<String> {
     let devs = devices();
     let mut keys = Vec::new();
     for (set, d) in &devs {
@@ -109,11 +117,7 @@ pub fn instance_keys() -> Vec<String> {
         unsafe {
             if SetupDiGetDeviceInstanceIdW(*set, d, Some(&mut buf), Some(&mut need)).is_ok() {
                 let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-                keys.push(
-                    String::from_utf16_lossy(&buf[..len])
-                        .to_ascii_uppercase()
-                        .replace('\\', "#"),
-                );
+                keys.push(String::from_utf16_lossy(&buf[..len]));
             }
         }
     }
@@ -125,40 +129,58 @@ pub fn instance_keys() -> Vec<String> {
     keys
 }
 
-/// The driver's settings for one session: the viewer's size at its
-/// refresh (and 60 Hz, in case), then a reload through the driver's pipe
-/// (open to the PC's users: no admin).
-pub fn set_mode(w: u32, h: u32, hz: u32) -> Res<()> {
-    let line = |r: u32| {
-        format!("    <resolution><width>{w}</width><height>{h}</height><refresh_rate>{r}</refresh_rate></resolution>\n")
-    };
-    let mut res = line(hz);
+/// Adds `w`×`h` (at `hz` and 60 Hz) to the sizes in the driver's settings,
+/// newest first, up to 24; no reload (the driver reads them when it
+/// starts). The folder is writable by the PC's users.
+pub fn note_mode(w: u32, h: u32, hz: u32) -> Res<()> {
+    let path = config_dir().join("vdd_settings.xml");
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut modes: Vec<(u32, u32, u32)> = vec![(w, h, hz)];
     if hz != 60 {
-        res.push_str(&line(60));
+        modes.push((w, h, 60));
     }
-    std::fs::write(
-        config_dir().join("vdd_settings.xml"),
-        settings_xml(&res, &[]),
-    )?;
-    reload()?;
-    // The driver re-reads its settings and re-creates its screen.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    for line in old.lines().filter(|l| l.contains("<resolution>")) {
+        let tag = |t: &str| -> Option<u32> {
+            let a = line.find(&format!("<{t}>"))? + t.len() + 2;
+            let b = line[a..].find('<')? + a;
+            line[a..b].trim().parse().ok()
+        };
+        if let (Some(a), Some(b), Some(c)) = (tag("width"), tag("height"), tag("refresh_rate")) {
+            if !modes.contains(&(a, b, c)) {
+                modes.push((a, b, c));
+            }
+        }
+    }
+    modes.truncate(24);
+    let res: String = modes
+        .iter()
+        .map(|(a, b, c)| {
+            format!("    <resolution><width>{a}</width><height>{b}</height><refresh_rate>{c}</refresh_rate></resolution>\n")
+        })
+        .collect();
+    let xml = settings_xml(&res, &[]);
+    if xml != old {
+        std::fs::write(&path, xml)?;
+    }
     Ok(())
 }
 
-/// Tells the driver to re-read its settings (`RELOAD_DRIVER`, UTF-16).
-fn reload() -> Res<()> {
-    use std::io::Write;
-    let mut pipe = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(r"\\.\pipe\MTTVirtualDisplayPipe")
-        .map_err(|e| format!("the virtual display driver isn't answering: {e}"))?;
-    let msg: Vec<u8> = "RELOAD_DRIVER"
-        .encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect();
-    pipe.write_all(&msg)?;
+/// Glass may restart the driver here (as administrator: the service).
+pub fn can_restart() -> bool {
+    super::blocker::self_elevated()
+}
+
+/// Restarts the driver so it reads its settings (`pnputil /restart-device`),
+/// then gives its screen a moment to come back.
+pub fn restart_driver() -> Res<()> {
+    let ids = instance_ids();
+    if ids.is_empty() {
+        return Err("the virtual display isn't installed".into());
+    }
+    for id in &ids {
+        run("pnputil", &["/restart-device", id])?;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     Ok(())
 }
 
@@ -369,6 +391,7 @@ pub fn command(args: &[String]) -> Res<()> {
     let r = match args.first().map(String::as_str) {
         Some("install") => install(),
         Some("uninstall") => uninstall(),
+        Some("try") => super::vscreen::try_cli(&args[1..]),
         Some("status") => {
             println!(
                 "virtual display: {}",

@@ -1,7 +1,7 @@
 //! Using the virtual display during a session (ADR 0030, option 1 of the
-//! user's choice): the viewer's screen size and refresh are written into the
-//! driver's settings and the driver reloads them (its pipe, no admin); then
-//! the virtual display becomes the only screen on this PC, so the whole
+//! user's choice): the viewer's screen size and refresh are added to the
+//! driver's settings (the driver restarted to read them where Glass may);
+//! then the virtual display becomes the only screen on this PC, so the whole
 //! desktop moves to it and the PC's own monitor goes dark while viewed. At
 //! the end Windows' saved layout comes back.
 //!
@@ -15,7 +15,8 @@ use super::Res;
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig, SetDisplayConfig,
     DISPLAYCONFIG_ADAPTER_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME,
-    DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS,
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS,
     QUERY_DISPLAY_CONFIG_FLAGS, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE,
     SDC_USE_DATABASE_CURRENT, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
 };
@@ -138,73 +139,153 @@ pub fn restore() {
     }
 }
 
-/// The virtual display on as the only screen, for one session; back to the
-/// PC's own screens when dropped.
-pub struct Session {
-    /// Its GDI name (`\\.\DISPLAYn`).
-    pub name: String,
+/// The virtual display's GDI name (`\.\DISPLAYn`) while it's an active
+/// screen: found by its own adapter, never by elimination (QUIETPC22: when it
+/// dropped out mid-reload, "the only screen left" was the real monitor).
+fn vdd_gdi_name(keys: &[String]) -> Option<String> {
+    let (paths, _) = query(QDC_ONLY_ACTIVE_PATHS)?;
+    for p in paths.iter().filter(|p| is_virtual(p, keys)) {
+        let mut n = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+        n.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        n.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+        n.header.adapterId = p.sourceInfo.adapterId;
+        n.header.id = p.sourceInfo.id;
+        if unsafe { DisplayConfigGetDeviceInfo(&mut n.header) } == 0 {
+            let len = n
+                .viewGdiDeviceName
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(32);
+            return Some(String::from_utf16_lossy(&n.viewGdiDeviceName[..len]));
+        }
+    }
+    None
 }
 
-impl Session {
-    /// `w`×`h` at `hz`: the size the viewer's screen looks like.
-    pub fn start(w: u32, h: u32, hz: u32) -> Res<Self> {
-        let keys = vdisplay::instance_keys();
-        if keys.is_empty() {
-            return Err("the virtual display isn't installed".into());
-        }
-        let before: Vec<String> = super::capture::monitors()?
-            .into_iter()
-            .map(|m| m.name)
+/// The virtual display on as the only screen: its target, fed by a source
+/// on its own adapter, tried every 250 ms for up to 6 s (it may still be
+/// starting).
+fn activate(keys: &[String]) -> Res<()> {
+    let same = |p: &DISPLAYCONFIG_PATH_INFO| {
+        let (s, t) = (p.sourceInfo.adapterId, p.targetInfo.adapterId);
+        s.LowPart == t.LowPart && s.HighPart == t.HighPart
+    };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    let mut last = 0;
+    let mut seen = false;
+    loop {
+        let (paths, _) = query(QDC_ALL_PATHS).ok_or("couldn't read the screen layout")?;
+        let candidates: Vec<_> = paths
+            .iter()
+            .filter(|p| is_virtual(p, keys) && p.targetInfo.targetAvailable.as_bool())
+            .copied()
             .collect();
-        let _ = detach_saved();
-        vdisplay::set_mode(w, h, hz)?;
-        let r = (|| -> Res<Self> {
-            let (paths, _) = query(QDC_ALL_PATHS).ok_or("couldn't read the screen layout")?;
-            let mut p = *paths
-                .iter()
-                .find(|p| is_virtual(p, &keys) && p.targetInfo.targetAvailable.as_bool())
-                .ok_or("the virtual display isn't available")?;
+        seen |= !candidates.is_empty();
+        if let Some(c) = candidates.iter().find(|p| same(p)).or(candidates.first()) {
+            let mut p = *c;
             p.flags = PATH_ACTIVE;
             p.sourceInfo.Anonymous.modeInfoIdx = NO_MODE;
             p.targetInfo.Anonymous.modeInfoIdx = NO_MODE;
-            let r = unsafe {
+            last = unsafe {
                 SetDisplayConfig(
                     Some(&[p]),
                     None,
                     SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
                 )
             };
-            if r != 0 {
-                return Err(format!("couldn't switch to the virtual display (error {r})").into());
+            if last == 0 && vdd_gdi_name(keys).is_some() {
+                return Ok(());
             }
-            // Its GDI name: the screen that wasn't there before, or the
-            // only one left.
-            let mut name = None;
-            for _ in 0..20 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let now = super::capture::monitors()?;
-                name = now
-                    .iter()
-                    .find(|m| !before.contains(&m.name))
-                    .or(if now.len() == 1 { now.first() } else { None })
-                    .map(|m| m.name.clone());
-                if name.is_some() {
-                    break;
+        }
+        if std::time::Instant::now() >= until {
+            return Err(if seen {
+                format!("couldn't switch to the virtual display (error {last})")
+            } else {
+                "the virtual display isn't available".to_string()
+            }
+            .into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// The viewer's size on the virtual display (and only on it), at its
+/// refresh or else 60 Hz; tried for up to 2 s. False if the driver doesn't
+/// offer that size.
+fn take_mode(keys: &[String], w: u32, h: u32, hz: u32) -> bool {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(name) = vdd_gdi_name(keys) {
+            let took = [hz, 60].iter().any(|&r| {
+                super::display::switch(
+                    &name,
+                    super::display::Mode {
+                        width: w,
+                        height: h,
+                        hz: r,
+                    },
+                )
+            });
+            if took {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// The virtual display on as the only screen, for one session; back to the
+/// PC's own screens when dropped.
+pub struct Session {
+    /// Its GDI name (`\.\DISPLAYn`).
+    pub name: String,
+}
+
+impl Session {
+    /// `w`×`h` at `hz`: the size the viewer's screen looks like. The driver
+    /// reads its sizes when it starts: a new one is added to its settings,
+    /// then the driver is restarted where Glass may (the service, as
+    /// administrator); otherwise it's there from the next restart. Never
+    /// the driver's own reload command (QUIETPC22: repeated reloads crashed
+    /// it, and its screen came and went at unpredictable times).
+    pub fn start(w: u32, h: u32, hz: u32) -> Res<Self> {
+        let keys = vdisplay::instance_keys();
+        if keys.is_empty() {
+            return Err("the virtual display isn't installed".into());
+        }
+        let _ = detach_saved();
+        vdisplay::note_mode(w, h, hz)?;
+        let r = (|| -> Res<Self> {
+            activate(&keys)?;
+            if !take_mode(&keys, w, h, hz) {
+                if !vdisplay::can_restart() {
+                    return Err(format!(
+                        "it doesn't have {w}x{h} yet; added for when the driver next starts (a PC restart, or a session through the Glass service)"
+                    )
+                    .into());
                 }
-            }
-            let name = name.ok_or("the virtual display didn't appear")?;
-            let mut mode = super::display::Mode {
-                width: w,
-                height: h,
-                hz,
-            };
-            if !super::display::switch(&name, mode) {
-                mode.hz = 60;
-                if !super::display::switch(&name, mode) {
-                    return Err(format!("the virtual display didn't take {w}x{h}").into());
+                restore();
+                vdisplay::restart_driver()?;
+                activate(&keys)?;
+                if !take_mode(&keys, w, h, hz) {
+                    let offered: Vec<String> = vdd_gdi_name(&keys)
+                        .map(|n| super::display::modes(&n))
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|m| format!("{}x{}@{}", m.width, m.height, m.hz))
+                        .collect();
+                    return Err(format!(
+                        "it didn't take {w}x{h} after a restart (it offers {})",
+                        offered.join(", ")
+                    )
+                    .into());
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(300));
+            let name = vdd_gdi_name(&keys).ok_or("its screen went away")?;
             Ok(Self { name })
         })();
         if r.is_err() {
@@ -240,6 +321,82 @@ pub fn viewer_size(w: u16, h: u16, scale_pct: u16, hz: u16) -> Option<(u32, u32,
         (hz as u32).clamp(30, 240)
     };
     Some((even(w as u32).max(640), even(h as u32).max(480), hz))
+}
+
+/// `glass-cli vdisplay try [W H HZ] [--seconds S]`: a session's switch
+/// without a viewer, to see what Windows says: the virtual display on as
+/// the only screen, both capture methods tried on it, then the PC's own
+/// screens back.
+pub fn try_cli(args: &[String]) -> Res<()> {
+    let num = |i: usize, d: u32| args.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
+    let (w, h, hz) = (num(0, 1470), num(1, 956), num(2, 60));
+    let secs = args
+        .iter()
+        .position(|a| a == "--seconds")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(3);
+    super::d3d::init_process();
+    println!("before: {:?}", names());
+    let t = std::time::Instant::now();
+    let vs = Session::start(w, h, hz)?;
+    println!(
+        "on in {:.1} s: {} | now: {:?}",
+        t.elapsed().as_secs_f64(),
+        vs.name,
+        names()
+    );
+    let mon = super::capture::monitors()?
+        .into_iter()
+        .find(|m| m.name == vs.name)
+        .ok_or("its screen isn't listed")?;
+    println!(
+        "  {}x{} @ {} Hz at ({}, {})",
+        mon.width, mon.height, mon.refresh_hz, mon.left, mon.top
+    );
+    let gpu = super::d3d::Gpu::new_nvidia()?;
+    for (label, dda) in [
+        ("Desktop Duplication", true),
+        ("Windows.Graphics.Capture", false),
+    ] {
+        match super::capture::Capture::start(&gpu, &mon, dda) {
+            Err(e) => println!("  {label}: start failed: {e}"),
+            Ok(mut c) => {
+                c.refresh();
+                let mut got = None;
+                for _ in 0..40 {
+                    c.wait(50);
+                    match c.next_frame() {
+                        Ok(Some(f)) => {
+                            got = Some(f.size);
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            println!("  {label}: frame error: {e}");
+                            break;
+                        }
+                    }
+                }
+                println!("  {label}: size {:?}, first frame {:?}", c.size(), got);
+            }
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    drop(vs);
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    println!("after: {:?}", names());
+    Ok(())
+}
+
+fn names() -> Vec<String> {
+    super::capture::monitors()
+        .map(|m| {
+            m.into_iter()
+                .map(|m| format!("{} {}x{}", m.name, m.width, m.height))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

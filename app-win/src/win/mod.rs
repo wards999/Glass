@@ -941,6 +941,34 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
     Ok(())
 }
 
+/// Capture on `mon` again after the screens changed: found afresh by name
+/// (its handle goes stale when Windows rearranges its screens: m5-test19's
+/// fallback failed on it and the service's helper restarted six times),
+/// retried for a moment while Windows settles.
+pub(crate) fn capture_again(
+    gpu: &d3d::Gpu,
+    mon: &capture::Monitor,
+    desktops: bool,
+) -> Res<capture::Capture> {
+    let mut last = String::new();
+    for _ in 0..12 {
+        let now = capture::monitors()?;
+        let m = now
+            .iter()
+            .find(|m| m.name == mon.name)
+            .or_else(|| now.iter().find(|m| m.primary))
+            .cloned();
+        if let Some(m) = m {
+            match capture::Capture::start(gpu, &m, desktops) {
+                Ok(c) => return Ok(c),
+                Err(e) => last = e.to_string(),
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    Err(format!("couldn't capture this PC's screen again: {last}").into())
+}
+
 /// One viewer's session on this screen: match its resolution where the
 /// screen offers a better mode (M3f), stream until it goes, put the screen
 /// back. Returns the results (after the header line).
@@ -973,9 +1001,7 @@ pub(crate) fn media_session<V: ViewerLink>(
             Some((vw, vh, hz)) => match vscreen::Session::start(vw, vh, hz) {
                 Ok(vs) => {
                     let found = capture::monitors()?.into_iter().find(|m| m.name == vs.name);
-                    match found
-                        .map(|nm| capture::Capture::start(gpu, &nm, a.desktops).map(|c| (nm, c)))
-                    {
+                    match found.map(|nm| capture_again(gpu, &nm, a.desktops).map(|c| (nm, c))) {
                         Some(Ok((nm, c))) => {
                             *cap = c;
                             (w, h) = cap.size();
@@ -1004,7 +1030,7 @@ pub(crate) fn media_session<V: ViewerLink>(
                             virt_note = format!(
                                 "virtual display: not used ({why}); this PC's own screen instead"
                             );
-                            *cap = capture::Capture::start(gpu, mon, a.desktops)?;
+                            *cap = capture_again(gpu, mon, a.desktops)?;
                         }
                     }
                 }
@@ -1068,7 +1094,7 @@ pub(crate) fn media_session<V: ViewerLink>(
         drop(vs);
         std::thread::sleep(std::time::Duration::from_millis(500));
         *remap.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        if let Ok(c) = capture::Capture::start(gpu, mon, a.desktops) {
+        if let Ok(c) = capture_again(gpu, mon, a.desktops) {
             *cap = c;
         }
         say("This PC's monitor is back.");
@@ -1134,6 +1160,17 @@ fn run_session<V: ViewerLink>(
     let mut first = None;
     while let Some(f) = cap.next_frame()? {
         first = Some(f);
+    }
+    // A picture to start with, even from a still screen (m5-test18: a
+    // session after the screens changed sent nothing for 35 s).
+    for _ in 0..10 {
+        if first.is_some() {
+            break;
+        }
+        cap.wait(50);
+        while let Some(f) = cap.next_frame()? {
+            first = Some(f);
+        }
     }
     let make = |chroma444: bool| {
         encode::Encoder::new(

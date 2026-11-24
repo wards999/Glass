@@ -10,6 +10,18 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 20 (the virtual display, fixed)
+Protocol v15 (unchanged): update QUIETPC22, QUIETPC (Glass and the service).
+1. From the Mac, connect to QUIETPC. The first time, expect up to ~6 s
+   while QUIETPC's driver loads the Mac's size. QUIETPC's monitor goes
+   dark; the Mac shows QUIETPC full screen, no black bars.
+2. Use it a minute, disconnect: QUIETPC's monitor comes back.
+3. Connect again: this time it should switch in about a second.
+4. From QUIETPC22, connect to QUIETPC too (another size: QUIETPC22's
+   2560x1440).
+5. Tell me when done, and send QUIETPC's results (the "virtual display:"
+   lines) and the Mac's.
+
 ## M5 test 19 (the virtual display in a session)
 Protocol v15: update all three machines, and the service on QUIETPC.
 1. On QUIETPC (it has the driver): in Glass's Settings press **Install

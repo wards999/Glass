@@ -48,3 +48,30 @@ StarDesk ships its own Microsoft-attested one.
   and before each session), so a crash or restart brings the PC's monitor
   back. If anything fails, the session uses the PC's own screen and the
   results say why.
+
+## Addendum (m5-test20): no reloads; tested on QUIETPC22
+m5-test19 on QUIETPC (service): the screen helper restarted six times (up
+to 3.6 s frozen). Reproduced on QUIETPC22 with `glass-cli vdisplay try`:
+- After the driver's `RELOAD_DRIVER` its screen goes and comes back at
+  unpredictable times (SetDisplayConfig error 31, then "not available"),
+  and three reloads in quick succession crashed it (CM_PROB_FAILED_POST_START;
+  `pnputil /restart-device` brought it back).
+- Once, mid-reload, "the only screen left" was the real monitor, and Glass
+  tried to give it the virtual display's size (Windows refused).
+- The fallback then captured with the old monitor handle, stale after the
+  screens changed, and the helper quit.
+
+Now:
+- **No reload.** A new size is added to the driver's settings (up to 24
+  remembered); the driver reads them when it starts. As administrator (the
+  service) Glass restarts the driver (`pnputil /restart-device`); plain
+  Glass.exe uses the sizes the driver already has, else this PC's screen
+  for that session.
+- The virtual display is found **only by its own adapter** (its source's
+  GDI name), never by elimination.
+- Capture after any change finds the monitor afresh by name and retries;
+  the screen helper refreshes its monitor between sessions; a session
+  waits up to 0.5 s for a first picture.
+- Measured on QUIETPC22: a size it has, 0.6 s to switch (2560×1440 @
+  165 Hz); a new size as administrator, 5.5 s (1470×956 @ 60 Hz); both
+  capture methods got frames; the real monitor came back every time.

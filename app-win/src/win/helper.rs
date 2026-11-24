@@ -168,9 +168,18 @@ pub fn screen(args: &[String]) -> Res<()> {
         gen: 0,
     };
     let never = std::sync::atomic::AtomicBool::new(false);
+    let mut mon = mon;
     loop {
-        // What's on screen now, for the broker's Welcome.
-        let mut cap = capture::Capture::start(&gpu, &mon, a.desktops)?;
+        // What's on screen now, for the broker's Welcome. Found afresh each
+        // time: a session's virtual display rearranges the screens.
+        if let Some(m) = capture::monitors()?
+            .into_iter()
+            .find(|m| m.name == mon.name)
+            .or_else(|| capture::monitors().ok()?.into_iter().find(|m| m.primary))
+        {
+            mon = m;
+        }
+        let mut cap = super::capture_again(&gpu, &mon, a.desktops)?;
         let (w, h) = cap.size();
         out.send(ToBroker::Display {
             width: w as u16,

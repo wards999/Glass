@@ -650,6 +650,30 @@ before Round 2.
    - Guidance for enabling it, without changing settings.
    - The honest limit: reliable over Ethernet; most PCs can't wake over
      Wi-Fi, and a Mac only through a Bonjour Sleep Proxy.
+5. **M6b – Network hardening.** Glass listens for connections (TCP and
+   UDP 47800, IPv4), and the Windows service does so as SYSTEM. It is
+   unreachable from the internet unless a port is forwarded (no UPnP or
+   NAT-PMP), and everything needs pairing (TLS 1.3, pinned certificates,
+   SPAKE2 PIN with lockout). Remaining exposure, to anyone on the local
+   network (or the internet with a forwarded port):
+   - **Glass.exe's firewall rule private-only,** as the service's already
+     is, instead of relying on Windows' prompt (where "Public networks"
+     may have been ticked).
+   - **Limits before pairing:** connections and handshakes per address and
+     overall (a time budget, a cap on open handshakes), so floods and
+     malformed connections can't tie up or crash a host.
+   - **Fuzz-testing** of everything read before pairing: control framing
+     (`decode_frame`, `Message::decode`, `Hello`), pairing messages, and
+     the UDP datagram path (punch, sealed packets, NACKs). In CI, with
+     `cargo fuzz` on Linux.
+   - **A "local network only" setting** (on by default): refuse
+     connections from addresses outside this machine's own subnets (a VPN
+     such as Tailscale counts as local when chosen).
+   - **A security review of the pre-pairing path** in core and in the
+     Windows service (what runs as SYSTEM before a peer is known), with
+     the findings fixed and recorded in an ADR.
+   - Documented: for use away from home, a private VPN (Tailscale,
+     WireGuard), never a forwarded port.
 
 **Round 2 – The Windows host's picture.** All of these change how the PC
 captures and encodes.

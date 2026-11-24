@@ -1479,6 +1479,21 @@ pub unsafe extern "C" fn glass_audio_out_free(a: *mut crate::net::AudioOut) {
     }
 }
 
+/// Adds a folder whose `.txt` session logs a results-only connection gets
+/// (v16: `~/Library/Logs/Glass` on the Mac).
+///
+/// # Safety
+/// `path` a NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn glass_results_add_dir(path: *const c_char) {
+    if path.is_null() {
+        return;
+    }
+    if let Ok(p) = CStr::from_ptr(path).to_str() {
+        crate::results::add_dir(std::path::PathBuf::from(p));
+    }
+}
+
 /// Interleaved stereo samples in one 10 ms sound frame (48 kHz): the C
 /// header's `GLASS_AUDIO_FRAME_LEN` (a literal, for cbindgen).
 pub const AUDIO_FRAME_LEN: usize = 960;

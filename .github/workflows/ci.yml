@@ -123,6 +123,8 @@ jobs:
           # Pair with the PIN, then stream; then reconnect without a PIN.
           GLASS_HOME=$RUNNER_TEMP/viewer target/release/glass-cli.exe probe 127.0.0.1 --port 47811 --pin 246810 --seconds 3 --verify $f --min-frames 30
           GLASS_HOME=$RUNNER_TEMP/viewer target/release/glass-cli.exe probe 127.0.0.1 --port 47811 --seconds 2 --verify $f --min-frames 20
+          # Results only (v16): the host's logs, no session.
+          GLASS_HOME=$RUNNER_TEMP/viewer target/release/glass-cli.exe results 127.0.0.1:47811 | head -3
           GLASS_HOME=$RUNNER_TEMP/host target/release/glass-cli.exe devices
           kill %1 || true
       - uses: actions/upload-artifact@v4

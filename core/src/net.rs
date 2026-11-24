@@ -140,6 +140,7 @@ fn is_timeout(e: &io::Error) -> bool {
 enum Incoming {
     Control(Control),
     Pair(u8, Vec<u8>),
+    Results(Vec<u8>),
 }
 
 /// Accumulates control bytes and yields whole messages. The buffer holds
@@ -209,6 +210,7 @@ impl ControlReader {
                     let got = match m {
                         Message::Control(c) => Some(Incoming::Control(c)),
                         Message::Pair { kind, body } => Some(Incoming::Pair(kind, body.to_vec())),
+                        Message::Results(b) => Some(Incoming::Results(b.to_vec())),
                         Message::Cursor(_)
                         | Message::Clip(_)
                         | Message::FileData(_)
@@ -631,6 +633,15 @@ impl HostListener {
             });
             return Ok(None);
         };
+        // Results only (v16): this machine's newest session logs, then
+        // close. No session, no screen change, no prompt.
+        if viewer.caps & crate::protocol::CAP_RESULTS_ONLY != 0 {
+            let mut out = Vec::new();
+            crate::protocol::encode_results(crate::results::gather().as_bytes(), &mut out);
+            let _ = ch.writer.write_all(&out);
+            let _ = send_control(&ch.writer, Control::Bye);
+            return Ok(None);
+        }
         // No loops: not this machine, and not a viewer this machine is
         // already (directly or through others) watching.
         let me = seen_id(&self.device.fingerprint());
@@ -1809,6 +1820,53 @@ impl Client {
     }
 
     /// [`Self::connect`], telling the host about this viewer (`hello`).
+    /// A results-only connection (v16) to a paired host: its newest session
+    /// logs, as text. No session starts there.
+    pub fn fetch_results(
+        device: &Arc<Device>,
+        host: &str,
+        port: u16,
+    ) -> Result<String, ConnectError> {
+        let (mut ch, _) = open_channel(device, host, port)?;
+        let hs = |_| ConnectError::Handshake;
+        if device.peer_with(&ch.peer, ROLE_HOST).is_none() {
+            let _ = send_control(&ch.writer, Control::Bye);
+            return Err(ConnectError::NotPaired);
+        }
+        send_control(
+            &ch.writer,
+            Control::Hello {
+                version: PROTOCOL_VERSION,
+                display_w: 0,
+                display_h: 0,
+                refresh_hz: 0,
+                scale_pct: 0,
+                caps: crate::protocol::CAP_RESULTS_ONLY,
+                mode: 0,
+                seen_count: 0,
+                seen_by: [[0u8; 8]; MAX_SEEN_BY],
+            },
+        )
+        .map_err(hs)?;
+        ch.reader
+            .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+            .map_err(hs)?;
+        let mut reader = ControlReader::new();
+        let mut text = Vec::new();
+        loop {
+            match reader.read_one(&mut ch.reader).map_err(hs)? {
+                Incoming::Results(b) if b.is_empty() => break,
+                Incoming::Results(b) => text.extend_from_slice(&b),
+                Incoming::Control(Control::Reject { reason }) => return Err(reject_error(reason)),
+                Incoming::Control(Control::Welcome { .. }) => return Err(ConnectError::Version),
+                Incoming::Control(Control::Bye) => break,
+                _ => {}
+            }
+        }
+        let _ = send_control(&ch.writer, Control::Bye);
+        Ok(String::from_utf8_lossy(&text).into_owned())
+    }
+
     pub fn connect_with(
         device: &Arc<Device>,
         host: &str,

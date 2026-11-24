@@ -22,6 +22,7 @@ pub mod qos;
 pub mod ratecontrol;
 pub mod recording;
 pub mod replay;
+pub mod results;
 pub mod seal;
 pub mod spikes;
 pub mod stats;

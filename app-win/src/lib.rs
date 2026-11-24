@@ -142,6 +142,57 @@ fn forget(what: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 /// `glass find`: Glass hosts on the local network (3 s of listening).
 #[cfg(windows)]
+/// `glass-cli results NAME|ADDRESS[:PORT]`: a paired machine's newest
+/// session logs (a results-only connection, v16: no session starts there),
+/// printed and saved to `%LOCALAPPDATA%\Glass\fetched\<name>.txt`.
+#[cfg(windows)]
+fn results(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let want = args
+        .first()
+        .ok_or("usage: glass results NAME|ADDRESS[:PORT]")?;
+    let (addr, port, name) = match want.rsplit_once(':') {
+        Some((a, p)) if p.parse::<u16>().is_ok() => (a.to_string(), p.parse()?, a.to_string()),
+        _ if want.parse::<std::net::Ipv4Addr>().is_ok() => (
+            want.clone(),
+            glass_core::protocol::DEFAULT_PORT,
+            want.clone(),
+        ),
+        _ => {
+            win::browse::start()?;
+            let mut found = None;
+            for _ in 0..30 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                found = win::browse::list()
+                    .into_iter()
+                    .find(|f| f.name.eq_ignore_ascii_case(want));
+                if found.is_some() {
+                    break;
+                }
+            }
+            win::browse::stop();
+            let f = found
+                .ok_or_else(|| format!("{want} isn't sharing on this network (try its address)"))?;
+            (f.address, f.port, f.name)
+        }
+    };
+    let text = glass_core::net::Client::fetch_results(&device()?, &addr, port)
+        .map_err(|e| format!("{name}: {e:?}"))?;
+    let dir = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Glass")
+        .join("fetched");
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join(format!(
+        "{}.txt",
+        name.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_")
+    ));
+    std::fs::write(&file, &text)?;
+    print!("{text}");
+    eprintln!("(saved to {})", file.display());
+    Ok(())
+}
+
 fn find() -> Result<(), Box<dyn std::error::Error>> {
     win::browse::start()?;
     std::thread::sleep(std::time::Duration::from_secs(3));
@@ -188,6 +239,7 @@ usage:
   glass serve FILE.glsr [--port P] [--pin PIN]
   glass list
   glass find                         Glass hosts on the local network
+  glass results NAME|ADDRESS[:PORT]  a paired machine's newest session results
   glass vdisplay install|uninstall|status   the virtual display (as administrator)
   glass record [--monitor N] [--seconds S] [--chroma 420|444] [--mbps M] out.glsr
   glass dump in.glsr out.h265
@@ -301,6 +353,8 @@ fn crash_log() {
 
 pub fn cli_main() {
     crash_log();
+    #[cfg(windows)]
+    win::register_results();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         #[cfg(windows)]
@@ -329,6 +383,8 @@ pub fn cli_main() {
         Some("list") => win::list(),
         #[cfg(windows)]
         Some("find") => find(),
+        #[cfg(windows)]
+        Some("results") => results(&args[1..]),
         #[cfg(windows)]
         Some("record") => win::record(&args[1..]),
         Some("--version") => {
@@ -363,6 +419,7 @@ pub fn win_message(text: &str) {
 #[cfg(windows)]
 pub fn gui_main() {
     crash_log();
+    win::register_results();
     let share = std::env::args().any(|a| a == "--share");
     if let Err(e) = win::app::run(share) {
         win_message(&format!("Glass couldn't start: {e}"));

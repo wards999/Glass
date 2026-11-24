@@ -49,6 +49,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var openedFile = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        // Paired machines may ask for this Mac's session logs (v16).
+        SessionLog.offerToPairedMachines()
         buildMenu()
         applyTheme()
         NSApp.activate(ignoringOtherApps: true)

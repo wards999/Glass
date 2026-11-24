@@ -1,3 +1,4 @@
+import CGlassCore
 import Foundation
 
 /// Running session logs, as on Windows (`slog.rs`): while a session is on,
@@ -11,6 +12,12 @@ public final class SessionLog {
     /// The reason a running report gives.
     public static let running = "still running"
     private static let keep = 20
+
+    /// A paired machine's results-only connection (protocol v16) gets the
+    /// newest logs here: Glass's own results, nothing else.
+    public static func offerToPairedMachines() {
+        dir.path.withCString { glass_results_add_dir($0) }
+    }
 
     public static var dir: URL {
         FileManager.default.homeDirectoryForCurrentUser

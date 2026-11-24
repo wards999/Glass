@@ -10,6 +10,13 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 21 (results between machines, and test 20)
+Protocol v16: update all three machines, and the service on QUIETPC.
+1. On the Mac, turn **Share this Mac** on (so it can answer for its logs).
+2. Run test 20 below.
+3. Then just tell me "done": I fetch QUIETPC's and the Mac's results from
+   QUIETPC22 (`glass-cli results QUIETPC`, `… <Mac's name>`).
+
 ## M5 test 20 (the virtual display, fixed)
 Protocol v15 (unchanged): update QUIETPC22, QUIETPC (Glass and the service).
 1. From the Mac, connect to QUIETPC. The first time, expect up to ~6 s

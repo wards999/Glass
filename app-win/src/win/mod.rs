@@ -969,6 +969,31 @@ pub(crate) fn capture_again(
     Err(format!("couldn't capture this PC's screen again: {last}").into())
 }
 
+/// Where this machine's session logs are, for a results-only connection
+/// (v16): its own logs, the service's last session, and (when this is the
+/// service, as SYSTEM) the signed-in users' logs.
+pub fn register_results() {
+    use glass_core::results::add_dir;
+    add_dir(slog::dir());
+    add_dir(service::data_dir().join("agent-results.txt"));
+    let users = std::path::PathBuf::from(
+        std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()) + "\\Users",
+    );
+    if let Ok(rd) = std::fs::read_dir(users) {
+        for e in rd.flatten() {
+            let d = e
+                .path()
+                .join("AppData")
+                .join("Local")
+                .join("Glass")
+                .join("logs");
+            if d.is_dir() {
+                add_dir(d);
+            }
+        }
+    }
+}
+
 /// One viewer's session on this screen: match its resolution where the
 /// screen offers a better mode (M3f), stream until it goes, put the screen
 /// back. Returns the results (after the header line).

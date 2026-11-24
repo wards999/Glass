@@ -82,7 +82,7 @@ Framing (inside TLS): `u16 length` (type + body) · `u8 type` · body. Max
 
 | Type | Name | Direction | Body |
 |---|---|---|---|
-| 1 | Hello | viewer → host | `version u8`, `display_w u16`, `display_h u16`, `refresh_hz u16` (the viewer's screen in pixels, 0 = unknown), `scale_pct u16` (its display scaling in percent, e.g. 200 on a Retina Mac; 0 = unknown), `caps u8` (bit 0: can decode HEVC 4:4:4; bit 1: start in 4:2:0), `mode u8` (view mode wanted, below), `seen_count u8`, then `seen_count` × 8 bytes (≤ 8): the machines that currently see the viewer (first 8 bytes of their fingerprints). A host that is the viewer, or finds itself on that list, answers `Reject(7 loop)`. |
+| 1 | Hello | viewer → host | `version u8`, `display_w u16`, `display_h u16`, `refresh_hz u16` (the viewer's screen in pixels, 0 = unknown), `scale_pct u16` (its display scaling in percent, e.g. 200 on a Retina Mac; 0 = unknown), `caps u8` (bit 0: can decode HEVC 4:4:4; bit 1: start in 4:2:0; bit 2: results only, below), `mode u8` (view mode wanted, below), `seen_count u8`, then `seen_count` × 8 bytes (≤ 8): the machines that currently see the viewer (first 8 bytes of their fingerprints). A host that is the viewer, or finds itself on that list, answers `Reject(7 loop)`. |
 | 2 | Welcome | host → viewer | `version u8`, `codec u8`, `chroma u8`, `mode u8`, `width u16`, `height u16`, `fps u16`, `udp_port u16`, `session_id u32`, `host_os u8` (0 unknown, 1 Windows, 2 Mac), `host_caps u8` (bit 0: view modes, bit 1: 4:4:4 switchable) |
 | 3 | Reject | host → viewer | `reason u8`: 1 version mismatch, 2 busy, 3 not paired, 4 denied by the host's user, 5 pairing locked (too many wrong PINs), 6 wrong or expired PIN |
 | 4 | Ping | viewer → host | `seq u32`, `client_ts u64` |
@@ -332,6 +332,7 @@ protocol version, `fp` first 8 bytes of the fingerprint (hex), `ip`, `port`.
 Advisory only: trust comes from the pinned fingerprint, never from discovery.
 
 ## Changelog
+- v16 — Results only: a `Hello` with caps bit 2 asks a paired host for its newest session logs. After the usual checks (version, pairing) the host sends them as `Results` frames (kind 24, UTF-8, up to 16000 bytes each; an empty one ends them) and `Bye`, and closes: no `Welcome`, no session, no prompt.
 - v15 — M5: `Hello` carries `scale_pct` after `refresh_hz` (the viewer's display scaling), for a Windows host's virtual display at the size the viewer's screen looks like.
 - v14 — M5: `VideoRate` (23), viewer → host: keep video at or below this many bits/s (0 = no limit).
 - v13 — M4b: sound, `"GLAU"` datagrams (Opus, 2 redundant frames) and `"GLNA"` audio NACKs.

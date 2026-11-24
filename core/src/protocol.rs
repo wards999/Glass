@@ -9,7 +9,7 @@
 /// announces new stream parameters mid-session (`StreamChange`).
 /// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
 /// datagrams. v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 15;
+pub const PROTOCOL_VERSION: u8 = 16;
 
 /// Most "seen by" ids a `Hello` carries (no-loop rule).
 pub const MAX_SEEN_BY: usize = 8;
@@ -296,6 +296,9 @@ pub const CAP_HEVC_444: u8 = 1;
 /// The viewer wants 4:2:0 to start with (faster; it may still switch to
 /// 4:4:4 later with `SetMode`).
 pub const CAP_PREFER_420: u8 = 2;
+/// Not a session: send your session results (`Results` frames, then an
+/// empty one) and close (v16).
+pub const CAP_RESULTS_ONLY: u8 = 4;
 
 /// `HostNotice` codes: why the host can't do what the viewer expects.
 pub const NOTICE_NONE: u8 = 0;
@@ -733,6 +736,19 @@ const KIND_FILE_DATA: u8 = 18;
 const KIND_FILE_CANCEL: u8 = 19;
 const KIND_FILE_REQUEST: u8 = 20;
 const KIND_FILE_RATE: u8 = 21;
+/// Host -> viewer on a results-only connection: UTF-8 text, in chunks of up
+/// to [`RESULTS_CHUNK`] bytes; an empty one ends it (v16).
+const KIND_RESULTS: u8 = 24;
+pub const RESULTS_CHUNK: usize = 16_000;
+
+/// Appends `text` as `Results` frames, then the empty one that ends it.
+pub fn encode_results(text: &[u8], out: &mut Vec<u8>) {
+    for c in text.chunks(RESULTS_CHUNK).chain(std::iter::once(&[][..])) {
+        out.extend_from_slice(&((c.len() + 1) as u16).to_be_bytes());
+        out.push(KIND_RESULTS);
+        out.extend_from_slice(c);
+    }
+}
 /// Bytes of clipboard data per chunk (well inside a 64 KB frame).
 pub const CLIP_CHUNK: usize = 60_000;
 
@@ -861,6 +877,8 @@ pub enum Message<'a> {
     FileRequest(u32),
     /// Viewer -> host: file data may go at up to this many bytes/s.
     FileRate(u32),
+    /// Host -> viewer: a chunk of session results (empty: the end).
+    Results(&'a [u8]),
     /// `PAIR_*` kind and its body.
     Pair {
         kind: u8,
@@ -884,6 +902,11 @@ impl<'a> Message<'a> {
                 KIND_FILE_REQUEST => Message::FileRequest(v),
                 _ => Message::FileRate(v),
             }
+        } else if kind == KIND_RESULTS {
+            if b.len() > RESULTS_CHUNK {
+                return Err(ControlError::Malformed);
+            }
+            Message::Results(b)
         } else if (PAIR_START..=PAIR_CONFIRM).contains(&kind) {
             if !pair_body_ok(kind, b.len()) {
                 return Err(ControlError::Malformed);
@@ -916,6 +939,25 @@ mod tests {
         assert_eq!(Nack::decode(&b[..n]).unwrap().indices().count(), NACK_MAX);
         assert!(Nack::decode(&b[..n - 1]).is_none());
         assert!(decode_punch(&b[..8]).is_none());
+    }
+
+    #[test]
+    fn results_come_in_chunks_and_end_empty() {
+        let text = "x".repeat(RESULTS_CHUNK * 2 + 5);
+        let mut buf = Vec::new();
+        encode_results(text.as_bytes(), &mut buf);
+        let (mut got, mut at, mut ended) = (Vec::new(), 0, false);
+        while at < buf.len() {
+            let (m, n) = Message::decode(&buf[at..]).unwrap();
+            at += n;
+            match m {
+                Message::Results([]) => ended = true,
+                Message::Results(b) => got.extend_from_slice(b),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(ended);
+        assert_eq!(got, text.as_bytes());
     }
 
     #[test]

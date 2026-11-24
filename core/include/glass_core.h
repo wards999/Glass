@@ -313,7 +313,7 @@
  * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
  * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 15
+#define GLASS_PROTOCOL_VERSION 16
 
 /**
  * Most "seen by" ids a `Hello` carries (no-loop rule).
@@ -409,6 +409,12 @@
 #define GLASS_CAP_PREFER_420 2
 
 /**
+ * Not a session: send your session results (`Results` frames, then an
+ * empty one) and close (v16).
+ */
+#define GLASS_CAP_RESULTS_ONLY 4
+
+/**
  * `HostNotice` codes: why the host can't do what the viewer expects.
  */
 #define GLASS_NOTICE_NONE 0
@@ -492,6 +498,8 @@
  */
 #define GLASS_CURSOR_MAX_DIM 96
 
+#define GLASS_RESULTS_CHUNK 16000
+
 /**
  * Bytes of clipboard data per chunk (well inside a 64 KB frame).
  */
@@ -558,6 +566,16 @@
 #define GLASS_CHROMA_420 0
 
 #define GLASS_CHROMA_444 1
+
+/**
+ * The newest logs sent per request.
+ */
+#define GLASS_NEWEST 8
+
+/**
+ * At most this much of each log (its end, where the totals are).
+ */
+#define GLASS_PER_LOG (64 * 1024)
 
 /**
  * Bytes added to each datagram: counter (8) + tag (16).
@@ -1992,6 +2010,15 @@ bool glass_audio_out_send(const GLASS_AudioOut *a,
  * `a` from `glass_session_audio_out`, not used after.
  */
 void glass_audio_out_free(GLASS_AudioOut *a);
+
+/**
+ * Adds a folder whose `.txt` session logs a results-only connection gets
+ * (v16: `~/Library/Logs/Glass` on the Mac).
+ *
+ * # Safety
+ * `path` a NUL-terminated UTF-8 string.
+ */
+void glass_results_add_dir(const char *path);
 
 /**
  * The weak-link test mode (Mbps, 0 = off): received packets go through a

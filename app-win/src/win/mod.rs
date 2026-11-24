@@ -1006,6 +1006,10 @@ pub fn nvenc_test(args: &[String]) -> Res<()> {
     nvenc::self_test(args)
 }
 
+pub fn decode444_test(args: &[String]) -> Res<()> {
+    decode444::self_test(args)
+}
+
 /// Where this machine's session logs are, for a results-only connection
 /// (v16): its own logs, the service's last session, and (when this is the
 /// service, as SYSTEM) the signed-in users' logs.

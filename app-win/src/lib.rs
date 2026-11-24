@@ -380,6 +380,8 @@ pub fn cli_main() {
         #[cfg(windows)]
         Some("nvenc-test") => win::nvenc_test(&args[1..]),
         #[cfg(windows)]
+        Some("decode444-test") => win::decode444_test(&args[1..]),
+        #[cfg(windows)]
         Some("connect") => connect::connect(&args[1..]),
         #[cfg(windows)]
         Some("list") => win::list(),

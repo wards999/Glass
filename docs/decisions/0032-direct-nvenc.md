@@ -65,3 +65,14 @@ applied to every frame, scrolling ones too: frames up to 850 KB, encode p99
 still keyframe does the sharpening. That keyframe now comes 300 ms after the
 picture stops (was 400 ms) and may follow the last one after 0.5 s (was
 2 s, which made the next photo wait the rest of the 2 s).
+
+## Addendum (m5-test29): the 4:4:4 viewer showed every picture one late
+m5-test28: 57 still keyframes sent and received, yet 4:4:4 "never cleared".
+`glass-cli decode444-test` (the encoder's test stream, one access unit at a
+time): `hevc_cuvid` gave 5 pictures for 6 frames. It leaves the end of a
+picture to NVIDIA's parser, which only knows when the next one starts, so
+each picture came out a frame late and a still screen's last one, the sharp
+keyframe, never did (m5-test27's floor hid it: the blurry frames before were
+sharp enough). The viewer now uses FFmpeg's own HEVC decoder on NVDEC (same
+GPU, CUDA frames, no frame threads): 6 of 6, each at once. This also takes a
+frame of delay off every 4:4:4 picture, and the jump at the end of a scroll.

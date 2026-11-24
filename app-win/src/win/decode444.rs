@@ -1,5 +1,5 @@
 //! HEVC 4:4:4 decode on NVIDIA GPUs (M3c). D3D11VA has no 4:4:4 profile
-//! there, so this uses FFmpeg's `hevc_cuvid` (NVDEC) and copies the three
+//! there, so this uses FFmpeg's HEVC decoder on NVDEC and copies the three
 //! decoded planes into D3D11 textures on the GPU (CUDA interop): frames
 //! still never touch the CPU. The presenter converts them with a shader.
 
@@ -84,8 +84,8 @@ fn cuda_ordinal(cu: &Cuda, device: &ID3D11Device) -> Option<i32> {
 
 /// Whether this PC can take the 4:4:4 path (tells the host in `Hello`).
 pub fn available(device: &ID3D11Device) -> bool {
-    let has_cuvid = unsafe { !ff::avcodec_find_decoder_by_name(c"hevc_cuvid".as_ptr()).is_null() };
-    has_cuvid
+    let has_hevc = unsafe { !ff::avcodec_find_decoder(ff::AVCodecID::AV_CODEC_ID_HEVC).is_null() };
+    has_hevc
         && cuda::cuda()
             .and_then(|cu| cuda_ordinal(cu, device))
             .is_some()
@@ -111,22 +111,29 @@ impl CudaDecoder {
             // AVCUDADeviceContext starts with the CUcontext.
             let devctx = (*dev_ref).data as *mut ff::AVHWDeviceContext;
             let cuctx = *((*devctx).hwctx as *const *mut c_void);
-            let codec = ff::avcodec_find_decoder_by_name(c"hevc_cuvid".as_ptr());
+            // FFmpeg's own HEVC decoder on NVDEC, not `hevc_cuvid`: that one
+            // leaves finding the end of a picture to NVIDIA's parser, which
+            // only knows when the next picture starts, so every picture came
+            // out one frame late and a still screen's last one (the sharp
+            // still keyframe) never did (m5-test28, `decode444-test`).
+            let codec = ff::avcodec_find_decoder(ff::AVCodecID::AV_CODEC_ID_HEVC);
             if codec.is_null() {
                 ff::av_buffer_unref(&mut dev_ref);
-                return Err("no hevc_cuvid decoder in this FFmpeg build".into());
+                return Err("no HEVC decoder in this FFmpeg build".into());
             }
             let mut ctx = ff::avcodec_alloc_context3(codec);
             (*ctx).hw_device_ctx = dev_ref;
             (*ctx).get_format = Some(get_format);
-            // LOW_DELAY: NVDEC hands each frame out at once (no display delay).
+            // Each picture out as soon as it's decoded: no reordering delay,
+            // no frame threads (each holds a picture back).
             (*ctx).flags |= ff::AV_CODEC_FLAG_LOW_DELAY as i32;
+            (*ctx).thread_count = 1;
             (*ctx).pkt_timebase = ff::AVRational {
                 num: 1,
                 den: 1_000_000,
             };
             let r = ff::avcodec_open2(ctx, codec, ptr::null_mut());
-            if let Err(e) = check(r, "avcodec_open2(hevc_cuvid)") {
+            if let Err(e) = check(r, "avcodec_open2(hevc, NVDEC)") {
                 ff::avcodec_free_context(&mut ctx);
                 return Err(e);
             }
@@ -221,11 +228,12 @@ impl CudaDecoder {
     pub fn decode(&mut self, au: &[u8]) -> Res<Option<Planar>> {
         self.input.clear();
         self.input.extend_from_slice(au);
-        self.input.resize(au.len() + PADDING, 0);
+        let len = self.input.len();
+        self.input.resize(len + PADDING, 0);
         let mut got = false;
         unsafe {
             (*self.pkt).data = self.input.as_mut_ptr();
-            (*self.pkt).size = au.len() as i32;
+            (*self.pkt).size = len as i32;
             let r = ff::avcodec_send_packet(self.ctx, self.pkt);
             (*self.pkt).data = ptr::null_mut();
             (*self.pkt).size = 0;
@@ -323,4 +331,59 @@ impl Drop for CudaDecoder {
             ff::avcodec_free_context(&mut self.ctx);
         }
     }
+}
+
+/// `glass-cli decode444-test FILE`: an HEVC stream (`nvenc-test --444
+/// --dump`) through this decoder one access unit at a time, printing
+/// whether each one's picture came out at once (a still picture's last
+/// frame must, or it's never shown).
+pub fn self_test(args: &[String]) -> Res<()> {
+    let file = args.first().ok_or("usage: decode444-test FILE")?;
+    let data = std::fs::read(file)?;
+    // NAL starts (after 00 00 01).
+    let mut nals = Vec::new();
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        if data[i..i + 3] == [0, 0, 1] {
+            nals.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    // Access units: a new one at a parameter set / AUD after a picture, or
+    // at a picture's first slice.
+    let mut aus: Vec<usize> = Vec::new();
+    let mut seen_vcl = false;
+    for &n in &nals {
+        let t = (data[n] >> 1) & 0x3f;
+        let vcl = t < 32;
+        let first_slice = vcl && data.get(n + 2).is_some_and(|b| b & 0x80 != 0);
+        if aus.is_empty() || (seen_vcl && (!vcl || first_slice)) {
+            // Back up over the start code (and a 4-byte one's extra zero).
+            let mut s = n - 3;
+            if s > 0 && data[s - 1] == 0 {
+                s -= 1;
+            }
+            aus.push(s);
+            seen_vcl = false;
+        }
+        seen_vcl |= vcl;
+    }
+    aus.push(data.len());
+    super::d3d::init_process();
+    let gpu = super::d3d::Gpu::new_nvidia()?;
+    let mut dec = CudaDecoder::new(&gpu.device)?;
+    let mut shown = 0;
+    for (k, w) in aus.windows(2).enumerate() {
+        let got = dec.decode(&data[w[0]..w[1]])?.is_some();
+        shown += got as usize;
+        println!(
+            "access unit {k}: {:>8} bytes -> {}",
+            w[1] - w[0],
+            if got { "picture out" } else { "nothing yet" }
+        );
+    }
+    println!("{} access units, {shown} pictures out", aus.len() - 1);
+    Ok(())
 }

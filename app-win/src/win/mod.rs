@@ -29,6 +29,7 @@ pub mod service;
 mod slog;
 mod sound;
 mod stats_box;
+pub mod vdisplay;
 mod vfiles;
 pub mod viewer;
 pub mod wlan;

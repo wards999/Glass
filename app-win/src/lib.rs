@@ -188,6 +188,7 @@ usage:
   glass serve FILE.glsr [--port P] [--pin PIN]
   glass list
   glass find                         Glass hosts on the local network
+  glass vdisplay install|uninstall|status   the virtual display (as administrator)
   glass record [--monitor N] [--seconds S] [--chroma 420|444] [--mbps M] out.glsr
   glass dump in.glsr out.h265
   glass pack in.h265 out.glsr WIDTH HEIGHT FPS 420|444
@@ -320,6 +321,8 @@ pub fn cli_main() {
         Some("debug-keys") => connect::debug_keys(&args[1..]),
         #[cfg(windows)]
         Some("service") => win::service::command(&args[1..]),
+        #[cfg(windows)]
+        Some("vdisplay") => win::vdisplay::command(&args[1..]),
         #[cfg(windows)]
         Some("connect") => connect::connect(&args[1..]),
         #[cfg(windows)]

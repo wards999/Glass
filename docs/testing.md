@@ -10,6 +10,18 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 18 (installing the virtual display, on QUIETPC22)
+1. Unzip m5-test18 and start Glass.exe. Settings → Virtual display →
+   **Install virtual display**. Allow the administrator prompt.
+2. Note any Windows Security window (none / "trust SignPath Foundation" /
+   a red "can't verify the publisher"), and what the black window says at
+   the end; then press Enter.
+3. Settings → System → Display: a second screen should be there. Say which
+   sizes it offers (Display resolution).
+4. Optional: **Remove virtual display** in Glass's Settings, and check the
+   second screen goes.
+Test 17 below still stands for sound and the Mac's refresh.
+
 ## M5 test 17 (sound from the Mac; the Mac at the PC's refresh)
 Protocol v14, as before. Update QUIETPC22 and the Mac.
 1. **The Mac viewing QUIETPC22** (pool, as before): a minute with the

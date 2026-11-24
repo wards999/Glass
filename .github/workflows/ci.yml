@@ -92,6 +92,8 @@ jobs:
           key: ffmpeg-${{ hashFiles('scripts/fetch-ffmpeg.ps1') }}
       - name: Fetch FFmpeg
         run: ./scripts/fetch-ffmpeg.ps1
+      - name: Fetch the virtual display driver
+        run: ./scripts/fetch-vdd.ps1
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - name: Package

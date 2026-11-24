@@ -184,6 +184,8 @@ struct GlassApp {
     svc_status: Option<super::service::Status>,
     /// The service's sharing is switched off (Share switch).
     svc_off: bool,
+    /// The virtual display driver is installed (ADR 0030).
+    vdisp: bool,
     /// This window runs in a Remote Desktop session.
     remote: bool,
     notice: Option<(String, Instant)>,
@@ -269,6 +271,7 @@ pub fn run(share: bool) -> Res<()> {
                 svc: super::service::state(),
                 svc_status: super::service::Status::read(),
                 svc_off: super::service::sharing_off(),
+                vdisp: super::vdisplay::installed(),
                 svc_build: super::service::installed_build(),
                 remote: super::service::in_remote_session(),
                 notice: None,
@@ -1694,6 +1697,7 @@ impl eframe::App for GlassApp {
                 self.svc = super::service::state();
                 self.svc_off = super::service::sharing_off();
                 self.svc_build = super::service::installed_build();
+                self.vdisp = super::vdisplay::installed();
             }
             self.svc_status = if self.demo.as_deref() == Some("service") {
                 self.svc_status.clone()
@@ -2171,6 +2175,31 @@ impl GlassApp {
                                     super::service::run_elevated("uninstall");
                                 }
                             }
+                        }
+                    });
+                    ui.add_space(10.0);
+
+                    section(ui, "Virtual display", p);
+                    ui.label(
+                        RichText::new(if self.vdisp {
+                            "Installed: a screen that only Glass uses, so a viewer can see this PC at its own size and refresh, with sharp text and no black bars (being finished: for now it shows as a second screen in Windows' Display settings)."
+                        } else if super::vdisplay::bundled() {
+                            "Lets a viewer see this PC at its own size and refresh (for example a MacBook's 2940\u{00D7}1912), with sharp text and no black bars. Installs the open-source Virtual Display Driver once; Windows asks for administrator rights, and may ask whether to trust its publisher, SignPath Foundation."
+                        } else {
+                            "Not in this build of Glass (the vdd folder is missing)."
+                        })
+                        .size(12.5)
+                        .color(p.weak),
+                    );
+                    ui.horizontal(|ui| {
+                        if self.vdisp {
+                            if ui.add(plain_button("Remove virtual display \u{2026}", p)).clicked() {
+                                super::vdisplay::run_elevated("uninstall");
+                            }
+                        } else if super::vdisplay::bundled()
+                            && ui.add(accent_button("Install virtual display \u{2026}", p)).clicked()
+                        {
+                            super::vdisplay::run_elevated("install");
                         }
                     });
                     ui.add_space(10.0);

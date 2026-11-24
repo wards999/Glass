@@ -105,9 +105,13 @@ impl Encoder {
             (*ctx).gop_size = i32::MAX;
             (*ctx).bit_rate = cfg.bitrate;
             (*ctx).rc_max_rate = cfg.bitrate;
-            (*ctx).rc_buffer_size = (cfg.bitrate / cfg.fps as i64) as i32; // ~1-frame VBV
-                                                                           // NVENC's internal RGB->YUV conversion is BT.601 limited range and
-                                                                           // FFmpeg writes that into the VUI regardless; decoders must read it.
+            // A tenth of a second of the bitrate: ordinary frames stay
+            // their size, but a keyframe or a photo opening can take what it
+            // needs to be sharp (one frame's share, ~60 KB at 80 Mbps and
+            // 165 fps, left photos blurry: m5-test22).
+            (*ctx).rc_buffer_size = (cfg.bitrate / 10).min(i32::MAX as i64) as i32;
+            // NVENC's internal RGB->YUV conversion is BT.601 limited range and
+            // FFmpeg writes that into the VUI regardless; decoders must read it.
             (*ctx).color_range = ff::AVColorRange::AVCOL_RANGE_MPEG;
 
             let opts: [(&str, &str); 9] = [
@@ -182,46 +186,29 @@ impl Encoder {
         self.encode_texture(src, pts_us, force_idr, on_packet)
     }
 
-    /// Changes the bitrate from the next frame (M5 rate control). NVENC
-    /// reconfigures without a keyframe; the 1-frame buffer follows.
+    /// Changes the bitrate from the next frame (M5 rate control); the
+    /// buffer (a tenth of a second) follows.
     pub fn set_bitrate(&mut self, bps: i64) {
         // SAFETY: the context this encoder owns; FFmpeg's NVENC applies the
         // change at the next frame it's given.
         unsafe {
-            let fps =
-                (*self.ctx).framerate.num.max(1) as i64 / (*self.ctx).framerate.den.max(1) as i64;
             (*self.ctx).bit_rate = bps;
             (*self.ctx).rc_max_rate = bps;
-            (*self.ctx).rc_buffer_size = (bps / fps.max(1)) as i32;
+            (*self.ctx).rc_buffer_size = (bps / 10).min(i32::MAX as i64) as i32;
         }
     }
 
-    /// The still picture again as one high-quality keyframe: for this frame
-    /// the budget is `frame_bytes` (normally one frame's share of the
-    /// bitrate, ~60 KB at 80 Mbps and 165 fps, which a sharp 2560x1440 photo
-    /// far exceeds: m5-test22's refinement passes at that budget never got
-    /// photos sharp), then back to `bps`. FFmpeg's NVENC makes a keyframe
-    /// at each budget change anyway.
+    /// The still picture again as a keyframe: with the encoder's buffer at
+    /// a tenth of a second it can take what it needs to be sharp. No
+    /// rate-control change (m5-test23 enlarged the buffer for this frame
+    /// only; putting it back forced a coarse keyframe at the next change,
+    /// and the whole screen blurred and sharpened every second or so).
     pub fn encode_last_quality(
         &mut self,
         pts_us: i64,
-        frame_bytes: i64,
-        bps: i64,
         on_packet: impl FnMut(&[u8], bool, i64),
     ) -> Res<()> {
-        let Some(last) = self.last.clone() else {
-            return Ok(());
-        };
-        // SAFETY: the context this encoder owns (see `set_bitrate`).
-        // Only the buffer grows, which lets this one frame be big; the
-        // bitrate stays (raising it to fit one big frame at 165 fps asked
-        // NVENC for ~2 Gbps: "invalid param", nothing changed).
-        unsafe {
-            (*self.ctx).rc_buffer_size = (frame_bytes * 8).min(i32::MAX as i64) as i32;
-        }
-        let r = self.encode_texture(&last, pts_us, true, on_packet);
-        self.set_bitrate(bps);
-        r
+        self.encode_last_idr(pts_us, on_packet)
     }
 
     /// Keeps `src` as the last frame without encoding it (a GPU copy): the

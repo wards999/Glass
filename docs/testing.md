@@ -10,6 +10,11 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 24 (photos sharp, no blur cycle)
+As test 23: from QUIETPC22 view QUIETPC, open photos and move around the
+desktop and Start menu. Nothing should blur and sharpen by itself; photos
+should be sharp a moment after they open. Then "done".
+
 ## M5 test 23 (photos sharpen)
 Protocol v16 (unchanged). Update QUIETPC22 and QUIETPC (Glass and the
 service).

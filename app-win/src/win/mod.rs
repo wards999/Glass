@@ -1545,17 +1545,9 @@ fn run_session<V: ViewerLink>(
                 run.refines += 1;
                 let input_seq = session.input_seq();
                 let mut bytes = 0;
-                // One keyframe with room for detail: up to 0.15 s of the
-                // link (the viewer's limit, else our bitrate), 200 KB to
-                // 1.5 MB.
-                let link = limit.unwrap_or(ours) as f64;
-                let budget = (link * 0.15 / 8.0).clamp(200_000.0, 1_500_000.0) as i64;
-                let back = if run.rate_now == 0 {
-                    ours
-                } else {
-                    run.rate_now
-                };
-                enc.encode_last_quality(now as i64, budget, back, |data, key, _| {
+                // One keyframe of the still picture (the encoder's buffer
+                // lets it be as big as it needs).
+                enc.encode_last_quality(now as i64, |data, key, _| {
                     bytes += data.len();
                     run.on_packet(session, now, input_seq, data, key)
                 })?;

@@ -80,6 +80,9 @@ struct Settings {
     full_colour: bool,
     /// Share the clipboard in sessions, both ways (M5c).
     clipboard: bool,
+    /// Windows' shortcuts straight to the host with a keyboard hook (off:
+    /// the viewer bar's Keys menu).
+    hook_shortcuts: bool,
 }
 
 impl Settings {
@@ -95,6 +98,7 @@ impl Settings {
             view: MODE_FIT,
             full_colour: false,
             clipboard: true,
+            hook_shortcuts: false,
         };
         for line in std::fs::read_to_string(Self::path())
             .unwrap_or_default()
@@ -106,6 +110,7 @@ impl Settings {
                 Some(("view", v)) => s.view = v.parse().unwrap_or(MODE_FIT),
                 Some(("colour", v)) => s.full_colour = v == "444",
                 Some(("clipboard", v)) => s.clipboard = v != "0",
+                Some(("hookkeys", v)) => s.hook_shortcuts = v == "1",
                 _ => {}
             }
         }
@@ -122,8 +127,8 @@ impl Settings {
         let _ = std::fs::write(
             Self::path(),
             format!(
-                "theme={theme}\nview={}\ncolour={colour}\nclipboard={}\n",
-                self.view, self.clipboard as u8
+                "theme={theme}\nview={}\ncolour={colour}\nclipboard={}\nhookkeys={}\n",
+                self.view, self.clipboard as u8, self.hook_shortcuts as u8
             ),
         );
     }
@@ -930,6 +935,7 @@ fn connect_worker(
                     rule: None,
                     full_colour: s.full_colour,
                     clipboard: s.clipboard,
+                    hook_shortcuts: s.hook_shortcuts,
                 };
                 let (report, m) = match viewer::run(c, prep, opts, &crate::banner()) {
                     Ok(r) => r,
@@ -2089,6 +2095,20 @@ impl GlassApp {
                     );
                     ui.label(
                         RichText::new("Fast has the lowest lag. Full colour is exact but adds some lag. Both can be switched while viewing, from the handle at the top of the viewer.")
+                            .size(12.5)
+                            .color(p.weak),
+                    );
+                    ui.add_space(10.0);
+
+                    section(ui, "Windows shortcuts", p);
+                    segmented(
+                        ui,
+                        &mut s.hook_shortcuts,
+                        &[(false, "From the Keys menu"), (true, "Sent directly")],
+                        p,
+                    );
+                    ui.label(
+                        RichText::new("While viewing, Windows keeps a few shortcuts for itself: the Windows key, Alt+Tab, Ctrl+Esc. From the Keys menu: send them from the Keys menu in the viewer's bar. Sent directly: they go straight to the other computer while Glass is in front, using a keyboard hook, which Windows Defender may mistake for a keylogger. Changes apply from the next session.")
                             .size(12.5)
                             .color(p.weak),
                     );

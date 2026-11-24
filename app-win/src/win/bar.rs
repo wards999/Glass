@@ -43,6 +43,8 @@ pub const ID_STATS: usize = 123;
 pub const ID_DISCONNECT: usize = 122;
 /// The weak-link test mode on/off (M5), amber while on.
 pub const ID_TEST_LINK: usize = 124;
+/// The Keys menu: Windows' own shortcuts, sent to the host (no hook).
+pub const ID_KEYS: usize = 125;
 
 /// The part of `client` (screen coordinates) that is on `owner`'s monitor:
 /// the handle and the bar stay inside it, so they're never off screen when
@@ -542,6 +544,7 @@ impl Bar {
                 item(ID_420, "Fast \u{00B7} 4:2:0", 2, false),
                 item(ID_444, "Full colour \u{00B7} 4:4:4", 2, false),
                 item(ID_FULLSCREEN, "Full screen", 0, false),
+                item(ID_KEYS, "Keys \u{25BE}", 0, false),
                 item(ID_STATS, "Stats", 0, false),
                 item(ID_TEST_LINK, "Weak Wi-Fi test", 0, false),
                 item(ID_PIN, "Pin", 0, false),

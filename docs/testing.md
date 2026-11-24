@@ -10,6 +10,15 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 15 (lag on the Mac; no keyboard hook on Windows)
+Protocol v14, as before. Update all three machines, and the service on QUIETPC.
+1. The lag test: as test 14 below (a minute with the stats showing, then
+   two minutes with them hidden and the pointer away from the top).
+2. From QUIETPC22 view the Mac: type in a Mac app, use Ctrl+C / Ctrl+V,
+   then the bar's "Keys" menu: Spotlight and Switch apps should open on
+   the Mac. Windows Defender should leave Glass alone.
+3. Send both results.
+
 ## M5 test 14 (lag: frames straight to the Mac's display)
 Protocol v14, as before: update all three machines, and the service on QUIETPC.
 1. Play pool for about a minute with the stats showing, as usual. The

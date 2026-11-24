@@ -64,6 +64,11 @@ pub struct Options {
     pub full_colour: bool,
     /// Share the clipboard with the host (M5c).
     pub clipboard: bool,
+    /// Send Windows' own shortcuts (Win, Alt+Tab, Ctrl+Esc) straight to
+    /// the host with a keyboard hook, while Glass is in front. Off by
+    /// default: Windows Defender took the hook for a keylogger (m5-test13);
+    /// the bar's Keys menu sends them instead.
+    pub hook_shortcuts: bool,
 }
 
 /// Made before connecting: the GPU, and what `Hello` tells the host.
@@ -127,7 +132,6 @@ const WM_TOGGLE_444: u32 = WM_APP + 5;
 const TEST_LINK_MBPS: u32 = 15;
 const TIMER_CURSOR: usize = 1;
 const TIMER_SHOT: usize = 2;
-const TIMER_REHOOK: usize = 3;
 const TIMER_FRONT: usize = 4;
 
 /// Brings the viewer to the front. Windows refuses SetForegroundWindow from
@@ -231,6 +235,8 @@ struct Shared {
     /// Key presses this viewer sent (for the report).
     keys_sent: AtomicU32,
     clipboard: bool,
+    /// The keyboard hook is wanted (`Options::hook_shortcuts`).
+    hook: bool,
     /// This PC's Wi-Fi link during the session (M4 step 5).
     wifi: super::wlan::WifiWatch,
 }
@@ -342,15 +348,26 @@ fn describe_window(h: HWND) -> String {
     }
 }
 
-/// (Re-)installs the keyboard hook on this (the window's) thread.
+/// (Re-)installs the keyboard hook on this (the window's) thread. Only
+/// while Glass is the app in front: Windows Defender quarantined m5-test13
+/// and m4-test1 as `Behavior:Win32/CredentialAccess.A!ml` while the hook
+/// stayed on in the background and was re-installed every 3 s, which is
+/// what a keylogger does. Now it goes on when Glass comes to the front and
+/// off when it leaves (WM_ACTIVATEAPP).
 fn install_hook() {
+    remove_hook();
     unsafe {
-        if let Some(h) = HOOK.with(|c| c.take()) {
-            let _ = UnhookWindowsHookEx(h);
-        }
         let inst: Option<HINSTANCE> = GetModuleHandleW(None).ok().map(Into::into);
         if let Ok(h) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), inst, 0) {
             HOOK.with(|c| c.set(Some(h)));
+        }
+    }
+}
+
+fn remove_hook() {
+    if let Some(h) = HOOK.with(|c| c.take()) {
+        unsafe {
+            let _ = UnhookWindowsHookEx(h);
         }
     }
 }
@@ -458,6 +475,7 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         stats_gen: AtomicU32::new(0),
         keys_sent: AtomicU32::new(0),
         clipboard: opts.clipboard,
+        hook: opts.hook_shortcuts,
         rule: opts.rule.unwrap_or(if client_os == HOST_OS_MAC {
             PcModifierRule::PcStyle
         } else {
@@ -510,18 +528,21 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         })
     };
 
-    // Keyboard hook: keys go to the host while our window is in front.
-    install_hook();
+    // Keyboard hook, if chosen: Windows' own shortcuts go to the host while
+    // our window is in front (it was just shown in front; after that
+    // WM_ACTIVATEAPP). Without it, the window's own keys go (all but Win,
+    // Alt+Tab, Ctrl+Esc and the like: the bar's Keys menu sends those).
+    if sh.hook {
+        install_hook();
+    }
     unsafe {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if let Some(h) = HOOK.with(|c| c.take()) {
-            let _ = UnhookWindowsHookEx(h);
-        }
     }
+    remove_hook();
     let _ = render.join();
     let host_cursor = UI
         .with(|u| u.borrow_mut().take())
@@ -1242,7 +1263,6 @@ unsafe fn create_window(sh: &Arc<Shared>, mon: RECT, work: RECT, fullscreen: boo
         DEBUG_SHOT.with(|d| *d.borrow_mut() = Some(path.into()));
     }
     SetTimer(Some(hwnd), TIMER_CURSOR, 15, None);
-    SetTimer(Some(hwnd), TIMER_REHOOK, 3000, None);
     Ok(hwnd)
 }
 
@@ -1433,6 +1453,72 @@ impl Ui {
     }
 
     /// A click on the bar.
+    /// The bar's Keys menu: the shortcuts Windows keeps for itself, sent to
+    /// the host on a click (no keyboard hook needed).
+    fn keys_menu(&mut self) {
+        // HID usages: Ctrl, Shift, Alt, GUI (Win / Cmd), and keys.
+        const CTRL: u8 = 0xE0;
+        const SHIFT: u8 = 0xE1;
+        const ALT: u8 = 0xE2;
+        const GUI: u8 = 0xE3;
+        const TAB: u8 = 0x2B;
+        const ESC: u8 = 0x29;
+        const SPACE: u8 = 0x2C;
+        const UP: u8 = 0x52;
+        let mac = self.sh.client.host_os() == HOST_OS_MAC;
+        let items: &[(&str, &[u8])] = if mac {
+            &[
+                ("Spotlight  (\u{2318}Space)", &[GUI, SPACE]),
+                ("Switch apps  (\u{2318}Tab)", &[GUI, TAB]),
+                ("Mission Control  (\u{2303}\u{2191})", &[CTRL, UP]),
+                ("Screenshot  (\u{2318}\u{21E7}4)", &[GUI, SHIFT, 0x21]),
+                ("Force Quit  (\u{2318}\u{2325}Esc)", &[GUI, ALT, ESC]),
+            ]
+        } else {
+            &[
+                ("Start  (Win)", &[GUI]),
+                ("Switch apps  (Alt+Tab)", &[ALT, TAB]),
+                ("Show desktop  (Win+D)", &[GUI, 0x07]),
+                ("File Explorer  (Win+E)", &[GUI, 0x08]),
+                ("Screenshot  (Win+Shift+S)", &[GUI, SHIFT, 0x16]),
+                ("Task Manager  (Ctrl+Shift+Esc)", &[CTRL, SHIFT, ESC]),
+            ]
+        };
+        let chosen = unsafe {
+            let Ok(menu) = CreatePopupMenu() else { return };
+            for (i, (label, _)) in items.iter().enumerate() {
+                let w: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+                let _ = AppendMenuW(menu, MF_STRING, i + 1, PCWSTR(w.as_ptr()));
+            }
+            let mut p = POINT::default();
+            let _ = GetCursorPos(&mut p);
+            let _ = SetForegroundWindow(self.hwnd);
+            let r = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                p.x,
+                p.y,
+                None,
+                self.hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+            r.0 as usize
+        };
+        if let Some((label, keys)) = chosen.checked_sub(1).and_then(|i| items.get(i)) {
+            let c = &self.sh.client;
+            c.input_release_all();
+            for &k in keys.iter() {
+                c.input_key(k, true);
+            }
+            for &k in keys.iter().rev() {
+                c.input_key(k, false);
+            }
+            self.sh.keys_sent.fetch_add(1, Ordering::Relaxed);
+            println!("Keys menu: {label}");
+        }
+    }
+
     fn bar_command(&mut self, id: usize) {
         let sh = self.sh.clone();
         let c = &sh.client;
@@ -1488,6 +1574,7 @@ impl Ui {
                 );
                 self.tick_stats();
             }
+            bar::ID_KEYS => self.keys_menu(),
             bar::ID_PIN => {
                 if let Some(b) = &mut self.bar {
                     b.pinned = !b.pinned;
@@ -1832,9 +1919,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 to_front(hwnd);
                 Some(LRESULT(0))
             }
-            WM_TIMER if wparam.0 == TIMER_REHOOK => {
-                install_hook();
-                Some(LRESULT(0))
+            WM_ACTIVATEAPP => {
+                // Glass came to the front, or left it: the keyboard hook
+                // only while it's in front.
+                if wparam.0 != 0 {
+                    if ui.sh.hook {
+                        install_hook();
+                    }
+                } else {
+                    remove_hook();
+                }
+                None
             }
             WM_TIMER if wparam.0 == TIMER_SHOT => {
                 let _ = KillTimer(Some(hwnd), TIMER_SHOT);

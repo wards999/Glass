@@ -410,8 +410,8 @@ struct HostRun {
     idle_idrs: u32,
     /// Still-picture refinement passes sent, and their bytes.
     refines: u32,
-    /// Which encoder ran.
-    encoder: &'static str,
+    /// Each encoder started this session: which, in which colour.
+    encoder: String,
     refine_bytes: u64,
     /// What blocked input during the session, and for how long (Âµs).
     blocked_by: Vec<String>,
@@ -518,7 +518,7 @@ impl HostRun {
             idrs: 0,
             idle_idrs: 0,
             refines: 0,
-            encoder: "",
+            encoder: String::new(),
             refine_bytes: 0,
             blocked_by: Vec::new(),
             blocked_us: 0,
@@ -1264,7 +1264,11 @@ fn run_session<V: ViewerLink>(
     }
     let mut enc = make(chroma444)?;
     let mut run = HostRun::new();
-    run.encoder = enc.name();
+    run.encoder = format!(
+        "{} {}",
+        enc.describe(),
+        if chroma444 { "4:4:4" } else { "4:2:0" }
+    );
     let mut pointer = cursor::CursorWatch::new();
     let mut watch = blocker::BlockerWatch::new();
     let mut blocked_since = None;
@@ -1371,6 +1375,8 @@ fn run_session<V: ViewerLink>(
         // second and one up per 5 s.
         if let Some(l) = session.take_video_rate() {
             limit = (l > 0).then_some((l as i64).min(ours));
+            // The quality floor only while the link has room.
+            enc.set_floor(limit.is_none());
         }
         {
             let now = clock::now_us();
@@ -1447,6 +1453,12 @@ fn run_session<V: ViewerLink>(
                     Ok(e) => {
                         enc = e;
                         chroma444 = want;
+                        run.encoder = format!(
+                            "{}, then {} {}",
+                            run.encoder,
+                            enc.describe(),
+                            if want { "4:4:4" } else { "4:2:0" }
+                        );
                         session.send_stream_change(info(chroma444))?;
                         pending_idr = true;
                         println!(
@@ -1658,7 +1670,7 @@ fn host_report<V: ViewerLink>(
     if let Some(c) = session.counters() {
         let _ = writeln!(
             r,
-            "  frames sent {} ({:.1} fps), IDRs {} (idle re-sends {}), viewer keyframe requests {}, not sent (viewer not ready) {}, skipped {} | still-picture quality keyframes {} ({:.0} KB) | encoder {}",
+            "  frames sent {} ({:.1} fps), IDRs {} (idle re-sends {}), viewer keyframe requests {}, not sent (viewer not ready) {}, skipped {} | still-picture quality keyframes {} ({:.0} KB) | encoders: {}",
             c.frames_sent,
             c.frames_sent as f64 / secs,
             run.idrs,
@@ -1744,7 +1756,7 @@ fn host_report<V: ViewerLink>(
     } else {
         let _ = writeln!(
             r,
-            "  frames encoded {} ({:.1} fps), IDRs {} (idle re-sends {}), skipped {} | still-picture quality keyframes {} ({:.0} KB) | encoder {}",
+            "  frames encoded {} ({:.1} fps), IDRs {} (idle re-sends {}), skipped {} | still-picture quality keyframes {} ({:.0} KB) | encoders: {}",
             run.frame_id,
             run.frame_id as f64 / secs,
             run.idrs,

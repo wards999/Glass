@@ -42,3 +42,17 @@ quality. So:
 ## Later
 Reference-frame invalidation after a loss instead of a keyframe (ADR 0022)
 now fits here too.
+
+## Addendum (m5-test27): a quality floor while the link has room
+m5-test26: Fast stills went sharp after ~1 s; "4:4:4 never goes sharp";
+Windows Remote Desktop is sharp at once (it sends still areas with lossless
+or near-lossless codecs, video only where things move). Glass now puts a
+floor under every frame's quality (max QP 24) while rate control sees no
+limit, and lifts it as soon as the viewer limits the bitrate (no reset, no
+keyframe). Test picture (grainy 2560x1440, 4:4:4): first frame 563 KB /
+26.2 dB → 1309 KB / 28.2 dB, and the next frames keep adding detail
+(125 KB, 50 KB) before the still keyframe (31.4 dB). Ordinary desktop use
+unchanged (frames p50 36 KB). The results now list every encoder a session
+started, its colour, and why the direct path didn't start if it didn't
+(the 4:4:4 encoder is a new one: a fallback to FFmpeg's path there would
+explain m5-test26).

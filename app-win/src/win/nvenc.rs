@@ -99,14 +99,6 @@ pub fn still_qp(limit_bps: i64) -> u32 {
     }
 }
 
-/// The worst quality any frame may have while the link has room: a big
-/// change (a photo opening) costs a bigger frame instead of a blurry one
-/// (QUIETPC22, a grainy 2560x1440 picture in 4:4:4: first frame 26.2 dB at
-/// the encoder's own rate control, 28.2 dB with this floor; the still
-/// keyframe then takes it to 31.4 dB). Off while the viewer limits the
-/// bitrate, so it can't add to a squeeze.
-const FLOOR_QP: u32 = 24;
-
 type CreateInstance = unsafe extern "C" fn(*mut nv::NV_ENCODE_API_FUNCTION_LIST) -> nv::NVENCSTATUS;
 type MaxVersion = unsafe extern "C" fn(*mut u32) -> nv::NVENCSTATUS;
 
@@ -281,13 +273,6 @@ impl Nvenc {
         // encodes ~70 % slower here (6.0 ms against 3.5 ms p50).
         rc.multiPass = nv::NV_ENC_MULTI_PASS_DISABLED;
         rc.set_zeroReorderDelay(1);
-        // A quality floor while the link has room (see `set_floor`).
-        rc.set_enableMaxQP(1);
-        rc.maxQP = nv::NV_ENC_QP {
-            qpInterP: FLOOR_QP,
-            qpInterB: FLOOR_QP,
-            qpIntra: FLOOR_QP,
-        };
         let h = &mut c.encodeCodecConfig.hevcConfig;
         h.idrPeriod = INFINITE_GOP;
         h.set_repeatSPSPPS(1);
@@ -344,19 +329,6 @@ impl Nvenc {
         rc.maxBitRate = rc.averageBitRate;
         rc.vbvBufferSize = (bps / 10).clamp(1, u32::MAX as i64) as u32;
         rc.vbvInitialDelay = rc.vbvBufferSize;
-        if let Err(e) = self.reconfigure() {
-            eprintln!("{e}");
-        }
-    }
-
-    /// The quality floor on (the link has room) or off (the viewer limits
-    /// the bitrate); no reset, no keyframe.
-    pub fn set_floor(&mut self, on: bool) {
-        let rc = &mut self.config.rcParams;
-        if (rc.enableMaxQP() == 1) == on {
-            return;
-        }
-        rc.set_enableMaxQP(on as u32);
         if let Err(e) = self.reconfigure() {
             eprintln!("{e}");
         }
@@ -644,13 +616,6 @@ impl Video {
 
     pub fn set_bitrate(&mut self, bps: i64) {
         both!(self, e => e.set_bitrate(bps))
-    }
-
-    /// The quality floor (direct path only): on while the link has room.
-    pub fn set_floor(&mut self, on: bool) {
-        if let Video::Direct(e) = self {
-            e.set_floor(on);
-        }
     }
 }
 

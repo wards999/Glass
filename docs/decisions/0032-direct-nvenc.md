@@ -56,3 +56,12 @@ unchanged (frames p50 36 KB). The results now list every encoder a session
 started, its colour, and why the direct path didn't start if it didn't
 (the 4:4:4 encoder is a new one: a fallback to FFmpeg's path there would
 explain m5-test26).
+
+## Addendum (m5-test28): floor removed, sharpening sooner
+m5-test27 (QUIETPC, RTX 2060, 4:4:4 over the eero mesh hop): stills went
+sharp, but scrolling through photos stalled and then jumped. The floor
+applied to every frame, scrolling ones too: frames up to 850 KB, encode p99
+48 ms, max 186 ms. It's gone; frames in motion are small again and the
+still keyframe does the sharpening. That keyframe now comes 300 ms after the
+picture stops (was 400 ms) and may follow the last one after 0.5 s (was
+2 s, which made the next photo wait the rest of the 2 s).

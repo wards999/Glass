@@ -343,15 +343,16 @@ impl Drop for FineTimer {
 /// Still-picture refinement: this long after the last change (m5-test25:
 /// 200 ms sent 122 quality keyframes in 3.5 minutes of scrolling, ~430 KB
 /// each across QUIETPC's eero mesh hop; input -> screen went from ~35 to
-/// 49 ms p50)...
-const REFINE_AFTER_US: u64 = 400_000;
+/// 49 ms p50; 400 ms in m5-test27 felt slow to sharpen)...
+const REFINE_AFTER_US: u64 = 300_000;
 /// ...after changes worth it (bytes of real changes since the last one)...
 const REFINE_MIN_CHANGE: usize = 100_000;
 /// ...one high-quality keyframe of the last picture (m5-test22: three
 /// passes at the normal per-frame budget never sharpened photos)...
 const REFINE_PASSES: u32 = 1;
-/// ...and at most one this often.
-const REFINE_EVERY_US: u64 = 2_000_000;
+/// ...and at most one this often (2 s in m5-test27: flicking to the next
+/// photo within 2 s of the last waited the rest of the 2 s to sharpen).
+const REFINE_EVERY_US: u64 = 500_000;
 
 /// The encoder's bitrate for a viewer's limit: coarse steps (each change
 /// costs a keyframe with FFmpeg's NVENC), the largest at or under the limit,
@@ -1375,8 +1376,6 @@ fn run_session<V: ViewerLink>(
         // second and one up per 5 s.
         if let Some(l) = session.take_video_rate() {
             limit = (l > 0).then_some((l as i64).min(ours));
-            // The quality floor only while the link has room.
-            enc.set_floor(limit.is_none());
         }
         {
             let now = clock::now_us();

@@ -331,9 +331,12 @@ impl Drop for FineTimer {
 }
 
 /// Still-picture refinement: this long after the last change...
-const REFINE_AFTER_US: u64 = 150_000;
-/// ...this many passes of the last picture...
-const REFINE_PASSES: u32 = 3;
+const REFINE_AFTER_US: u64 = 200_000;
+/// ...after changes worth it (bytes encoded since the last one)...
+const REFINE_MIN_CHANGE: usize = 40_000;
+/// ...one high-quality keyframe of the last picture (m5-test22: three
+/// passes at the normal per-frame budget never sharpened photos)...
+const REFINE_PASSES: u32 = 1;
 /// ...this far apart.
 const REFINE_EVERY_US: u64 = 60_000;
 
@@ -1292,6 +1295,9 @@ fn run_session<V: ViewerLink>(
     let mut last_change_us = 0u64;
     let mut refines_left = 0u32;
     let mut last_refine_us = 0u64;
+    // What the changes since the last one cost: a clock ticking or a pointer
+    // blinking (a few KB) doesn't need a sharp copy; a photo opening does.
+    let mut changed_bytes = 0usize;
     run.send_hz = send_hz;
     run.full_hz = full_hz;
     // 1 ms timer resolution for the session: Windows' default is 15.6 ms,
@@ -1507,6 +1513,12 @@ fn run_session<V: ViewerLink>(
             let idr = std::mem::take(&mut pending_idr);
             let input_seq = session.input_seq();
             enc.encode(&frame.texture, arrival as i64, idr, |data, key, _| {
+                // Real changes only: a keyframe (the one after a quality
+                // keyframe, or one asked for) isn't new content, and
+                // counting it re-armed the next quality keyframe at once.
+                if !key {
+                    changed_bytes += data.len();
+                }
                 run.on_packet(session, arrival, input_seq, data, key)
             })?;
         }
@@ -1518,6 +1530,7 @@ fn run_session<V: ViewerLink>(
             && held.is_none()
             && !pending_idr
             && refines_left > 0
+            && changed_bytes >= REFINE_MIN_CHANGE
             && session.streaming()
             && enc.has_last()
         {
@@ -1526,12 +1539,23 @@ fn run_session<V: ViewerLink>(
                 && now.saturating_sub(last_refine_us) >= REFINE_EVERY_US
             {
                 refines_left -= 1;
+                changed_bytes = 0;
                 last_refine_us = now;
                 last_sent = now;
                 run.refines += 1;
                 let input_seq = session.input_seq();
                 let mut bytes = 0;
-                enc.encode_last(now as i64, false, |data, key, _| {
+                // One keyframe with room for detail: up to 0.15 s of the
+                // link (the viewer's limit, else our bitrate), 200 KB to
+                // 1.5 MB.
+                let link = limit.unwrap_or(ours) as f64;
+                let budget = (link * 0.15 / 8.0).clamp(200_000.0, 1_500_000.0) as i64;
+                let back = if run.rate_now == 0 {
+                    ours
+                } else {
+                    run.rate_now
+                };
+                enc.encode_last_quality(now as i64, budget, back, |data, key, _| {
                     bytes += data.len();
                     run.on_packet(session, now, input_seq, data, key)
                 })?;
@@ -1619,7 +1643,7 @@ fn host_report<V: ViewerLink>(
     if let Some(c) = session.counters() {
         let _ = writeln!(
             r,
-            "  frames sent {} ({:.1} fps), IDRs {} (idle re-sends {}), viewer keyframe requests {}, not sent (viewer not ready) {}, skipped {} | still-picture refinement passes {} ({:.0} KB)",
+            "  frames sent {} ({:.1} fps), IDRs {} (idle re-sends {}), viewer keyframe requests {}, not sent (viewer not ready) {}, skipped {} | still-picture quality keyframes {} ({:.0} KB)",
             c.frames_sent,
             c.frames_sent as f64 / secs,
             run.idrs,
@@ -1704,7 +1728,7 @@ fn host_report<V: ViewerLink>(
     } else {
         let _ = writeln!(
             r,
-            "  frames encoded {} ({:.1} fps), IDRs {} (idle re-sends {}), skipped {} | still-picture refinement passes {} ({:.0} KB)",
+            "  frames encoded {} ({:.1} fps), IDRs {} (idle re-sends {}), skipped {} | still-picture quality keyframes {} ({:.0} KB)",
             run.frame_id,
             run.frame_id as f64 / secs,
             run.idrs,

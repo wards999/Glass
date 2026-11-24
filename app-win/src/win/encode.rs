@@ -196,6 +196,34 @@ impl Encoder {
         }
     }
 
+    /// The still picture again as one high-quality keyframe: for this frame
+    /// the budget is `frame_bytes` (normally one frame's share of the
+    /// bitrate, ~60 KB at 80 Mbps and 165 fps, which a sharp 2560x1440 photo
+    /// far exceeds: m5-test22's refinement passes at that budget never got
+    /// photos sharp), then back to `bps`. FFmpeg's NVENC makes a keyframe
+    /// at each budget change anyway.
+    pub fn encode_last_quality(
+        &mut self,
+        pts_us: i64,
+        frame_bytes: i64,
+        bps: i64,
+        on_packet: impl FnMut(&[u8], bool, i64),
+    ) -> Res<()> {
+        let Some(last) = self.last.clone() else {
+            return Ok(());
+        };
+        // SAFETY: the context this encoder owns (see `set_bitrate`).
+        // Only the buffer grows, which lets this one frame be big; the
+        // bitrate stays (raising it to fit one big frame at 165 fps asked
+        // NVENC for ~2 Gbps: "invalid param", nothing changed).
+        unsafe {
+            (*self.ctx).rc_buffer_size = (frame_bytes * 8).min(i32::MAX as i64) as i32;
+        }
+        let r = self.encode_texture(&last, pts_us, true, on_packet);
+        self.set_bitrate(bps);
+        r
+    }
+
     /// Keeps `src` as the last frame without encoding it (a GPU copy): the
     /// frame-rate cap holds the newest frame until it's time to send one.
     pub fn keep(&mut self, src: &ID3D11Texture2D) {

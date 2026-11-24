@@ -10,6 +10,14 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 23 (photos sharpen)
+Protocol v16 (unchanged). Update QUIETPC22 and QUIETPC (Glass and the
+service).
+1. From QUIETPC22, connect to QUIETPC. Open a few photos, each still for
+   a second; in Fast and in Full colour.
+2. Say whether they now sharpen fully, and how quickly.
+3. Tell me "done".
+
 ## M5 test 22 (the virtual display on Glass's GPU; sharper images)
 Protocol v16 (unchanged). Update QUIETPC22, QUIETPC (Glass and the
 service) and the Mac; Share this Mac on.

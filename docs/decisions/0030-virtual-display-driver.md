@@ -31,3 +31,20 @@ StarDesk ships its own Microsoft-attested one.
   screen in Windows' Display settings.
 - Parsec's driver stays the fallback if this one's signature isn't
   accepted somewhere.
+
+## Addendum (m5-test19): used during sessions
+- The user chose: **the PC's own monitor off while viewed**; the whole
+  desktop moves to the virtual display, and comes back afterwards.
+- `Hello` now carries the viewer's display scaling (protocol v15). The
+  virtual display is the size the viewer's screen looks like (a 200 %
+  MacBook at 2940×1912 → 1470×956), at its refresh: the same text size as
+  on the Mac. Full resolution with Windows at 200 % (sharper, if Windows
+  scales the apps well) is to be compared next, from the bar.
+- Per session (`vscreen.rs`): the driver's settings get exactly that mode
+  and it reloads (its pipe); the virtual display becomes the only active
+  path (`SetDisplayConfig`, not saved), then takes the mode. At the end
+  Windows' saved layout returns (`SDC_USE_DATABASE_CURRENT`). The saved
+  layout never includes the virtual display (`detach_saved`, after install
+  and before each session), so a crash or restart brings the PC's monitor
+  back. If anything fails, the session uses the PC's own screen and the
+  results say why.

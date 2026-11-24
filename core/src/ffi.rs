@@ -2106,6 +2106,7 @@ mod tests {
                 display_w: 2560,
                 display_h: 1440,
                 refresh_hz: 165,
+                scale_pct: 100,
                 caps: crate::protocol::CAP_HEVC_444,
                 mode: 1,
             };

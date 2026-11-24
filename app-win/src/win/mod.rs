@@ -32,6 +32,7 @@ mod stats_box;
 pub mod vdisplay;
 mod vfiles;
 pub mod viewer;
+mod vscreen;
 pub mod wlan;
 
 use glass_core::clock;
@@ -960,7 +961,61 @@ pub(crate) fn media_session<V: ViewerLink>(
     let (mut w, mut h) = cap.size();
     let mut fps = mon.refresh_hz;
     let mut switched = None;
-    if a.match_res {
+    // The virtual display, if installed (ADR 0030): the only screen while
+    // viewed, at the size the viewer's screen looks like; the PC's own
+    // monitor goes dark meanwhile (the user's choice).
+    let mut virt: Option<vscreen::Session> = None;
+    let mut virt_note = String::new();
+    if vdisplay::installed() {
+        let v = session.viewer();
+        match vscreen::viewer_size(v.display_w, v.display_h, v.scale_pct, v.refresh_hz) {
+            None => virt_note = "virtual display: not used (the viewer didn't say its size)".into(),
+            Some((vw, vh, hz)) => match vscreen::Session::start(vw, vh, hz) {
+                Ok(vs) => {
+                    let found = capture::monitors()?.into_iter().find(|m| m.name == vs.name);
+                    match found
+                        .map(|nm| capture::Capture::start(gpu, &nm, a.desktops).map(|c| (nm, c)))
+                    {
+                        Some(Ok((nm, c))) => {
+                            *cap = c;
+                            (w, h) = cap.size();
+                            fps = nm.refresh_hz.max(1);
+                            *remap.lock().unwrap_or_else(|e| e.into_inner()) = Some(inject::Rect {
+                                left: nm.left,
+                                top: nm.top,
+                                width: nm.width as i32,
+                                height: nm.height as i32,
+                            });
+                            say(&format!(
+                                "Virtual display: {w}x{h} at {fps} Hz for the viewer; this PC's monitor is off while viewed."
+                            ));
+                            virt_note = format!(
+                                "virtual display: {w}x{h} @ {fps} Hz (the viewer's {}x{} at {}%), this PC's monitor off while viewed",
+                                v.display_w, v.display_h, v.scale_pct
+                            );
+                            virt = Some(vs);
+                        }
+                        other => {
+                            drop(vs);
+                            let why = match other {
+                                Some(Err(e)) => e.to_string(),
+                                _ => "its screen wasn't found".into(),
+                            };
+                            virt_note = format!(
+                                "virtual display: not used ({why}); this PC's own screen instead"
+                            );
+                            *cap = capture::Capture::start(gpu, mon, a.desktops)?;
+                        }
+                    }
+                }
+                Err(e) => {
+                    virt_note =
+                        format!("virtual display: not used ({e}); this PC's own screen instead")
+                }
+            },
+        }
+    }
+    if a.match_res && virt.is_none() {
         let v = session.viewer();
         if let Some(cur) = display::current(&mon.name) {
             let best = display::best(
@@ -995,18 +1050,33 @@ pub(crate) fn media_session<V: ViewerLink>(
             }
         }
     }
-    let (mut report, blocked_by, blocked_us) = run_session(
+    let session_result = run_session(
         gpu,
         cap,
         session,
         a,
         (w, h),
         fps,
-        switched.is_some(),
+        switched.is_some() || virt.is_some(),
         blocking,
         stop,
         end,
-    )?;
+    );
+    if let Some(vs) = virt.take() {
+        // The PC's own screens back (even if the session failed), and
+        // capture on them for whatever comes next.
+        drop(vs);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        *remap.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if let Ok(c) = capture::Capture::start(gpu, mon, a.desktops) {
+            *cap = c;
+        }
+        say("This PC's monitor is back.");
+    }
+    let (mut report, blocked_by, blocked_us) = session_result?;
+    if !virt_note.is_empty() {
+        let _ = writeln!(report, "  {virt_note}");
+    }
     if let Some(orig) = switched {
         display::restore(&mon.name);
         let _ = writeln!(

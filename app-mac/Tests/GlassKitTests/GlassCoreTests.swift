@@ -8,7 +8,7 @@ final class GlassCoreTests: XCTestCase {
     func testCoreLinksAndReportsVersions() {
         XCTAssertFalse(GlassCore.version.isEmpty)
         XCTAssertEqual(GlassCore.version.split(separator: ".").count, 3)
-        XCTAssertEqual(GlassCore.protocolVersion, 14)
+        XCTAssertEqual(GlassCore.protocolVersion, 15)
     }
 }
 

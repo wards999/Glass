@@ -143,6 +143,7 @@ impl ToHelper {
                 out.extend_from_slice(&hello.display_w.to_le_bytes());
                 out.extend_from_slice(&hello.display_h.to_le_bytes());
                 out.extend_from_slice(&hello.refresh_hz.to_le_bytes());
+                out.extend_from_slice(&hello.scale_pct.to_le_bytes());
                 out.push(hello.caps);
                 out.push(hello.mode);
                 out.extend_from_slice(peer.as_bytes());
@@ -193,6 +194,7 @@ impl ToHelper {
                     display_w: b.u16()?,
                     display_h: b.u16()?,
                     refresh_hz: b.u16()?,
+                    scale_pct: b.u16()?,
                     caps: b.u8()?,
                     mode: b.u8()?,
                 };
@@ -383,6 +385,7 @@ mod tests {
                     display_w: 2560,
                     display_h: 1440,
                     refresh_hz: 165,
+                    scale_pct: 100,
                     caps: 3,
                     mode: 1,
                 },

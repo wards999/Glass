@@ -15,10 +15,10 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW,
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
-    SetupDiGetDeviceRegistryPropertyW, SetupDiSetDeviceRegistryPropertyW,
-    UpdateDriverForPlugAndPlayDevicesW, DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIF_REMOVE,
-    DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY, HDEVINFO, INSTALLFLAG_FORCE, SPDRP_HARDWAREID,
-    SP_DEVINFO_DATA,
+    SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW,
+    SetupDiSetDeviceRegistryPropertyW, UpdateDriverForPlugAndPlayDevicesW, DICD_GENERATE_ID,
+    DIF_REGISTERDEVICE, DIF_REMOVE, DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY, HDEVINFO,
+    INSTALLFLAG_FORCE, SPDRP_HARDWAREID, SP_DEVINFO_DATA,
 };
 
 /// The driver's hardware id (its INF).
@@ -98,6 +98,70 @@ fn devices() -> Vec<(HDEVINFO, SP_DEVINFO_DATA)> {
     out
 }
 
+/// The virtual display's device instances as they appear in an adapter's
+/// device path (`ROOT#DISPLAY#0001`), to tell its screens apart.
+pub fn instance_keys() -> Vec<String> {
+    let devs = devices();
+    let mut keys = Vec::new();
+    for (set, d) in &devs {
+        let mut buf = [0u16; 200];
+        let mut need = 0u32;
+        unsafe {
+            if SetupDiGetDeviceInstanceIdW(*set, d, Some(&mut buf), Some(&mut need)).is_ok() {
+                let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                keys.push(
+                    String::from_utf16_lossy(&buf[..len])
+                        .to_ascii_uppercase()
+                        .replace('\\', "#"),
+                );
+            }
+        }
+    }
+    if let Some((set, _)) = devs.first() {
+        unsafe {
+            let _ = SetupDiDestroyDeviceInfoList(*set);
+        }
+    }
+    keys
+}
+
+/// The driver's settings for one session: the viewer's size at its
+/// refresh (and 60 Hz, in case), then a reload through the driver's pipe
+/// (open to the PC's users: no admin).
+pub fn set_mode(w: u32, h: u32, hz: u32) -> Res<()> {
+    let line = |r: u32| {
+        format!("    <resolution><width>{w}</width><height>{h}</height><refresh_rate>{r}</refresh_rate></resolution>\n")
+    };
+    let mut res = line(hz);
+    if hz != 60 {
+        res.push_str(&line(60));
+    }
+    std::fs::write(
+        config_dir().join("vdd_settings.xml"),
+        settings_xml(&res, &[]),
+    )?;
+    reload()?;
+    // The driver re-reads its settings and re-creates its screen.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    Ok(())
+}
+
+/// Tells the driver to re-read its settings (`RELOAD_DRIVER`, UTF-16).
+fn reload() -> Res<()> {
+    use std::io::Write;
+    let mut pipe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(r"\\.\pipe\MTTVirtualDisplayPipe")
+        .map_err(|e| format!("the virtual display driver isn't answering: {e}"))?;
+    let msg: Vec<u8> = "RELOAD_DRIVER"
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    pipe.write_all(&msg)?;
+    Ok(())
+}
+
 /// Installed and present.
 pub fn installed() -> bool {
     let d = devices();
@@ -127,8 +191,18 @@ fn default_settings() -> String {
             "    <resolution><width>{w}</width><height>{h}</height><refresh_rate>60</refresh_rate></resolution>\n"
         ));
     }
+    settings_xml(&res, &[60, 120, 144, 165])
+}
+
+/// The driver's settings file: one screen, `res` (`<resolution>` lines),
+/// `global` refresh rates added to every resolution.
+fn settings_xml(res: &str, global: &[u32]) -> String {
+    let g: String = global
+        .iter()
+        .map(|r| format!("    <g_refresh_rate>{r}</g_refresh_rate>\n"))
+        .collect();
     format!(
-        "<?xml version='1.0' encoding='utf-8'?>\n<vdd_settings>\n  <monitors><count>1</count></monitors>\n  <gpu><friendlyname>default</friendlyname></gpu>\n  <global>\n    <g_refresh_rate>60</g_refresh_rate>\n    <g_refresh_rate>120</g_refresh_rate>\n    <g_refresh_rate>144</g_refresh_rate>\n    <g_refresh_rate>165</g_refresh_rate>\n  </global>\n  <resolutions>\n{res}  </resolutions>\n  <options>\n    <CustomEdid>false</CustomEdid>\n    <PreventSpoof>false</PreventSpoof>\n    <EdidCeaOverride>false</EdidCeaOverride>\n    <HardwareCursor>true</HardwareCursor>\n    <SDR10bit>false</SDR10bit>\n    <HDRPlus>false</HDRPlus>\n    <logging>false</logging>\n    <debuglogging>false</debuglogging>\n  </options>\n</vdd_settings>\n"
+        "<?xml version='1.0' encoding='utf-8'?>\n<vdd_settings>\n  <monitors><count>1</count></monitors>\n  <gpu><friendlyname>default</friendlyname></gpu>\n  <global>\n{g}  </global>\n  <resolutions>\n{res}  </resolutions>\n  <options>\n    <CustomEdid>false</CustomEdid>\n    <PreventSpoof>false</PreventSpoof>\n    <EdidCeaOverride>false</EdidCeaOverride>\n    <HardwareCursor>true</HardwareCursor>\n    <SDR10bit>false</SDR10bit>\n    <HDRPlus>false</HDRPlus>\n    <logging>false</logging>\n    <debuglogging>false</debuglogging>\n  </options>\n</vdd_settings>\n"
     )
 }
 
@@ -230,6 +304,12 @@ fn install() -> Res<()> {
                 ""
             }
         );
+    }
+    // Off until a session needs it: Windows turns a new screen on.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    match super::vscreen::detach_saved() {
+        Ok(()) => println!("The virtual display stays off until someone views this PC."),
+        Err(e) => println!("Couldn't switch the virtual display off for now: {e}"),
     }
     Ok(())
 }

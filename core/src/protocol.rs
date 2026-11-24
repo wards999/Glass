@@ -9,7 +9,7 @@
 /// announces new stream parameters mid-session (`StreamChange`).
 /// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
 /// datagrams. v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 14;
+pub const PROTOCOL_VERSION: u8 = 15;
 
 /// Most "seen by" ids a `Hello` carries (no-loop rule).
 pub const MAX_SEEN_BY: usize = 8;
@@ -359,6 +359,10 @@ pub enum Control {
         display_w: u16,
         display_h: u16,
         refresh_hz: u16,
+        /// The viewer's display scaling, percent (200 on a Retina Mac; 0 =
+        /// unknown): a Windows host's virtual display uses the size it
+        /// looks like (v15).
+        scale_pct: u16,
         caps: u8,
         mode: u8,
         /// Machines that see the viewer (first 8 bytes of their
@@ -472,6 +476,7 @@ impl Control {
                 display_w,
                 display_h,
                 refresh_hz,
+                scale_pct,
                 caps,
                 mode,
                 seen_count,
@@ -481,6 +486,7 @@ impl Control {
                 put(&display_w.to_be_bytes());
                 put(&display_h.to_be_bytes());
                 put(&refresh_hz.to_be_bytes());
+                put(&scale_pct.to_be_bytes());
                 let n = (seen_count as usize).min(MAX_SEEN_BY);
                 put(&[caps, mode, n as u8]);
                 for id in &seen_by[..n] {
@@ -549,23 +555,24 @@ impl Control {
         let u16_at = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]);
         let u32_at = |i: usize| u32::from_be_bytes(b[i..i + 4].try_into().unwrap());
         let u64_at = |i: usize| u64::from_be_bytes(b[i..i + 8].try_into().unwrap());
-        // Hello: 10 bytes, then 8 per "seen by" id.
+        // Hello: 12 bytes, then 8 per "seen by" id.
         if kind == 1 {
-            let n = *b.get(9).ok_or(ControlError::Malformed)? as usize;
-            if n > MAX_SEEN_BY || b.len() != 10 + 8 * n {
+            let n = *b.get(11).ok_or(ControlError::Malformed)? as usize;
+            if n > MAX_SEEN_BY || b.len() != 12 + 8 * n {
                 return Err(ControlError::Malformed);
             }
             let mut seen_by = [[0u8; 8]; MAX_SEEN_BY];
             for (i, id) in seen_by.iter_mut().enumerate().take(n) {
-                id.copy_from_slice(&b[10 + 8 * i..18 + 8 * i]);
+                id.copy_from_slice(&b[12 + 8 * i..20 + 8 * i]);
             }
             return Ok(Control::Hello {
                 version: b[0],
                 display_w: u16_at(1),
                 display_h: u16_at(3),
                 refresh_hz: u16_at(5),
-                caps: b[7],
-                mode: b[8],
+                scale_pct: u16_at(7),
+                caps: b[9],
+                mode: b[10],
                 seen_count: n as u8,
                 seen_by,
             });
@@ -919,6 +926,7 @@ mod tests {
                 display_w: 2940,
                 display_h: 1912,
                 refresh_hz: 120,
+                scale_pct: 200,
                 caps: CAP_HEVC_444,
                 mode: MODE_FIT_MORE_SPACE,
                 seen_count: 2,

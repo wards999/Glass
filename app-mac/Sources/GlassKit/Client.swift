@@ -97,6 +97,7 @@ public final class GlassClient {
             hello.display_w = UInt16(clamping: Int(px.width))
             hello.display_h = UInt16(clamping: Int(px.height))
             hello.refresh_hz = UInt16(clamping: s.maximumFramesPerSecond)
+            hello.scale_pct = UInt16(clamping: Int((s.backingScaleFactor * 100).rounded()))
         }
         hello.caps = UInt8(GLASS_CAP_HEVC_444) | (fullColour ? 0 : UInt8(GLASS_CAP_PREFER_420))
         hello.mode = mode

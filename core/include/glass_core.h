@@ -313,7 +313,7 @@
  * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
  * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 14
+#define GLASS_PROTOCOL_VERSION 15
 
 /**
  * Most "seen by" ids a `Hello` carries (no-loop rule).
@@ -817,6 +817,10 @@ typedef struct {
   uint16_t display_w;
   uint16_t display_h;
   uint16_t refresh_hz;
+  /**
+   * Display scaling, percent (200 on a Retina Mac; 0 = unknown).
+   */
+  uint16_t scale_pct;
   /**
    * `protocol::CAP_*` bits.
    */

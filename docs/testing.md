@@ -10,6 +10,21 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 19 (the virtual display in a session)
+Protocol v15: update all three machines, and the service on QUIETPC.
+1. On QUIETPC (it has the driver): in Glass's Settings press **Install
+   virtual display** once more. It's already there; this time the
+   installer also switches it off, so the second screen should go from
+   Windows' Display settings.
+2. Connect from the Mac to QUIETPC. Expected: QUIETPC's own monitor goes
+   dark, and the Mac shows QUIETPC's desktop filling the whole Mac screen
+   (no black bars) at the Mac's text size.
+3. Use it for a few minutes (windows, Settings, the pool game). Then
+   disconnect: QUIETPC's monitor should come back with the windows where
+   they were.
+4. Send both results. The PC's has a "virtual display:" line, saying what
+   it used or why it couldn't.
+
 ## M5 test 18 (installing the virtual display, on QUIETPC22)
 1. Unzip m5-test18 and start Glass.exe. Settings → Virtual display →
    **Install virtual display**. Allow the administrator prompt.

@@ -71,6 +71,21 @@ pub struct Options {
     pub hook_shortcuts: bool,
 }
 
+/// The display scaling of the monitor at `r` (percent; 0 if unknown).
+fn monitor_scale_pct(r: &RECT) -> u16 {
+    use windows::Win32::Graphics::Gdi::MonitorFromRect;
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    unsafe {
+        let hmon = MonitorFromRect(r, MONITOR_DEFAULTTONEAREST);
+        let (mut x, mut y) = (0u32, 0u32);
+        if GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut x, &mut y).is_ok() && x > 0 {
+            (x * 100 / 96) as u16
+        } else {
+            0
+        }
+    }
+}
+
 /// Made before connecting: the GPU, and what `Hello` tells the host.
 pub struct Prepared {
     gpu: d3d::Gpu,
@@ -101,6 +116,7 @@ pub fn prepare(mode: u8, full_colour: bool) -> Res<Prepared> {
             display_w: (mon.right - mon.left) as u16,
             display_h: (mon.bottom - mon.top) as u16,
             refresh_hz: hz,
+            scale_pct: monitor_scale_pct(&mon),
             caps,
             mode: mode.min(MODE_COUNT - 1),
         },

@@ -364,6 +364,8 @@ pub struct ViewerHello {
     pub display_w: u16,
     pub display_h: u16,
     pub refresh_hz: u16,
+    /// Display scaling, percent (200 on a Retina Mac; 0 = unknown).
+    pub scale_pct: u16,
     /// `protocol::CAP_*` bits.
     pub caps: u8,
     /// `protocol::MODE_*` the viewer wants.
@@ -583,6 +585,7 @@ impl HostListener {
                 display_w,
                 display_h,
                 refresh_hz,
+                scale_pct,
                 caps,
                 mode,
                 seen_count,
@@ -596,6 +599,7 @@ impl HostListener {
                         display_w,
                         display_h,
                         refresh_hz,
+                        scale_pct,
                         caps,
                         mode,
                     },
@@ -1826,6 +1830,7 @@ impl Client {
                 display_w: hello.display_w,
                 display_h: hello.display_h,
                 refresh_hz: hello.refresh_hz,
+                scale_pct: hello.scale_pct,
                 caps: hello.caps,
                 mode: hello.mode,
                 seen_count: seen.len() as u8,

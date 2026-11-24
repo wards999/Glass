@@ -1322,7 +1322,13 @@ pub struct LiveFrameMeta {
     pub queued_us: u64,
 }
 
-const QUEUE_LEN: usize = 8;
+/// Frames waiting for the decoder. Every one is needed (each refers to the
+/// one before), so a full queue throws them all away and waits for a
+/// keyframe: 8 (~50 ms at 165 fps) overflowed 21 times in m5-test29's 4:4:4
+/// session (decode p50 3.8 ms, queue max 57 ms) and whole card animations
+/// went missing. 32 is ~190 ms at 165 fps; slots grow only to the largest
+/// frame each has held.
+const QUEUE_LEN: usize = 32;
 
 struct QueuedFrame {
     meta: LiveFrameMeta,

@@ -7,8 +7,9 @@
 //! it; a queue does), how much was lost or late so far, and how fast video
 //! actually arrived. Against a quiet baseline (the lowest tick average of
 //! the last 10 s):
-//! - more than [`CONGESTED_US`] over, or a loss: **back off** to 85 % of
-//!   what actually arrived, and hold for [`HOLD_US`];
+//! - more than [`CONGESTED_US`] over for two ticks, or a loss, while the
+//!   stream is using the link: **back off** to 85 % of the limit (of what
+//!   arrived, if there was none), and hold for [`HOLD_US`];
 //! - more than [`WORRIED_US`] over: hold;
 //! - otherwise **ramp up** 5 % a tick (about doubling in 1.5 s) until it
 //!   stops limiting anything, and then no limit at all (the host's own
@@ -29,6 +30,9 @@ pub const HOLD_US: u64 = 500_000;
 pub const IDLE_CALM_US: u64 = 3_000_000;
 /// ...by 5 % this often (µs): from 20 Mbps to no limit in about 25 s.
 pub const IDLE_STEP_US: u64 = 500_000;
+/// With no limit, the stream counts as using the link from twice this
+/// (bits/s); with one, from half of it.
+pub const BUSY_NO_LIMIT_BPS: f64 = 20e6;
 /// Never below this: text and fine detail go soft (bits/s).
 pub const MIN_BPS: f64 = 8e6;
 /// At or above this it's no limit (bits/s).
@@ -45,6 +49,8 @@ pub struct VideoRateControl {
     /// Since when nothing worried it (µs), and the last idle rise.
     calm_since: u64,
     idle_up_at: u64,
+    /// Ticks in a row over [`CONGESTED_US`].
+    congested_ticks: u32,
     last_sent: Option<Option<u32>>,
     last_sent_at: u64,
     pub backoffs: u32,
@@ -74,9 +80,26 @@ impl VideoRateControl {
             self.base_since = now_us;
         }
         let over = d.saturating_sub(self.base);
-        if lost || over > CONGESTED_US {
-            let at = (received_bps * 0.85).max(MIN_BPS);
-            let t = self.target.map_or(at, |t| t.min(at));
+        // Only a stream that's using the link can be what congests it: a
+        // spike while a still picture trickles out is Wi-Fi jitter, and
+        // backing off then only spoils the next picture (QUIETPC, m5-test21:
+        // 10 backoffs to the 8 Mbps floor on a wired PC and a clean 6 GHz
+        // link, photos blocky). And a rise must last two ticks (200 ms).
+        let busy = received_bps >= self.target.unwrap_or(BUSY_NO_LIMIT_BPS) * 0.5;
+        self.congested_ticks = if over > CONGESTED_US {
+            self.congested_ticks + 1
+        } else {
+            0
+        };
+        // Not again within the hold: the queue it saw needs a moment to drain.
+        if busy && now_us >= self.hold_until && (lost || self.congested_ticks >= 2) {
+            // From the limit itself, not from what happened to arrive.
+            let t = match self.target {
+                Some(t) => t * 0.85,
+                None => received_bps * 0.85,
+            }
+            .max(MIN_BPS);
+            self.congested_ticks = 0;
             self.target = Some(t);
             self.hold_until = now_us + HOLD_US;
             self.calm_since = now_us;
@@ -231,7 +254,7 @@ mod tests {
     fn an_unused_limit_still_goes_once_calm() {
         let mut c = VideoRateControl::default();
         run(&mut c, 0, 50, |_| 3_000, |_, _| 45e6, |_| 0);
-        run(&mut c, 50, 1, |_| 30_000, |_, _| 24e6, |_| 0);
+        run(&mut c, 50, 2, |_| 30_000, |_, _| 24e6, |_| 0);
         assert_eq!(c.limit(), 20_400_000);
         // 7 Mbps used: not "used", but calm. Nothing for the first 3 s...
         run(&mut c, 51, 30, |_| 3_000, |_, _| 7e6, |_| 0);
@@ -241,11 +264,60 @@ mod tests {
         assert_eq!(c.limit(), 0);
     }
 
+    /// m5-test21: Wi-Fi spikes while a still picture trickles out must
+    /// not limit anything.
+    #[test]
+    fn spikes_on_an_idle_stream_dont_back_off() {
+        let mut c = VideoRateControl::default();
+        let sent = run(
+            &mut c,
+            0,
+            300,
+            |i| if i % 10 < 3 { 55_000 } else { 3_000 },
+            |_, _| 3e6,
+            |i| i / 50,
+        );
+        assert!(sent.is_empty(), "{sent:?}");
+        assert_eq!((c.limit(), c.backoffs), (0, 0));
+    }
+
+    /// A lone tick over isn't congestion; two are.
+    #[test]
+    fn one_tick_over_is_not_enough() {
+        let mut c = VideoRateControl::default();
+        run(&mut c, 0, 20, |_| 3_000, |_, _| 45e6, |_| 0);
+        run(&mut c, 20, 1, |_| 30_000, |_, _| 45e6, |_| 0);
+        assert_eq!(c.limit(), 0);
+        run(&mut c, 21, 1, |_| 30_000, |_, _| 45e6, |_| 0);
+        assert_eq!(c.limit(), 38_250_000);
+    }
+
+    /// From the limit, not from the trickle that arrived.
+    #[test]
+    fn backs_off_from_the_limit() {
+        let mut c = VideoRateControl::default();
+        run(&mut c, 0, 20, |_| 3_000, |_, _| 45e6, |_| 0);
+        run(&mut c, 20, 2, |_| 30_000, |_, _| 40e6, |_| 0);
+        assert_eq!(c.limit(), 34_000_000);
+        // Busy at 25 Mbps (over half the limit): 85 % of the limit, not
+        // of 25.
+        run(&mut c, 22, 10, |_| 3_000, |_, _| 25e6, |_| 0);
+        let before = c.limit() as f64;
+        run(&mut c, 40, 2, |_| 40_000, |_, _| 25e6, |_| 0);
+        assert!(
+            (c.limit() as f64 - before * 0.85).abs() <= 2.0,
+            "{} {before}",
+            c.limit()
+        );
+    }
+
     #[test]
     fn a_loss_backs_off_and_it_never_goes_below_the_floor() {
         let mut c = VideoRateControl::default();
         run(&mut c, 0, 10, |_| 3_000, |_, _| 45e6, |_| 0);
-        run(&mut c, 10, 20, |_| 3_000, |_, _| 2e6, |i| i);
+        // Losses while the stream uses the link: down by 15 % a time (one
+        // each hold) to the floor, never below.
+        run(&mut c, 10, 80, |_| 3_000, |_, _| 45e6, |i| i);
         assert_eq!(c.limit(), MIN_BPS as u32);
     }
 
@@ -253,7 +325,7 @@ mod tests {
     fn the_same_limit_is_resent_each_second() {
         let mut c = VideoRateControl::default();
         run(&mut c, 0, 10, |_| 3_000, |_, _| 45e6, |_| 0);
-        run(&mut c, 10, 1, |_| 30_000, |_, _| 30e6, |_| 0);
+        run(&mut c, 10, 2, |_| 30_000, |_, _| 30e6, |_| 0);
         // Held by a worried delay: no change, but a resend every second.
         let sent = run(&mut c, 11, 30, |_| 7_000 + 3_000, |_, _| 25e6, |_| 0);
         assert!((2..=4).contains(&sent.len()), "{sent:?}");

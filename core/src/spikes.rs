@@ -267,7 +267,7 @@ impl LinkTrack {
             return "Wi-Fi here: not measured".into();
         }
         if self.wifi == 0 {
-            return "Wi-Fi here: not on Wi-Fi (wired)".into();
+            return "Wi-Fi here: none (a cable to the network; a mesh node or Wi-Fi beyond it isn't visible from here)".into();
         }
         let l = &self.last;
         let mut parts = Vec::new();
@@ -404,6 +404,6 @@ mod tests {
         assert!(d.contains("roams 1 | channel changes 1"), "{d}");
         let mut w = LinkTrack::default();
         w.feed(&LinkSample::default());
-        assert_eq!(w.describe(), "Wi-Fi here: not on Wi-Fi (wired)");
+        assert_eq!(w.describe(), "Wi-Fi here: none (a cable to the network; a mesh node or Wi-Fi beyond it isn't visible from here)");
     }
 }

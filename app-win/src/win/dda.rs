@@ -13,8 +13,9 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
+    DXGI_OUTDUPL_FRAME_INFO,
 };
 use windows::Win32::Graphics::Gdi::HMONITOR;
 
@@ -31,12 +32,54 @@ pub struct Dda {
     pub switches: u64,
 }
 
+/// The outputs (screens) of `device`'s GPU as they are now. Not through the
+/// device's own adapter object: DXGI keeps that adapter's screens as they
+/// were when its factory was made, so a screen added since (the virtual
+/// display, switched on after the service's helper started) is missing
+/// there (QUIETPC22: the virtual display was on the RTX 4070, but a
+/// helper-age device said it wasn't). A new factory, the same GPU by LUID.
+fn outputs_now(device: &ID3D11Device) -> Res<Vec<IDXGIOutput>> {
+    unsafe {
+        let luid = device
+            .cast::<IDXGIDevice>()?
+            .GetAdapter()?
+            .GetDesc()?
+            .AdapterLuid;
+        let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
+        let mut i = 0;
+        while let Ok(a) = factory.EnumAdapters1(i) {
+            i += 1;
+            let l = a.GetDesc1()?.AdapterLuid;
+            if l.LowPart == luid.LowPart && l.HighPart == luid.HighPart {
+                let mut outs = Vec::new();
+                let mut j = 0;
+                while let Ok(o) = a.EnumOutputs(j) {
+                    j += 1;
+                    outs.push(o);
+                }
+                return Ok(outs);
+            }
+        }
+        Err("the encoding GPU isn't listed any more".into())
+    }
+}
+
+/// The screen called `name` (`\.\DISPLAYn`) is an output of `device`'s
+/// GPU: Desktop Duplication can capture it there.
+pub fn on_gpu(device: &ID3D11Device, name: &str) -> bool {
+    outputs_now(device).is_ok_and(|outs| {
+        outs.iter().any(|o| unsafe {
+            o.GetDesc().is_ok_and(|d| {
+                let len = d.DeviceName.iter().position(|&c| c == 0).unwrap_or(32);
+                String::from_utf16_lossy(&d.DeviceName[..len]).eq_ignore_ascii_case(name)
+            })
+        })
+    })
+}
+
 fn duplicate(device: &ID3D11Device, hmon: HMONITOR) -> Res<IDXGIOutputDuplication> {
     unsafe {
-        let adapter = device.cast::<IDXGIDevice>()?.GetAdapter()?;
-        let mut i = 0;
-        while let Ok(out) = adapter.EnumOutputs(i) {
-            i += 1;
+        for out in outputs_now(device)? {
             if out.GetDesc()?.Monitor == hmon {
                 return Ok(out.cast::<IDXGIOutput1>()?.DuplicateOutput(device)?);
             }

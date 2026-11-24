@@ -10,6 +10,17 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 22 (the virtual display on Glass's GPU; sharper images)
+Protocol v16 (unchanged). Update QUIETPC22, QUIETPC (Glass and the
+service) and the Mac; Share this Mac on.
+1. From QUIETPC22, connect to QUIETPC. The first time may take ~6-10 s
+   (QUIETPC's driver restarted onto its GPU). QUIETPC's monitor goes dark;
+   QUIETPC22 shows it at its own 2560x1440.
+2. Open a photo on QUIETPC; leave it still for a second: it should sharpen.
+   Try Full colour (4:4:4) for photos.
+3. Disconnect: QUIETPC's monitor comes back. Repeat once from the Mac.
+4. Tell me "done".
+
 ## M5 test 21 (results between machines, and test 20)
 Protocol v16: update all three machines, and the service on QUIETPC.
 1. On the Mac, turn **Share this Mac** on (so it can answer for its logs).

@@ -550,6 +550,12 @@
 #define GLASS_IDLE_STEP_US 500000
 
 /**
+ * With no limit, the stream counts as using the link from twice this
+ * (bits/s); with one, from half of it.
+ */
+#define GLASS_BUSY_NO_LIMIT_BPS 20e6
+
+/**
  * Never below this: text and fine detail go soft (bits/s).
  */
 #define GLASS_MIN_BPS 8e6

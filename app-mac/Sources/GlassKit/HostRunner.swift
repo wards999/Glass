@@ -134,7 +134,7 @@ public final class HostRunner {
 /// Stats that live across view-mode changes within one session.
 private final class Totals {
     let encode = Stats(), delivery = Stats(), vtEncode = Stats(), send = Stats(), interval = Stats()
-    var frames = 0, idrs = 0, notSent = 0, idleIDRs = 0, bytes = 0
+    var frames = 0, idrs = 0, notSent = 0, idleIDRs = 0, bytes = 0, refines = 0
     /// Captured frames dropped because a newer one arrived while encoding.
     var stale = 0
     var frameId: UInt32 = 0
@@ -411,8 +411,8 @@ private final class HostSessionRun {
             : "Session with \u{201C}\(s.peerName)\u{201D} (\(s.peerAddress)) ended after \(String(format: "%.1f", secs)) s (\(reason))")
         out.append("  streamed: " + history.joined(separator: " -> "))
         if no444 { out.append("  NOTE: the encoder produced 4:2:0 when asked for 4:4:4, so this session switched to 4:2:0.") }
-        out.append(String(format: "  frames sent %ld (%.1f fps), IDRs %ld (idle re-sends %ld), viewer keyframe requests %ld, not sent (viewer not ready) %ld",
-                          t.frames, Double(t.frames) / secs, t.idrs, t.idleIDRs, Int(counters.keyframe_requests), t.notSent))
+        out.append(String(format: "  frames sent %ld (%.1f fps), IDRs %ld (idle re-sends %ld), viewer keyframe requests %ld, not sent (viewer not ready) %ld | still-picture refinement passes %ld",
+                          t.frames, Double(t.frames) / secs, t.idrs, t.idleIDRs, Int(counters.keyframe_requests), t.notSent, t.refines))
         out.append(String(format: "  bitrate %.1f Mbps avg | %ld packets", Double(t.bytes) * 8 / secs / 1e6, Int(counters.packets_sent)))
         out.append(String(format: "  FEC (M4): %llu parity packets (%.1f%% of packets) | the viewer's latest reported loss %.2f%% | NACKs answered %llu (%llu packets resent)",
                           counters.parity_packets,
@@ -470,6 +470,10 @@ private final class Pipeline {
     let idle: DispatchSourceTimer
     var lastFrame: CVPixelBuffer? // under lock
     var lastCapture: UInt64 = 0 // under lock
+    /// Still-picture refinement (M7, brought forward): passes left for the
+    /// current picture (under lock), and when the last went (idle timer).
+    var refinesLeft = 0
+    private var lastRefine: UInt64 = 0
     var forceKey = true // a new stream starts with an IDR
     var count = 0
     /// Capture runs here; encoding on the session queue. If the encoder is
@@ -515,6 +519,7 @@ private final class Pipeline {
             if lastCapture > 0, captureUs > lastCapture { t.interval.push(UInt32(clamping: captureUs - lastCapture)) }
             lastCapture = captureUs
             lastFrame = pb
+            refinesLeft = 3
             if pending != nil { t.stale += 1 }
             pending = (pb, captureUs)
             let kick = !busy
@@ -536,6 +541,20 @@ private final class Pipeline {
                 let now = GlassClock.nowUs()
                 self.lock.withLock { self.lastCapture = now }
                 self.encodeAndSend(pb, now, force: true)
+            } else {
+                // Still for 150 ms: the same picture again, up to 3 times,
+                // 60 ms apart, so detail a squeezed bitrate left out arrives.
+                let now = GlassClock.nowUs()
+                let go: Bool = self.lock.withLock {
+                    guard self.refinesLeft > 0, now &- last >= 150_000, now &- self.lastRefine >= 60_000 else { return false }
+                    self.refinesLeft -= 1
+                    return true
+                }
+                if go {
+                    self.lastRefine = now
+                    t.refines += 1
+                    self.encodeAndSend(pb, now, force: false)
+                }
             }
         }
         idle.resume()

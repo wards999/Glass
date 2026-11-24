@@ -251,13 +251,13 @@ impl Session {
     /// administrator); otherwise it's there from the next restart. Never
     /// the driver's own reload command (QUIETPC22: repeated reloads crashed
     /// it, and its screen came and went at unpredictable times).
-    pub fn start(w: u32, h: u32, hz: u32) -> Res<Self> {
+    pub fn start(w: u32, h: u32, hz: u32, gpu: &super::d3d::Gpu, same_gpu: bool) -> Res<Self> {
         let keys = vdisplay::instance_keys();
         if keys.is_empty() {
             return Err("the virtual display isn't installed".into());
         }
         let _ = detach_saved();
-        vdisplay::note_mode(w, h, hz)?;
+        vdisplay::note_mode(w, h, hz, &gpu.name)?;
         let r = (|| -> Res<Self> {
             activate(&keys)?;
             if !take_mode(&keys, w, h, hz) {
@@ -282,6 +282,29 @@ impl Session {
                         offered.join(", ")
                     )
                     .into());
+                }
+            }
+            // Desktop Duplication (the service) captures only screens on its
+            // own GPU: if the driver drew elsewhere (QUIETPC: another GPU),
+            // restart it, now told Glass's GPU by name, and look again.
+            if same_gpu {
+                let here = |keys: &[String]| {
+                    vdd_gdi_name(keys).is_some_and(|n| super::dda::on_gpu(&gpu.device, &n))
+                };
+                if !here(&keys) {
+                    if !vdisplay::can_restart() {
+                        return Err(format!("it draws on another GPU than {}", gpu.name).into());
+                    }
+                    restore();
+                    vdisplay::restart_driver()?;
+                    activate(&keys)?;
+                    if !take_mode(&keys, w, h, hz) || !here(&keys) {
+                        return Err(format!(
+                            "it still draws on another GPU than {} after a restart",
+                            gpu.name
+                        )
+                        .into());
+                    }
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -323,7 +346,8 @@ pub fn viewer_size(w: u16, h: u16, scale_pct: u16, hz: u16) -> Option<(u32, u32,
     Some((even(w as u32).max(640), even(h as u32).max(480), hz))
 }
 
-/// `glass-cli vdisplay try [W H HZ] [--seconds S]`: a session's switch
+/// `glass-cli vdisplay try [W H HZ] [--seconds S] [--dda]` (`--dda`: as the
+/// service, which needs the virtual display on its own GPU): a session's switch
 /// without a viewer, to see what Windows says: the virtual display on as
 /// the only screen, both capture methods tried on it, then the PC's own
 /// screens back.
@@ -338,8 +362,13 @@ pub fn try_cli(args: &[String]) -> Res<()> {
         .unwrap_or(3);
     super::d3d::init_process();
     println!("before: {:?}", names());
+    for l in super::d3d::describe_adapters() {
+        println!("  {l}");
+    }
     let t = std::time::Instant::now();
-    let vs = Session::start(w, h, hz)?;
+    let gpu = super::d3d::Gpu::new_nvidia()?;
+    let dda = args.iter().any(|a| a == "--dda");
+    let vs = Session::start(w, h, hz, &gpu, dda)?;
     println!(
         "on in {:.1} s: {} | now: {:?}",
         t.elapsed().as_secs_f64(),
@@ -354,7 +383,10 @@ pub fn try_cli(args: &[String]) -> Res<()> {
         "  {}x{} @ {} Hz at ({}, {})",
         mon.width, mon.height, mon.refresh_hz, mon.left, mon.top
     );
-    let gpu = super::d3d::Gpu::new_nvidia()?;
+    println!("  adapters now (Glass encodes on: {}):", gpu.name);
+    for l in super::d3d::describe_adapters() {
+        println!("  {l}");
+    }
     for (label, dda) in [
         ("Desktop Duplication", true),
         ("Windows.Graphics.Capture", false),

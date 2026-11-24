@@ -330,6 +330,13 @@ impl Drop for FineTimer {
     }
 }
 
+/// Still-picture refinement: this long after the last change...
+const REFINE_AFTER_US: u64 = 150_000;
+/// ...this many passes of the last picture...
+const REFINE_PASSES: u32 = 3;
+/// ...this far apart.
+const REFINE_EVERY_US: u64 = 60_000;
+
 /// The encoder's bitrate for a viewer's limit: coarse steps (each change
 /// costs a keyframe with FFmpeg's NVENC), the largest at or under the limit,
 /// never above ours.
@@ -385,6 +392,9 @@ struct HostRun {
     intervals: IntervalTracker,
     idrs: u32,
     idle_idrs: u32,
+    /// Still-picture refinement passes sent, and their bytes.
+    refines: u32,
+    refine_bytes: u64,
     /// What blocked input during the session, and for how long (µs).
     blocked_by: Vec<String>,
     blocked_us: u64,
@@ -489,6 +499,8 @@ impl HostRun {
             intervals: IntervalTracker::default(),
             idrs: 0,
             idle_idrs: 0,
+            refines: 0,
+            refine_bytes: 0,
             blocked_by: Vec::new(),
             blocked_us: 0,
             not_sent: 0,
@@ -1023,7 +1035,7 @@ pub(crate) fn media_session<V: ViewerLink>(
         let v = session.viewer();
         match vscreen::viewer_size(v.display_w, v.display_h, v.scale_pct, v.refresh_hz) {
             None => virt_note = "virtual display: not used (the viewer didn't say its size)".into(),
-            Some((vw, vh, hz)) => match vscreen::Session::start(vw, vh, hz) {
+            Some((vw, vh, hz)) => match vscreen::Session::start(vw, vh, hz, gpu, a.desktops) {
                 Ok(vs) => {
                     let found = capture::monitors()?.into_iter().find(|m| m.name == vs.name);
                     match found.map(|nm| capture_again(gpu, &nm, a.desktops).map(|c| (nm, c))) {
@@ -1273,6 +1285,13 @@ fn run_session<V: ViewerLink>(
     let mut last_step_us = 0u64;
     let mut last_sent = 0u64;
     let mut held: Option<u64> = None;
+    // Still-picture refinement (M7, brought forward): when the screen stops
+    // changing, the last picture is encoded again a few times, so detail
+    // that a squeezed bitrate left out arrives once there's room (an image
+    // opened on a weak link sharpens in a moment instead of staying blocky).
+    let mut last_change_us = 0u64;
+    let mut refines_left = 0u32;
+    let mut last_refine_us = 0u64;
     run.send_hz = send_hz;
     run.full_hz = full_hz;
     // 1 ms timer resolution for the session: Windows' default is 15.6 ms,
@@ -1491,6 +1510,34 @@ fn run_session<V: ViewerLink>(
                 run.on_packet(session, arrival, input_seq, data, key)
             })?;
         }
+        if got {
+            last_change_us = clock::now_us();
+            refines_left = REFINE_PASSES;
+        }
+        if !got
+            && held.is_none()
+            && !pending_idr
+            && refines_left > 0
+            && session.streaming()
+            && enc.has_last()
+        {
+            let now = clock::now_us();
+            if now.saturating_sub(last_change_us) >= REFINE_AFTER_US
+                && now.saturating_sub(last_refine_us) >= REFINE_EVERY_US
+            {
+                refines_left -= 1;
+                last_refine_us = now;
+                last_sent = now;
+                run.refines += 1;
+                let input_seq = session.input_seq();
+                let mut bytes = 0;
+                enc.encode_last(now as i64, false, |data, key, _| {
+                    bytes += data.len();
+                    run.on_packet(session, now, input_seq, data, key)
+                })?;
+                run.refine_bytes += bytes as u64;
+            }
+        }
         if held.is_some() && clock::now_us().saturating_sub(last_sent) >= min_gap {
             held = None;
             let now = clock::now_us();
@@ -1572,14 +1619,16 @@ fn host_report<V: ViewerLink>(
     if let Some(c) = session.counters() {
         let _ = writeln!(
             r,
-            "  frames sent {} ({:.1} fps), IDRs {} (idle re-sends {}), viewer keyframe requests {}, not sent (viewer not ready) {}, skipped {}",
+            "  frames sent {} ({:.1} fps), IDRs {} (idle re-sends {}), viewer keyframe requests {}, not sent (viewer not ready) {}, skipped {} | still-picture refinement passes {} ({:.0} KB)",
             c.frames_sent,
             c.frames_sent as f64 / secs,
             run.idrs,
             run.idle_idrs,
             c.keyframe_requests,
             run.not_sent,
-            run.skipped
+            run.skipped,
+            run.refines,
+            run.refine_bytes as f64 / 1024.0
         );
         if let Some(m) = run.moments_line() {
             let _ = writeln!(r, "{m}");
@@ -1655,12 +1704,14 @@ fn host_report<V: ViewerLink>(
     } else {
         let _ = writeln!(
             r,
-            "  frames encoded {} ({:.1} fps), IDRs {} (idle re-sends {}), skipped {}",
+            "  frames encoded {} ({:.1} fps), IDRs {} (idle re-sends {}), skipped {} | still-picture refinement passes {} ({:.0} KB)",
             run.frame_id,
             run.frame_id as f64 / secs,
             run.idrs,
             run.idle_idrs,
-            run.skipped
+            run.skipped,
+            run.refines,
+            run.refine_bytes as f64 / 1024.0
         );
     }
     let _ = writeln!(r, "{}", fmt_line("encode", &run.encode.summary()));

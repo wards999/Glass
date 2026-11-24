@@ -130,9 +130,13 @@ fn instance_ids() -> Vec<String> {
 }
 
 /// Adds `w`×`h` (at `hz` and 60 Hz) to the sizes in the driver's settings,
+/// and has it draw with `gpu` (Glass's encoding GPU, by its name: Desktop
+/// Duplication captures only screens on the GPU it runs on; QUIETPC's driver
+/// drew on another and the service couldn't capture it; it takes effect
+/// when the driver starts);
 /// newest first, up to 24; no reload (the driver reads them when it
 /// starts). The folder is writable by the PC's users.
-pub fn note_mode(w: u32, h: u32, hz: u32) -> Res<()> {
+pub fn note_mode(w: u32, h: u32, hz: u32, gpu: &str) -> Res<()> {
     let path = config_dir().join("vdd_settings.xml");
     let old = std::fs::read_to_string(&path).unwrap_or_default();
     let mut modes: Vec<(u32, u32, u32)> = vec![(w, h, hz)];
@@ -158,7 +162,7 @@ pub fn note_mode(w: u32, h: u32, hz: u32) -> Res<()> {
             format!("    <resolution><width>{a}</width><height>{b}</height><refresh_rate>{c}</refresh_rate></resolution>\n")
         })
         .collect();
-    let xml = settings_xml(&res, &[]);
+    let xml = settings_xml(&res, &[], gpu);
     if xml != old {
         std::fs::write(&path, xml)?;
     }
@@ -213,18 +217,18 @@ fn default_settings() -> String {
             "    <resolution><width>{w}</width><height>{h}</height><refresh_rate>60</refresh_rate></resolution>\n"
         ));
     }
-    settings_xml(&res, &[60, 120, 144, 165])
+    settings_xml(&res, &[60, 120, 144, 165], "default")
 }
 
 /// The driver's settings file: one screen, `res` (`<resolution>` lines),
 /// `global` refresh rates added to every resolution.
-fn settings_xml(res: &str, global: &[u32]) -> String {
+fn settings_xml(res: &str, global: &[u32], gpu: &str) -> String {
     let g: String = global
         .iter()
         .map(|r| format!("    <g_refresh_rate>{r}</g_refresh_rate>\n"))
         .collect();
     format!(
-        "<?xml version='1.0' encoding='utf-8'?>\n<vdd_settings>\n  <monitors><count>1</count></monitors>\n  <gpu><friendlyname>default</friendlyname></gpu>\n  <global>\n{g}  </global>\n  <resolutions>\n{res}  </resolutions>\n  <options>\n    <CustomEdid>false</CustomEdid>\n    <PreventSpoof>false</PreventSpoof>\n    <EdidCeaOverride>false</EdidCeaOverride>\n    <HardwareCursor>true</HardwareCursor>\n    <SDR10bit>false</SDR10bit>\n    <HDRPlus>false</HDRPlus>\n    <logging>false</logging>\n    <debuglogging>false</debuglogging>\n  </options>\n</vdd_settings>\n"
+        "<?xml version='1.0' encoding='utf-8'?>\n<vdd_settings>\n  <monitors><count>1</count></monitors>\n  <gpu><friendlyname>{gpu}</friendlyname></gpu>\n  <global>\n{g}  </global>\n  <resolutions>\n{res}  </resolutions>\n  <options>\n    <CustomEdid>false</CustomEdid>\n    <PreventSpoof>false</PreventSpoof>\n    <EdidCeaOverride>false</EdidCeaOverride>\n    <HardwareCursor>true</HardwareCursor>\n    <SDR10bit>false</SDR10bit>\n    <HDRPlus>false</HDRPlus>\n    <logging>false</logging>\n    <debuglogging>false</debuglogging>\n  </options>\n</vdd_settings>\n"
     )
 }
 

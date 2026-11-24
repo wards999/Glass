@@ -33,6 +33,44 @@ pub struct AdapterInfo {
     adapter: IDXGIAdapter1,
 }
 
+/// Every adapter DXGI lists, with its LUID, flags and screens (for
+/// `glass-cli vdisplay try`: which one a virtual display's screen is on).
+pub fn describe_adapters() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return out;
+    };
+    for i in 0.. {
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else {
+            break;
+        };
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+        let mut outs = Vec::new();
+        for j in 0.. {
+            let Ok(o) = (unsafe { adapter.EnumOutputs(j) }) else {
+                break;
+            };
+            if let Ok(od) = unsafe { o.GetDesc() } {
+                let n = od.DeviceName.iter().position(|&c| c == 0).unwrap_or(32);
+                outs.push(String::from_utf16_lossy(&od.DeviceName[..n]));
+            }
+        }
+        out.push(format!(
+            "[{i}] {} | vendor {:04x} | LUID {:x}:{:08x} | flags {:x} | screens {:?}",
+            String::from_utf16_lossy(&desc.Description[..len]),
+            desc.VendorId,
+            desc.AdapterLuid.HighPart,
+            desc.AdapterLuid.LowPart,
+            desc.Flags,
+            outs
+        ));
+    }
+    out
+}
+
 pub fn adapters() -> Res<Vec<AdapterInfo>> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
     let mut out = Vec::new();

@@ -10,6 +10,14 @@ publishes a **prerelease** on the repo's Releases page with:
 The Mac doesn't need Rust or Xcode. First launch: right-click > Open, or
 System Settings > Privacy & Security > Open Anyway.
 
+## M5 test 25 (direct NVENC: sharp photos)
+Update QUIETPC22, QUIETPC (Glass and the service).
+1. From QUIETPC22 view QUIETPC: photos, in Fast and in Full colour, each
+   still for a second. They should go fully sharp a moment after opening,
+   with nothing blurring by itself.
+2. Use it normally a few minutes (scrolling, the pool game).
+3. "done": the results say "encoder NVENC (direct)" if the direct path ran.
+
 ## M5 test 24 (photos sharp, no blur cycle)
 As test 23: from QUIETPC22 view QUIETPC, open photos and move around the
 desktop and Start menu. Nothing should blur and sharpen by itself; photos

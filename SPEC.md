@@ -685,9 +685,10 @@ captures and encodes.
 3. **M7 – Clarity (rest):** a scene-change burst and still-region
    refinement on the Windows host.
 4. **M8 – Extras:**
-   - **A direct NVENC SDK path:** bitrate changes without a keyframe, and
-     reference-frame invalidation instead of a keyframe after a loss
-     (ADR 0022).
+   - **A direct NVENC SDK path:** done early (ADR 0032, m5-test25):
+     bitrate changes without a keyframe, still pictures at high quality.
+     Still to do: reference-frame invalidation instead of a keyframe after
+     a loss (ADR 0022).
    - **The MTU probe** (DF bit, falling back to 1200-byte datagrams) with a
      warning when a VPN routes local traffic (ADR 0023).
 

@@ -22,6 +22,16 @@ mod helper;
 mod inject;
 mod mdns;
 mod netif;
+mod nvenc;
+#[allow(
+    non_upper_case_globals,
+    non_camel_case_types,
+    non_snake_case,
+    dead_code,
+    unused_imports,
+    clippy::all
+)]
+mod nvenc_sys;
 mod pipe;
 mod play;
 mod present;
@@ -397,8 +407,10 @@ struct HostRun {
     idle_idrs: u32,
     /// Still-picture refinement passes sent, and their bytes.
     refines: u32,
+    /// Which encoder ran.
+    encoder: &'static str,
     refine_bytes: u64,
-    /// What blocked input during the session, and for how long (µs).
+    /// What blocked input during the session, and for how long (Âµs).
     blocked_by: Vec<String>,
     blocked_us: u64,
     not_sent: u32,
@@ -408,8 +420,8 @@ struct HostRun {
     capped: u32,
     send_hz: u32,
     /// Worst moments (M5): the longest pauses in capture while the picture
-    /// was moving (µs into the session, gap), and the biggest frames (µs,
-    /// bytes, encode µs, keyframe). Longest / biggest first.
+    /// was moving (Âµs into the session, gap), and the biggest frames (Âµs,
+    /// bytes, encode Âµs, keyframe). Longest / biggest first.
     /// Rate control (M5): the encoder's bitrate now, the lowest set, and
     /// how many changes (0 = none yet: our own setting).
     rate_now: i64,
@@ -453,7 +465,7 @@ impl HostRun {
         self.last_capture = now;
     }
 
-    /// "worst moments (M5): …", for the results.
+    /// "worst moments (M5): â€¦", for the results.
     fn moments_line(&self) -> Option<String> {
         let when = |us: u64| {
             let s = us as f64 / 1e6;
@@ -503,6 +515,7 @@ impl HostRun {
             idrs: 0,
             idle_idrs: 0,
             refines: 0,
+            encoder: "",
             refine_bytes: 0,
             blocked_by: Vec::new(),
             blocked_us: 0,
@@ -984,6 +997,11 @@ pub(crate) fn capture_again(
     Err(format!("couldn't capture this PC's screen again: {last}").into())
 }
 
+/// `glass-cli nvenc-test`: see `nvenc::self_test`.
+pub fn nvenc_test(args: &[String]) -> Res<()> {
+    nvenc::self_test(args)
+}
+
 /// Where this machine's session logs are, for a results-only connection
 /// (v16): its own logs, the service's last session, and (when this is the
 /// service, as SYSTEM) the signed-in users' logs.
@@ -1213,7 +1231,7 @@ fn run_session<V: ViewerLink>(
         }
     }
     let make = |chroma444: bool| {
-        encode::Encoder::new(
+        nvenc::Video::new(
             &gpu.device,
             &encode::Config {
                 width: w,
@@ -1243,6 +1261,7 @@ fn run_session<V: ViewerLink>(
     }
     let mut enc = make(chroma444)?;
     let mut run = HostRun::new();
+    run.encoder = enc.name();
     let mut pointer = cursor::CursorWatch::new();
     let mut watch = blocker::BlockerWatch::new();
     let mut blocked_since = None;
@@ -1547,7 +1566,8 @@ fn run_session<V: ViewerLink>(
                 let mut bytes = 0;
                 // One keyframe of the still picture (the encoder's buffer
                 // lets it be as big as it needs).
-                enc.encode_last_quality(now as i64, |data, key, _| {
+                let qp = nvenc::still_qp(limit.unwrap_or(0));
+                enc.encode_last_quality(now as i64, qp, |data, key, _| {
                     bytes += data.len();
                     run.on_packet(session, now, input_seq, data, key)
                 })?;
@@ -1635,7 +1655,7 @@ fn host_report<V: ViewerLink>(
     if let Some(c) = session.counters() {
         let _ = writeln!(
             r,
-            "  frames sent {} ({:.1} fps), IDRs {} (idle re-sends {}), viewer keyframe requests {}, not sent (viewer not ready) {}, skipped {} | still-picture quality keyframes {} ({:.0} KB)",
+            "  frames sent {} ({:.1} fps), IDRs {} (idle re-sends {}), viewer keyframe requests {}, not sent (viewer not ready) {}, skipped {} | still-picture quality keyframes {} ({:.0} KB) | encoder {}",
             c.frames_sent,
             c.frames_sent as f64 / secs,
             run.idrs,
@@ -1644,7 +1664,8 @@ fn host_report<V: ViewerLink>(
             run.not_sent,
             run.skipped,
             run.refines,
-            run.refine_bytes as f64 / 1024.0
+            run.refine_bytes as f64 / 1024.0,
+            run.encoder
         );
         if let Some(m) = run.moments_line() {
             let _ = writeln!(r, "{m}");
@@ -1720,14 +1741,15 @@ fn host_report<V: ViewerLink>(
     } else {
         let _ = writeln!(
             r,
-            "  frames encoded {} ({:.1} fps), IDRs {} (idle re-sends {}), skipped {} | still-picture quality keyframes {} ({:.0} KB)",
+            "  frames encoded {} ({:.1} fps), IDRs {} (idle re-sends {}), skipped {} | still-picture quality keyframes {} ({:.0} KB) | encoder {}",
             run.frame_id,
             run.frame_id as f64 / secs,
             run.idrs,
             run.idle_idrs,
             run.skipped,
             run.refines,
-            run.refine_bytes as f64 / 1024.0
+            run.refine_bytes as f64 / 1024.0,
+            run.encoder
         );
     }
     let _ = writeln!(r, "{}", fmt_line("encode", &run.encode.summary()));

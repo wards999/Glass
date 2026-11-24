@@ -378,6 +378,8 @@ pub fn cli_main() {
         #[cfg(windows)]
         Some("vdisplay") => win::vdisplay::command(&args[1..]),
         #[cfg(windows)]
+        Some("nvenc-test") => win::nvenc_test(&args[1..]),
+        #[cfg(windows)]
         Some("connect") => connect::connect(&args[1..]),
         #[cfg(windows)]
         Some("list") => win::list(),

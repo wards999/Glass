@@ -207,8 +207,14 @@ pub(crate) struct TlsWriter(Arc<Mutex<Shared>>);
 impl TlsWriter {
     pub fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
         let mut s = lock(&self.0);
-        s.conn.writer().write_all(bytes)?;
-        s.flush()
+        // In pieces, each sent before the next: rustls buffers at most
+        // 64 KiB unsent, and a bigger write failed (the v16 results, ~300 KB
+        // once QUIETPC had eight full logs, arrived as nothing).
+        for piece in bytes.chunks(16 * 1024) {
+            s.conn.writer().write_all(piece)?;
+            s.flush()?;
+        }
+        Ok(())
     }
 
     /// RFC 5705/8446 exporter: `len` bytes bound to this TLS session.
@@ -305,4 +311,34 @@ pub(crate) fn handshake(mut tcp: TcpStream, mut conn: Connection) -> io::Result<
         writer: TlsWriter(sh),
         peer,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+    use std::net::TcpListener;
+
+    #[test]
+    fn writes_bigger_than_rustls_buffer_arrive() {
+        let host = Identity::generate().unwrap();
+        let viewer = Identity::generate().unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i * 7) as u8).collect();
+        let sent = data.clone();
+        let t = std::thread::spawn(move || {
+            let (tcp, _) = l.accept().unwrap();
+            let cfg = server_config(&host).unwrap();
+            let ch = handshake(tcp, server_conn(&cfg).unwrap()).unwrap();
+            ch.writer.write_all(&sent).unwrap();
+        });
+        let tcp = TcpStream::connect(addr).unwrap();
+        let cfg = client_config(&viewer).unwrap();
+        let mut ch = handshake(tcp, client_conn(&cfg).unwrap()).unwrap();
+        let mut got = vec![0u8; data.len()];
+        ch.reader.read_exact(&mut got).unwrap();
+        assert!(got == data);
+        t.join().unwrap();
+    }
 }

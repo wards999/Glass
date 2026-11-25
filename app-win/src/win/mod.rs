@@ -345,9 +345,10 @@ impl Drop for FineTimer {
 /// 200 ms sent 122 quality keyframes in 3.5 minutes of scrolling, ~430 KB
 /// each across QUIETPC's eero mesh hop; input -> screen went from ~35 to
 /// 49 ms p50; 400 ms in m5-test27 felt slow to sharpen; 300 ms in
-/// m5-test29 sharpened in ~0.5 s; 200 ms now the quality frame is a
-/// correction, not a keyframe)...
-const REFINE_AFTER_US: u64 = 200_000;
+/// m5-test29 sharpened in ~0.5 s; 200 ms once the quality frame was a
+/// correction; 100 ms for SPEC's 150 ms: the scorecard's changes whose first
+/// frame wasn't sharp took 219-243 ms at 200 ms)...
+const REFINE_AFTER_US: u64 = 100_000;
 /// ...after changes worth it (bytes of real changes since the last one)...
 const REFINE_MIN_CHANGE: usize = 100_000;
 /// ...one high-quality keyframe of the last picture (m5-test22: three
@@ -433,6 +434,14 @@ struct HostRun {
     /// and the rate it sends at.
     capped: u32,
     send_hz: u32,
+    /// Encode time, a running average (µs), and how often the encoder's
+    /// load lowered the frame rate, and to what.
+    enc_avg_us: f64,
+    /// Encoding a still picture's quality frame (not counted in the average:
+    /// it's slow on purpose, and the screen is still).
+    in_quality: bool,
+    load_lowered: u32,
+    load_lowest_hz: u32,
     /// Worst moments (M5): the longest pauses in capture while the picture
     /// was moving (Âµs into the session, gap), and the biggest frames (Âµs,
     /// bytes, encode Âµs, keyframe). Longest / biggest first.
@@ -541,6 +550,10 @@ impl HostRun {
             skipped: 0,
             capped: 0,
             send_hz: 0,
+            enc_avg_us: 0.0,
+            in_quality: false,
+            load_lowered: 0,
+            load_lowest_hz: 0,
             rate_now: 0,
             rate_lo: 0,
             rate_changes: 0,
@@ -593,6 +606,9 @@ impl HostRun {
                     self.big.truncate(5);
                 }
                 self.encode.push(encode_us);
+                if !self.in_quality {
+                    self.enc_avg_us += (encode_us as f64 - self.enc_avg_us) * 0.05;
+                }
                 if self.chroma444 {
                     self.encode_444.push(encode_us);
                 } else {
@@ -1440,6 +1456,29 @@ fn run_session<V: ViewerLink>(
     };
     let mut send_hz = full_hz;
     let mut min_gap = 900_000 / send_hz.max(1) as u64;
+    // The encoder's own lever: when a frame takes longer to encode than 80 %
+    // of the gap between frames, the next step down (the viewer's refresh,
+    // then half, a third); each is a whole number of the viewer's refreshes,
+    // so motion stays even instead of frames going late at random. Up again
+    // after 1 s with room (m5-test37's scorecard: the RTX 2060 took 18 ms a
+    // frame for a 4:4:4 scroll at 165 Hz, and 669 of 1000 refreshes missed).
+    let load_steps: Vec<u32> = {
+        let mut v = vec![full_hz];
+        if viewer_hz > 0 {
+            for k in 1..=3 {
+                let hz = (viewer_hz / k).max(1);
+                if hz < *v.last().unwrap_or(&u32::MAX) {
+                    v.push(hz);
+                }
+            }
+        }
+        v
+    };
+    let mut load_level = 0usize;
+    let mut load_changed_us = 0u64;
+    // Over the line since (one big frame, a page or a card changing, isn't
+    // a load: it has to last 0.3 s).
+    let mut load_over_since: Option<u64> = None;
     let ours = a.mbps as i64 * 1_000_000;
     let mut limit: Option<i64> = None;
     let mut last_step_us = 0u64;
@@ -1531,6 +1570,36 @@ fn run_session<V: ViewerLink>(
                 }
                 _ => full_hz,
             };
+            // The encoder's lever (above), checked against the average.
+            let gap = |i: usize| 1e6 / load_steps[i] as f64;
+            let avg = run.enc_avg_us;
+            if avg > 0.0 {
+                let over = load_level + 1 < load_steps.len() && avg > gap(load_level) * 0.8;
+                if !over {
+                    load_over_since = None;
+                } else if load_over_since.is_none() {
+                    load_over_since = Some(now);
+                }
+                if over && load_over_since.is_some_and(|t| now.saturating_sub(t) >= 300_000) {
+                    load_over_since = None;
+                    load_level += 1;
+                    load_changed_us = now;
+                    run.load_lowered += 1;
+                    let hz = load_steps[load_level];
+                    run.load_lowest_hz = if run.load_lowest_hz == 0 {
+                        hz
+                    } else {
+                        run.load_lowest_hz.min(hz)
+                    };
+                } else if load_level > 0
+                    && avg < gap(load_level - 1) * 0.6
+                    && now.saturating_sub(load_changed_us) >= 1_000_000
+                {
+                    load_level -= 1;
+                    load_changed_us = now;
+                }
+            }
+            let want_hz = want_hz.min(load_steps[load_level]);
             if want_hz != send_hz {
                 send_hz = want_hz;
                 min_gap = 900_000 / send_hz.max(1) as u64;
@@ -1717,10 +1786,13 @@ fn run_session<V: ViewerLink>(
                 // One keyframe of the still picture (the encoder's buffer
                 // lets it be as big as it needs).
                 let qp = nvenc::still_qp(limit.unwrap_or(0));
-                enc.encode_last_quality(now as i64, qp, |data, key, _| {
+                run.in_quality = true;
+                let r = enc.encode_last_quality(now as i64, qp, |data, key, _| {
                     bytes += data.len();
                     run.on_packet(session, now, input_seq, data, key)
-                })?;
+                });
+                run.in_quality = false;
+                r?;
                 run.refine_encode
                     .push(clock::now_us().saturating_sub(now) as u32);
                 run.refine_bytes += bytes as u64;
@@ -1847,8 +1919,15 @@ fn host_report<V: ViewerLink>(
         if run.send_hz > 0 {
             let _ = writeln!(
                 r,
-                "  frame rate (M5): at most {} fps, twice the viewer's screen | {} frames held back (a newer one went instead)",
-                run.full_hz.max(run.send_hz), run.capped
+                "  frame rate (M5): at most {} fps, twice the viewer's screen | {} frames held back (a newer one went instead) | lowered for the encoder's load {} times{}",
+                run.full_hz.max(run.send_hz),
+                run.capped,
+                run.load_lowered,
+                if run.load_lowest_hz > 0 {
+                    format!(", lowest {} fps", run.load_lowest_hz)
+                } else {
+                    String::new()
+                }
             );
         }
         let _ = writeln!(

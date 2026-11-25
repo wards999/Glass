@@ -110,10 +110,16 @@ final class LiveViewer: NSObject, NSWindowDelegate {
     /// 32 ms). Presenting each frame as it was decoded (m5-test3) doesn't
     /// suit the host sending twice the refresh.
     private let presentPath = "late in each refresh, the newest frame"
-    /// How long before the next refresh the frame goes (s).
-    /// 3 ms (was 5): every ms here is a ms of lag; a present that misses
-    /// costs a whole refresh, counted as "late" in the results (m5-test17).
-    private let presentLead = 0.003
+    /// How long before the next refresh the frame goes (s): from 3 ms (every
+    /// ms here is a ms of lag), raised a ms at a time while more than 3% of
+    /// a 2 s stretch missed (a miss costs a whole refresh: m5-test35, 9% late
+    /// at 3 ms during a game), lowered again after a clean stretch.
+    private var presentLead = 0.003
+    private var leadMax = 0.003
+    private var leadCheck: UInt64 = 0
+    /// Presents and late ones since the last check (under `lock`).
+    private var windowShown = 0
+    private var windowLate = 0
     private var keyMonitor: Any?
     private var finished = false
     private let started = GlassClock.nowUs()
@@ -678,6 +684,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         // refresh saw it still pending and skipped: 51.5 fps shown of 60).
         let target = link.targetTimestamp
         refreshPeriod = link.targetTimestamp - link.timestamp
+        adaptLead()
         let wait = target - CACurrentMediaTime() - presentLead
         if wait > 0.0005 {
             DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in self?.presentNow(for: target) }
@@ -743,6 +750,24 @@ final class LiveViewer: NSObject, NSWindowDelegate {
         present(item.0, item.1, for: target)
     }
 
+    /// Every 2 s: more margin if presents missed, less after a clean stretch.
+    private func adaptLead() {
+        let now = GlassClock.nowUs()
+        guard now - leadCheck >= 2_000_000 else { return }
+        leadCheck = now
+        let (shown, late) = lock.withLock { () -> (Int, Int) in
+            defer { windowShown = 0; windowLate = 0 }
+            return (windowShown, windowLate)
+        }
+        guard shown >= 30 else { return }
+        if late * 100 > shown * 3 {
+            presentLead = min(presentLead + 0.001, 0.008)
+        } else if late == 0 {
+            presentLead = max(presentLead - 0.0005, 0.003)
+        }
+        leadMax = max(leadMax, presentLead)
+    }
+
     /// The display's refresh interval (s), from the display link.
     private var refreshPeriod: CFTimeInterval = 1.0 / 60
 
@@ -783,6 +808,8 @@ final class LiveViewer: NSObject, NSWindowDelegate {
             self.lock.withLock {
                 let newInput = t.inputSeq != self.lastInputMeasured && sentAt != nil
                 if newInput { self.lastInputMeasured = t.inputSeq }
+                self.windowShown += 1
+                if !onTime { self.windowLate += 1 }
                 for s in [self.session, self.recent] {
                     s.presented += 1
                     if onTime { s.onTime += 1 } else { s.later += 1 }
@@ -985,7 +1012,7 @@ final class LiveViewer: NSObject, NSWindowDelegate {
                 out.append("  PC notices: \(noticesSeen.sorted().map { $0 == UInt8(GLASS_NOTICE_INPUT_BLOCKED_ELEVATED) ? "input blocked by an admin window" : "UAC prompt / lock screen" }.joined(separator: ", "))")
             }
             let shownAll = max(s.onTime + s.later, 1)
-            out.append("  decoder: \(usingHardware ? "hardware" : "SOFTWARE") | presented by: \(presentPath) | on time \(s.onTime * 100 / shownAll)% (one refresh after its deadline, macOS's own pipeline), late \(s.later * 100 / shownAll)% (missed the deadline, or composited) | lead \(Int(presentLead * 1000)) ms")
+            out.append("  decoder: \(usingHardware ? "hardware" : "SOFTWARE") | presented by: \(presentPath) | on time \(s.onTime * 100 / shownAll)% (one refresh after its deadline, macOS's own pipeline), late \(s.later * 100 / shownAll)% (missed the deadline, or composited) | lead \(String(format: "%.1f", presentLead * 1000)) ms (up to \(String(format: "%.1f", leadMax * 1000)) ms: raised while presents missed)")
             out.append("  clipboard: \(clipSummary)")
             out.append(s.encode.line("encode (host)"))
             out.append(s.network.line("network"))

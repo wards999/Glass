@@ -313,8 +313,12 @@ private final class HostSessionRun {
         _ = log.due(started)
         let viewer = q.sync { s.viewer }
         viewerHz = viewer.refresh_hz
-        // 4:4:4 from the start unless the viewer prefers 4:2:0.
-        configure(mode: viewer.mode, allow444: viewer.caps & UInt8(GLASS_CAP_PREFER_420) == 0)
+        // 4:2:0 to start with, whatever the viewer prefers; its colour toggle
+        // still asks for 4:4:4. The scorecard (m5-test37): the M4's 4:2:0
+        // encoder (low-latency) passed sharpness and delay, its 4:4:4 one
+        // was blurrier (40.8 dB at best, 46.9 dB for 4:2:0's first frame)
+        // and slower (18.5 ms a frame, 12.6 ms).
+        configure(mode: viewer.mode, allow444: false)
         // The sound (M4b step 3): its own capture, kept across view changes.
         if !runner.options.testPattern, let out = q.sync(execute: { s.audioOut() }) {
             let a = HostAudio(out: out)
@@ -557,7 +561,7 @@ private final class Pipeline {
         })
         // Idle screen: ScreenCaptureKit sends nothing new, so answer keyframe
         // requests (and a new stream's first IDR) with the last picture.
-        idle.schedule(deadline: .now() + .milliseconds(50), repeating: .milliseconds(50))
+        idle.schedule(deadline: .now() + .milliseconds(25), repeating: .milliseconds(25))
         idle.setEventHandler { [weak self] in
             guard let self else { return }
             let (frame, last) = self.lock.withLock { (self.lastFrame, self.lastCapture) }
@@ -568,12 +572,12 @@ private final class Pipeline {
                 self.lock.withLock { self.lastCapture = now }
                 self.encodeAndSend(pb, now, force: true)
             } else {
-                // Still for 200 ms: the picture once more at high quality, at
+                // Still for 100 ms: the picture once more at high quality, at
                 // most every 0.5 s (as the PC host, ADR 0032; three passes at
                 // the normal budget never sharpened photos there).
                 let now = GlassClock.nowUs()
                 let go: Bool = self.lock.withLock {
-                    guard self.refinesLeft > 0, now &- last >= 200_000, now &- self.lastRefine >= 500_000 else { return false }
+                    guard self.refinesLeft > 0, now &- last >= 100_000, now &- self.lastRefine >= 500_000 else { return false }
                     self.refinesLeft -= 1
                     return true
                 }

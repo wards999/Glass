@@ -48,10 +48,10 @@ pub const MAX_BPS: f64 = 200e6;
 /// Both hosts use it (the Mac's encoder as a QP cap).
 pub fn still_qp(limit_bps: i64) -> u32 {
     match limit_bps {
-        0 => 18,
-        l if l >= 60_000_000 => 18,
-        l if l >= 20_000_000 => 22,
-        _ => 26,
+        0 => 16,
+        l if l >= 60_000_000 => 16,
+        l if l >= 20_000_000 => 20,
+        _ => 24,
     }
 }
 
@@ -184,10 +184,10 @@ mod tests {
 
     #[test]
     fn still_qp_coarser_on_a_squeezed_link() {
-        assert_eq!(still_qp(0), 18);
-        assert_eq!(still_qp(80_000_000), 18);
-        assert_eq!(still_qp(40_000_000), 22);
-        assert_eq!(still_qp(10_000_000), 26);
+        assert_eq!(still_qp(0), 16);
+        assert_eq!(still_qp(80_000_000), 16);
+        assert_eq!(still_qp(40_000_000), 20);
+        assert_eq!(still_qp(10_000_000), 24);
     }
 
     /// Runs `ticks` ticks; `delay(i)` and `rate(i, limit)` give each tick's

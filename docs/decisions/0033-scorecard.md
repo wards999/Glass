@@ -40,3 +40,19 @@ so both hosts draw the same pixels and any viewer scores them the same way.
 - Luma only: 4:4:4's chroma isn't scored yet. LATER: a colour card.
 - F24 is pressed and let go on the host while scoring (nothing answers it).
 - Mac viewer scoring LATER; the Mac host draws the scene.
+
+## First results and what they changed (m5-test37 → m5-test40)
+- Mac host 4:2:0 passed sharpness (all changes at 45 dB in 83 ms) and delay
+  (25.6 / 29.3 ms); its 4:4:4 was blurrier (40.8 dB at best) and slower
+  (18.5 ms a frame against 12.6). Mac hosts now start in 4:2:0; the viewer's
+  colour toggle still asks for 4:4:4.
+- The PC host's quality frame at QP 18 peaked at 44.2–44.8 dB: now QP 16
+  (both hosts, `still_qp`), and 100 ms after the last change (was 200; the
+  changes whose first frame wasn't sharp took 219–243 ms). Loopback 4:4:4:
+  6 of 6 at 45 dB, worst 148 ms: PASS.
+- No host here encodes a full-screen 2560x1440 change 165 times a second
+  (RTX 2060 4:4:4 18 ms a frame, the Mac 12.6–18.5 ms). The PC host now
+  lowers its frame rate in even steps (the viewer's refresh, half, a third)
+  when encoding takes over 80 % of the gap for 0.3 s, and the scorecard
+  judges smoothness at the steady rate reached, which its line states.
+- The Mac viewer's present margin adapts (3–8 ms) to presents that miss.

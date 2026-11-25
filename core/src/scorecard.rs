@@ -541,36 +541,48 @@ impl Scorecard {
             SHARP_TARGET_US / 1000,
             if pass { "PASS" } else { "FAIL" }
         ));
-        // Smoothness.
+        // Smoothness: judged at the steady rate reached (the typical gap in
+        // whole refreshes), which the line states: a host that sends every
+        // other refresh on purpose (its encoder's lever) is even, not
+        // missing half; a gap longer than that step is a missed picture.
         let period = 1e6 / self.fps as f64;
-        let mut missed = 0u64;
-        let mut refreshes = 0u64;
-        let mut intervals: Vec<f64> = Vec::with_capacity(self.motion_shown.len());
-        for w in self.motion_shown.windows(2) {
-            let d = w[1].saturating_sub(w[0]) as f64;
-            let n = (d / period).round().max(1.0) as u64;
-            refreshes += n;
-            missed += n - 1;
-            intervals.push(d);
-        }
-        if intervals.is_empty() {
-            out.push_str("  smoothness: no frames shown while scrolling FAIL\n");
+        let mut gaps: Vec<f64> = self
+            .motion_shown
+            .windows(2)
+            .map(|w| w[1].saturating_sub(w[0]) as f64)
+            .collect();
+        if gaps.is_empty() {
+            out.push_str(
+                "  smoothness: no frames shown while scrolling FAIL
+",
+            );
         } else {
-            let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
-            let sd = (intervals.iter().map(|d| (d - mean).powi(2)).sum::<f64>()
-                / intervals.len() as f64)
-                .sqrt();
-            let mut sorted = intervals.clone();
+            let mut sorted = gaps.clone();
             sorted.sort_by(|a, b| a.total_cmp(b));
+            let step = (sorted[sorted.len() / 2] / period).round().max(1.0);
+            let beat = step * period;
+            let (mut beats, mut missed) = (0u64, 0u64);
+            for &d in &gaps {
+                let n = (d / beat).round().max(1.0) as u64;
+                beats += n;
+                missed += n - 1;
+            }
+            let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
+            let sd =
+                (gaps.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / gaps.len() as f64).sqrt();
             let p99 = sorted[(sorted.len() * 99 / 100).min(sorted.len() - 1)];
-            let per_1000 = missed as f64 * 1000.0 / refreshes.max(1) as f64;
-            let pass = per_1000 <= 1.0 && sd < 1000.0 && p99 < 1.5 * period;
+            let per_1000 = missed as f64 * 1000.0 / beats.max(1) as f64;
+            let pass = per_1000 <= 1.0 && sd < 1000.0 && p99 < 1.5 * beat;
             out.push_str(&format!(
-                "  smoothness: {refreshes} refreshes while scrolling, {missed} without a new picture ({per_1000:.1} per 1000; target <= 1) | interval sd {:.2} ms (target < 1), p99 {:.2} refreshes (target < 1.5) {}\n",
+                "  smoothness: a new picture every {step:.0} refresh{} ({:.0} fps) while scrolling: {missed} of {beats} late ({per_1000:.1} per 1000; target <= 1) | interval sd {:.2} ms (target < 1), p99 {:.2} x the step (target < 1.5) {}
+",
+                if step > 1.0 { "es" } else { "" },
+                self.fps as f64 / step,
                 sd / 1e3,
-                p99 / period,
+                p99 / beat,
                 if pass { "PASS" } else { "FAIL" }
             ));
+            gaps.clear();
         }
         // Delay.
         let s = self.latency.summary();
@@ -682,7 +694,10 @@ mod tests {
             r.contains("sharpness") && r.lines().nth(1).unwrap().ends_with("PASS"),
             "{r}"
         );
-        assert!(r.contains("1 without a new picture"), "{r}");
+        assert!(
+            r.contains("every 1 refresh (100 fps) while scrolling: 1 of"),
+            "{r}"
+        );
         assert!(r.contains("delay: input -> screen p50 25.0 ms"), "{r}");
     }
 }

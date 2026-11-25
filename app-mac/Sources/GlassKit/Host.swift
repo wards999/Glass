@@ -113,6 +113,7 @@ public final class GlassHost {
         // A Mac host: view modes if the virtual display works here, and 4:4:4.
         let os = UInt8(GLASS_HOST_OS_MAC)
         let caps = (VirtualDisplay.available ? UInt8(GLASS_HOST_CAP_VIEW_MODES) : 0) | UInt8(GLASS_HOST_CAP_444)
+            | UInt8(GLASS_HOST_CAP_SCORECARD)
         if let fixedPin {
             p = glass_host_listen(device.ptr, port, fixedPin, os, caps, eventTrampoline, ctx, &err)
         } else {

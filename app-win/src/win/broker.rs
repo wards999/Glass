@@ -198,7 +198,7 @@ pub fn run(
         ask: None,
         events: event,
         host_os: glass_core::protocol::HOST_OS_WINDOWS,
-        host_caps: glass_core::protocol::HOST_CAP_444,
+        host_caps: glass_core::protocol::HOST_CAP_444 | glass_core::protocol::HOST_CAP_SCORECARD,
     };
     let mut listener = if a.local {
         HostListener::bind_on(std::net::Ipv4Addr::LOCALHOST, a.port, device.clone(), opts)?

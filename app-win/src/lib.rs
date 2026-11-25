@@ -232,7 +232,7 @@ fn usage() -> ! {
 
 usage:
   glass host [--monitor N] [--chroma 420|444] [--mbps M] [--port P] [--log FILE] [--ask]
-  glass connect [HOST[:PORT]] [--pin PIN] [--windowed] [--keys pc|labelled] [--seconds S] [--log FILE]
+  glass connect [HOST[:PORT]] [--pin PIN] [--windowed] [--keys pc|labelled] [--seconds S] [--log FILE] [--scorecard]
   glass devices
   glass forget NAME|FINGERPRINT
   glass probe HOST [--port P] [--pin PIN] [--seconds S] [--verify FILE.glsr] [--min-frames N]

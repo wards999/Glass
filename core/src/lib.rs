@@ -23,6 +23,7 @@ pub mod ratecontrol;
 pub mod recording;
 pub mod replay;
 pub mod results;
+pub mod scorecard;
 pub mod seal;
 pub mod spikes;
 pub mod stats;

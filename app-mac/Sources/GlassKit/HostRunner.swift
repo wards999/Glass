@@ -167,6 +167,8 @@ private final class HostSessionRun {
     var clipSummary = "off"
     /// The viewer's screen refresh (Hz, 0 = unknown), from its Hello.
     var viewerHz: UInt16 = 0
+    /// Streaming the scorecard's test scene (ADR 0033).
+    var scorecard = false
     /// The Mac's sound, to the viewer (M4b step 3).
     var audio: HostAudio?
     /// This Mac's Wi-Fi link during the session (M4 step 5).
@@ -229,7 +231,16 @@ private final class HostSessionRun {
         var disp = runner.display
         var actual = UInt8(GLASS_MODE_HOST_SCREEN)
         var note = ""
-        if Int32(mode) != GLASS_MODE_HOST_SCREEN && Int32(mode) < GLASS_MODE_COUNT {
+        // The scorecard (ADR 0033): the test scene at the viewer's size and
+        // refresh; no virtual display, nothing on this Mac's screen changes.
+        scorecard = (viewer.caps & UInt8(GLASS_CAP_SCORECARD)) != 0
+        if scorecard {
+            let vw = (viewer.display_w > 0 ? Int(viewer.display_w) : runner.display.width) & ~1
+            let vh = (viewer.display_h > 0 ? Int(viewer.display_h) : runner.display.height) & ~1
+            disp = HostDisplay(id: disp.id, width: vw, height: vh,
+                               fps: viewer.refresh_hz > 0 ? Int(viewer.refresh_hz) : 60, bounds: disp.bounds)
+            note = " (scorecard test scene, ADR 0033)"
+        } else if Int32(mode) != GLASS_MODE_HOST_SCREEN && Int32(mode) < GLASS_MODE_COUNT {
             // The viewer's screen size; ours if it didn't say.
             let vw = (viewer.display_w > 0 ? Int(viewer.display_w) : runner.display.width) & ~1
             let vh = (viewer.display_h > 0 ? Int(viewer.display_h) : runner.display.height) & ~1
@@ -504,7 +515,11 @@ private final class Pipeline {
     init(run: HostSessionRun, display: HostDisplay, chroma444: Bool) throws {
         self.run = run
         let o = run.runner.options
-        source = o.testPattern
+        let s = run.s
+        source = run.scorecard
+            ? SceneSource(width: display.width, height: display.height, fps: display.fps, queue: captureQ,
+                          inputSeq: { s.inputSeq })
+            : o.testPattern
             ? TestPatternSource(width: display.width, height: display.height, fps: display.fps, queue: captureQ)
             : ScreenSource(display: display, queue: captureQ, bgra: chroma444)
         encoder = try HEVCEncoder(.init(width: display.width, height: display.height, fps: display.fps,

@@ -1028,6 +1028,73 @@ pub unsafe extern "C" fn glass_session_take_keyframe_request(s: *const HostSessi
     (*s).take_keyframe_request()
 }
 
+/// The scorecard's test scene (ADR 0033) for a host that draws it itself
+/// (the Mac): `width` x `height`. Free with `glass_scene_free`.
+#[no_mangle]
+pub extern "C" fn glass_scene_new(width: u32, height: u32) -> *mut crate::scorecard::Scene {
+    Box::into_raw(Box::new(crate::scorecard::Scene::new(width, height)))
+}
+
+/// # Safety
+/// `s` from `glass_scene_new` (or null), not used after.
+#[no_mangle]
+pub unsafe extern "C" fn glass_scene_free(s: *mut crate::scorecard::Scene) {
+    if !s.is_null() {
+        drop(Box::from_raw(s));
+    }
+}
+
+/// Whether scene time `t_us` is the delay part (each input packet then
+/// flips the marker).
+#[no_mangle]
+pub extern "C" fn glass_scene_in_latency(t_us: u64, fps: u32) -> bool {
+    crate::scorecard::phase_at(t_us, fps) == crate::scorecard::Phase::Latency
+}
+
+/// What the scene shows at `t_us`, as one number: draw a frame when it
+/// changes. `u64::MAX` once the scene is over.
+///
+/// # Safety
+/// `s` from `glass_scene_new`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_scene_key(
+    s: *const crate::scorecard::Scene,
+    t_us: u64,
+    fps: u32,
+    marker: bool,
+) -> u64 {
+    match (*s).content(t_us, fps, marker) {
+        None => u64::MAX,
+        Some((off, m, bar)) => {
+            off as u64
+                | (m.map_or(0, |o| 1 + o as u64) << 32)
+                | (bar.map_or(0, |b| b as u64 + 1) << 34)
+        }
+    }
+}
+
+/// Draws the scene at `t_us` as limited-range luma into `out` (`height`
+/// rows of `stride` bytes): an NV12 picture's first plane.
+///
+/// # Safety
+/// `s` from `glass_scene_new`; `out` writable for `height * stride` bytes,
+/// `stride >= width`.
+#[no_mangle]
+pub unsafe extern "C" fn glass_scene_fill(
+    s: *const crate::scorecard::Scene,
+    t_us: u64,
+    fps: u32,
+    marker: bool,
+    out: *mut u8,
+    stride: usize,
+) {
+    let s = &*s;
+    if let Some((off, m, bar)) = s.content(t_us, fps, marker) {
+        let out = std::slice::from_raw_parts_mut(out, s.height as usize * stride);
+        s.fill_video_y(off, m, bar, out, stride);
+    }
+}
+
 /// The viewer's screen, decode capabilities and wanted view mode (`Hello`).
 ///
 /// # Safety

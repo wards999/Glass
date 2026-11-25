@@ -135,6 +135,83 @@ public final class ScreenSource: NSObject, FrameSource, SCStreamOutput, SCStream
 
 /// Moving bars and a clock, generated at `fps` without any permission: CI
 /// and quick checks of the encode -> network path.
+/// The scorecard's test scene (ADR 0033): frames drawn by core instead of
+/// the screen, at the viewer's size and refresh. A new frame whenever the
+/// scene changes (checked every millisecond); in the delay part each input
+/// packet flips the marker.
+public final class SceneSource: FrameSource {
+    public let queue: DispatchQueue
+    private let width: Int
+    private let height: Int
+    private let fps: Int
+    private let inputSeq: () -> UInt32
+    private let scene: OpaquePointer?
+    private var timer: DispatchSourceTimer?
+    private var pool: CVPixelBufferPool?
+    private var started: UInt64 = 0
+    private var drawn: UInt64 = .max - 1
+    private var seenSeq: UInt32 = 0
+    private var marker = false
+
+    public init(width: Int, height: Int, fps: Int, queue: DispatchQueue, inputSeq: @escaping () -> UInt32) {
+        self.queue = queue
+        self.width = width
+        self.height = height
+        self.fps = max(fps, 1)
+        self.inputSeq = inputSeq
+        scene = glass_scene_new(UInt32(width), UInt32(height))
+    }
+
+    deinit { glass_scene_free(scene) }
+
+    public func start(_ onFrame: @escaping (CVPixelBuffer, UInt64) -> Void, _ done: @escaping (Error?) -> Void) {
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferIOSurfacePropertiesKey: [CFString: Any]() as CFDictionary,
+        ]
+        CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool)
+        started = GlassClock.nowUs()
+        let t = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+        t.schedule(deadline: .now(), repeating: .milliseconds(1), leeway: .microseconds(200))
+        t.setEventHandler { [weak self] in self?.tick(onFrame) }
+        timer = t
+        t.resume()
+    }
+
+    private func tick(_ onFrame: (CVPixelBuffer, UInt64) -> Void) {
+        guard let scene, let pool else { return }
+        let now = GlassClock.nowUs()
+        let t = now &- started
+        let seq = inputSeq()
+        if seq != seenSeq {
+            seenSeq = seq
+            if glass_scene_in_latency(t, UInt32(fps)) { marker.toggle() }
+        }
+        let key = glass_scene_key(scene, t, UInt32(fps), marker)
+        guard key != .max, key != drawn else { return }
+        var pb: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pb) == kCVReturnSuccess, let pb else { return }
+        CVPixelBufferLockBaseAddress(pb, [])
+        if let y = CVPixelBufferGetBaseAddressOfPlane(pb, 0) {
+            glass_scene_fill(scene, t, UInt32(fps), marker,
+                             y.assumingMemoryBound(to: UInt8.self), CVPixelBufferGetBytesPerRowOfPlane(pb, 0))
+        }
+        if let uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1) {
+            memset(uv, 128, CVPixelBufferGetBytesPerRowOfPlane(pb, 1) * CVPixelBufferGetHeightOfPlane(pb, 1))
+        }
+        CVPixelBufferUnlockBaseAddress(pb, [])
+        drawn = key
+        onFrame(pb, now)
+    }
+
+    public func stop() {
+        timer?.cancel()
+        timer = nil
+    }
+}
+
 public final class TestPatternSource: FrameSource {
     public let queue: DispatchQueue
     private let width: Int

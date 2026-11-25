@@ -939,6 +939,7 @@ fn connect_worker(
                     full_colour: s.full_colour,
                     clipboard: s.clipboard,
                     hook_shortcuts: s.hook_shortcuts,
+                    scorecard: false,
                 };
                 let (report, m) = match viewer::run(c, prep, opts, &crate::banner()) {
                     Ok(r) => r,

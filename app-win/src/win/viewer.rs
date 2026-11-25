@@ -31,6 +31,7 @@ use glass_core::protocol::{
     MODE_COUNT, MODE_FIT, MODE_FIT_LARGER, MODE_FIT_MORE_SPACE, NOTICE_NONE,
 };
 use glass_core::recording::CHROMA_444;
+use glass_core::scorecard::Scorecard;
 use glass_core::stats::{StatRing, Summary};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -39,6 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Texture2D, D3D11_TEXTURE2D_DESC};
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateBitmap, CreateDIBSection, DeleteObject, EnumDisplaySettingsW,
     GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, ScreenToClient, BITMAPINFO,
@@ -69,6 +71,9 @@ pub struct Options {
     /// default: Windows Defender took the hook for a keylogger (m5-test13);
     /// the bar's Keys menu sends them instead.
     pub hook_shortcuts: bool,
+    /// A scorecard session (ADR 0033): the host streams its test scene, this
+    /// viewer scores it and ends the session when the scene is over.
+    pub scorecard: bool,
 }
 
 /// The display scaling of the monitor at `r` (percent; 0 if unknown).
@@ -250,6 +255,8 @@ struct Shared {
     stats_gen: AtomicU32,
     /// Key presses this viewer sent (for the report).
     keys_sent: AtomicU32,
+    /// Scoring the host's test scene (ADR 0033).
+    scorecard: bool,
     /// Capture → screen p50 (µs, 0 = not yet), for keeping the sound with
     /// the picture (render thread → UI thread).
     picture_us: AtomicU32,
@@ -298,6 +305,8 @@ struct Report {
     /// together: a short animation can vanish that way), the most dropped
     /// at once (m5-test30: card animations missing in 4:4:4 only).
     by_mode: [ModeCount; 2],
+    /// The scorecard, once it's done (ADR 0033).
+    scorecard: Option<String>,
     decode_errors: u64,
     last_error: Option<String>,
     /// What was shown, in order ("fit to this PC 2560x1440 4:4:4 (NVDEC)").
@@ -519,6 +528,7 @@ pub fn run(client: Client, prep: Prepared, opts: Options, banner: &str) -> Res<(
         sound_problem: Mutex::new(None),
         clipboard: opts.clipboard,
         hook: opts.hook_shortcuts,
+        scorecard: opts.scorecard,
         rule: opts.rule.unwrap_or(if client_os == HOST_OS_MAC {
             PcModifierRule::PcStyle
         } else {
@@ -638,6 +648,9 @@ fn session_report(sh: &Shared, r: &Report, head: &ReportHead, reason: &str) -> S
         info.fps,
         if info.chroma == 1 { "4:4:4" } else { "4:2:0" }
     );
+    if let Some(s) = &r.scorecard {
+        out.push_str(s);
+    }
     let _ = writeln!(
         out,
         "  received {} frames ({:.1} fps), presented {} ({:.1} fps), superseded {}, decode errors {}",
@@ -820,6 +833,66 @@ enum Dec {
 enum Pic {
     Hw(Picture),
     Nv(Planar),
+}
+
+/// A decoded picture's luma copied back from the GPU (the scorecard, ADR
+/// 0033): `width` bytes a row into `out`; returns the width.
+fn read_luma(
+    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    pic: &Pic,
+    staging: &mut Option<(ID3D11Texture2D, D3D11_TEXTURE2D_DESC)>,
+    out: &mut Vec<u8>,
+) -> Res<u32> {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_USAGE_STAGING,
+    };
+    let (tex, index, w, h) = match pic {
+        Pic::Hw(p) => (p.texture.clone(), p.index, p.width, p.height),
+        Pic::Nv(p) => {
+            let r = unsafe { p.planes[0].GetResource()? };
+            (r.cast::<ID3D11Texture2D>()?, 0, p.width, p.height)
+        }
+    };
+    let mut d = D3D11_TEXTURE2D_DESC::default();
+    unsafe { tex.GetDesc(&mut d) };
+    let want = D3D11_TEXTURE2D_DESC {
+        ArraySize: 1,
+        MipLevels: 1,
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+        ..d
+    };
+    let same = staging.as_ref().is_some_and(|(_, s)| {
+        (s.Width, s.Height, s.Format) == (want.Width, want.Height, want.Format)
+    });
+    if !same {
+        let mut t = None;
+        unsafe { device.CreateTexture2D(&want, None, Some(&mut t))? };
+        *staging = Some((t.ok_or("no staging texture")?, want));
+    }
+    let Some((st, _)) = staging.as_ref() else {
+        return Err("no staging texture".into());
+    };
+    let (w, h) = (w.min(d.Width), h.min(d.Height));
+    unsafe {
+        let ctx = device.GetImmediateContext()?;
+        ctx.CopySubresourceRegion(st, 0, 0, 0, 0, &tex, index * d.MipLevels.max(1), None);
+        let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+        ctx.Map(st, 0, D3D11_MAP_READ, 0, Some(&mut m))?;
+        out.clear();
+        for y in 0..h as usize {
+            let row = std::slice::from_raw_parts(
+                (m.pData as *const u8).add(y * m.RowPitch as usize),
+                w as usize,
+            );
+            out.extend_from_slice(row);
+        }
+        ctx.Unmap(st, 0);
+    }
+    Ok(w)
 }
 
 /// Rates for the on-screen stats, over the last second or so.
@@ -1043,7 +1116,11 @@ fn render_loop(
     c.request_keyframe();
 
     // Records one present once its on-screen time is known.
-    let mut record = |r: &mut Report, p: Pending, shown: u64, last_shown: &mut u64| {
+    let mut record = |r: &mut Report,
+                      sc: &mut Option<Scorecard>,
+                      p: Pending,
+                      shown: u64,
+                      last_shown: &mut u64| {
         r.present.push(span(shown, p.submit));
         if p.capture > 0 {
             r.total.push(span(shown, p.capture));
@@ -1052,17 +1129,61 @@ fn render_loop(
             r.interval.push(span(shown, *last_shown));
         }
         *last_shown = shown;
+        let mut answered = None;
         if p.input_seq != 0 && p.input_seq != last_input {
             if let Some(sent) = c.input_sent_at(p.input_seq) {
                 r.input.push(span(shown, sent));
                 last_input = p.input_seq;
+                answered = Some(sent);
             }
         }
+        if let Some(s) = sc.as_mut() {
+            s.presented(p.capture, shown, answered);
+        }
     };
+    let mut sc: Option<Scorecard> = None;
+    let mut staging: Option<(ID3D11Texture2D, D3D11_TEXTURE2D_DESC)> = None;
+    let mut luma: Vec<u8> = Vec::new();
+    let sc_deadline = clock::now_us() + 20_000_000;
 
     while !sh.stop.load(Ordering::Relaxed) {
         let size = sh.size.load(Ordering::Relaxed);
         pres.resize(((size >> 32) as u32, size as u32))?;
+        if sh.scorecard {
+            let info = c.info();
+            let fits = sc.as_ref().is_some_and(|s| {
+                (s.scene.width, s.scene.height) == (info.width as u32, info.height as u32)
+            });
+            if sc.as_ref().is_none_or(|s| !fits && !s.is_started()) {
+                sc = Some(Scorecard::new(
+                    info.width as u32,
+                    info.height as u32,
+                    info.fps as u32,
+                ));
+            }
+            let now = clock::now_us();
+            if let Some(s) = sc.as_mut() {
+                if let Some(down) = s.input_due(now) {
+                    c.input_key(glass_core::scorecard::DELAY_KEY, down);
+                }
+                let what = format!(
+                    "{} from {}",
+                    if info.chroma == CHROMA_444 {
+                        "HEVC 4:4:4"
+                    } else {
+                        "HEVC 4:2:0"
+                    },
+                    c.peer().name
+                );
+                if s.finished(now) || (!s.is_started() && now > sc_deadline) {
+                    let text = s.report(&what);
+                    print!("{text}");
+                    r.scorecard = Some(text);
+                    sh.end("scorecard done");
+                    break;
+                }
+            }
+        }
         if end.is_some_and(|e| clock::now_us() >= e) {
             sh.end("--seconds elapsed");
             break;
@@ -1132,6 +1253,13 @@ fn render_loop(
                     match res {
                         Ok(Some(pic)) => {
                             errors_in_row = 0;
+                            if let Some(s) = sc.as_mut().filter(|s| s.wants_picture(capture)) {
+                                if let Ok(w) = read_luma(device, &pic, &mut staging, &mut luma) {
+                                    if w == s.scene.width {
+                                        s.picture(capture, &luma, w as usize);
+                                    }
+                                }
+                            }
                             if newest.is_some() {
                                 r.superseded += 1;
                                 dropped += 1;
@@ -1231,7 +1359,7 @@ fn render_loop(
                         } else {
                             shown
                         };
-                        record(r, p, shown, &mut last_shown);
+                        record(r, &mut sc, p, shown, &mut last_shown);
                     }
                 }
             }
@@ -1240,7 +1368,7 @@ fn render_loop(
                 if stats_failures > 120 && !r.exact_present {
                     // No frame statistics here: count the present call.
                     while let Some(p) = pending.pop_front() {
-                        record(r, p, p.submit, &mut last_shown);
+                        record(r, &mut sc, p, p.submit, &mut last_shown);
                     }
                 }
             }

@@ -313,7 +313,7 @@
  * v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
  * datagrams. v3 = M3: input, cursor, `HostNotice`.
  */
-#define GLASS_PROTOCOL_VERSION 16
+#define GLASS_PROTOCOL_VERSION 17
 
 /**
  * Most "seen by" ids a `Hello` carries (no-loop rule).
@@ -339,6 +339,11 @@
  * The host can encode 4:4:4 and switch to it mid-session (`SetMode`).
  */
 #define GLASS_HOST_CAP_444 2
+
+/**
+ * The host can show the scorecard's test scene (v17).
+ */
+#define GLASS_HOST_CAP_SCORECARD 4
 
 /**
  * Default TCP control port; the host's UDP media socket uses the same number.
@@ -413,6 +418,12 @@
  * empty one) and close (v16).
  */
 #define GLASS_CAP_RESULTS_ONLY 4
+
+/**
+ * A scorecard session (v17, ADR 0033): stream the test scene
+ * (`scorecard`) at the viewer's size and refresh, not the screen.
+ */
+#define GLASS_CAP_SCORECARD 8
 
 /**
  * `HostNotice` codes: why the host can't do what the viewer expects.
@@ -582,6 +593,54 @@
  * At most this much of each log (its end, where the totals are).
  */
 #define GLASS_PER_LOG (64 * 1024)
+
+#define GLASS_WARMUP_US 3500000
+
+/**
+ * The barcode (warm-up only): 16 bits of the scene's age in ms, one
+ * `BAR_CELL` square each, black = 1, top left.
+ */
+#define GLASS_BAR_BITS 16
+
+#define GLASS_BAR_CELL 16
+
+#define GLASS_CARDS 6
+
+#define GLASS_CARD_US 2000000
+
+#define GLASS_MOTION_START_US (GLASS_WARMUP_US + ((uint64_t)GLASS_CARDS * GLASS_CARD_US))
+
+#define GLASS_MOTION_US 10000000
+
+#define GLASS_LATENCY_START_US (GLASS_MOTION_START_US + GLASS_MOTION_US)
+
+#define GLASS_LATENCY_US 10000000
+
+#define GLASS_END_US (GLASS_LATENCY_START_US + GLASS_LATENCY_US)
+
+/**
+ * Rows the card moves per frame while scrolling.
+ */
+#define GLASS_SCROLL_PX 3
+
+/**
+ * "Visually lossless" (SPEC §0).
+ */
+#define GLASS_SHARP_DB 45.0
+
+#define GLASS_SHARP_TARGET_US 150000
+
+#define GLASS_INPUT_EVERY_US 100000
+
+/**
+ * The marker square (top left) that answers input in the delay part.
+ */
+#define GLASS_MARKER 64
+
+/**
+ * F24's HID usage: the delay part's key.
+ */
+#define GLASS_DELAY_KEY 115
 
 /**
  * Bytes added to each datagram: counter (8) + tag (16).
@@ -753,6 +812,11 @@ typedef struct GLASS_Pairing GLASS_Pairing;
 typedef struct GLASS_PcmRing GLASS_PcmRing;
 
 typedef struct GLASS_Replay GLASS_Replay;
+
+/**
+ * The test card: `height` rows that repeat (the scroll wraps), grey.
+ */
+typedef struct GLASS_Scene GLASS_Scene;
 
 /**
  * Fixed-capacity ring of duration samples (µs). `push` is O(1) and never
@@ -1773,6 +1837,48 @@ bool glass_session_streaming(const GLASS_HostSession *s);
  * `s` from `glass_host_accept`.
  */
 bool glass_session_take_keyframe_request(const GLASS_HostSession *s);
+
+/**
+ * The scorecard's test scene (ADR 0033) for a host that draws it itself
+ * (the Mac): `width` x `height`. Free with `glass_scene_free`.
+ */
+GLASS_Scene *glass_scene_new(uint32_t width, uint32_t height);
+
+/**
+ * # Safety
+ * `s` from `glass_scene_new` (or null), not used after.
+ */
+void glass_scene_free(GLASS_Scene *s);
+
+/**
+ * Whether scene time `t_us` is the delay part (each input packet then
+ * flips the marker).
+ */
+bool glass_scene_in_latency(uint64_t t_us, uint32_t fps);
+
+/**
+ * What the scene shows at `t_us`, as one number: draw a frame when it
+ * changes. `u64::MAX` once the scene is over.
+ *
+ * # Safety
+ * `s` from `glass_scene_new`.
+ */
+uint64_t glass_scene_key(const GLASS_Scene *s, uint64_t t_us, uint32_t fps, bool marker);
+
+/**
+ * Draws the scene at `t_us` as limited-range luma into `out` (`height`
+ * rows of `stride` bytes): an NV12 picture's first plane.
+ *
+ * # Safety
+ * `s` from `glass_scene_new`; `out` writable for `height * stride` bytes,
+ * `stride >= width`.
+ */
+void glass_scene_fill(const GLASS_Scene *s,
+                      uint64_t t_us,
+                      uint32_t fps,
+                      bool marker,
+                      uint8_t *out,
+                      size_t stride);
 
 /**
  * The viewer's screen, decode capabilities and wanted view mode (`Hello`).

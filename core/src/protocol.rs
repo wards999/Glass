@@ -9,7 +9,7 @@
 /// announces new stream parameters mid-session (`StreamChange`).
 /// v4 = M6: mutual TLS 1.3, pinned certificates, PIN pairing, AES-GCM sealed
 /// datagrams. v3 = M3: input, cursor, `HostNotice`.
-pub const PROTOCOL_VERSION: u8 = 16;
+pub const PROTOCOL_VERSION: u8 = 17;
 
 /// Most "seen by" ids a `Hello` carries (no-loop rule).
 pub const MAX_SEEN_BY: usize = 8;
@@ -24,6 +24,8 @@ pub const HOST_OS_MAC: u8 = 2;
 pub const HOST_CAP_VIEW_MODES: u8 = 1;
 /// The host can encode 4:4:4 and switch to it mid-session (`SetMode`).
 pub const HOST_CAP_444: u8 = 2;
+/// The host can show the scorecard's test scene (v17).
+pub const HOST_CAP_SCORECARD: u8 = 4;
 
 /// Default TCP control port; the host's UDP media socket uses the same number.
 pub const DEFAULT_PORT: u16 = 47800;
@@ -299,6 +301,9 @@ pub const CAP_PREFER_420: u8 = 2;
 /// Not a session: send your session results (`Results` frames, then an
 /// empty one) and close (v16).
 pub const CAP_RESULTS_ONLY: u8 = 4;
+/// A scorecard session (v17, ADR 0033): stream the test scene
+/// (`scorecard`) at the viewer's size and refresh, not the screen.
+pub const CAP_SCORECARD: u8 = 8;
 
 /// `HostNotice` codes: why the host can't do what the viewer expects.
 pub const NOTICE_NONE: u8 = 0;

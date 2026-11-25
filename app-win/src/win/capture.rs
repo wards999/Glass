@@ -105,10 +105,23 @@ pub struct Frame {
     _frame: Option<windows::Graphics::Capture::Direct3D11CaptureFrame>,
 }
 
+impl Frame {
+    pub fn from_texture(texture: ID3D11Texture2D, ts_us: u64, size: (u32, u32)) -> Self {
+        Self {
+            texture,
+            ts_us,
+            size,
+            _frame: None,
+        }
+    }
+}
+
 /// Either capture method, behind one interface.
 pub enum Capture {
     Wgc(Wgc),
     Dda(super::dda::Dda),
+    /// The scorecard's test scene (ADR 0033).
+    Scene(Box<super::scene::SceneSource>),
 }
 
 impl Capture {
@@ -130,6 +143,7 @@ impl Capture {
         match self {
             Capture::Wgc(c) => c.size(),
             Capture::Dda(c) => c.size(),
+            Capture::Scene(c) => c.size(),
         }
     }
 
@@ -137,6 +151,7 @@ impl Capture {
         match self {
             Capture::Wgc(c) => c.wait(timeout_ms),
             Capture::Dda(c) => c.wait(timeout_ms),
+            Capture::Scene(c) => c.wait(timeout_ms),
         }
     }
 
@@ -149,6 +164,14 @@ impl Capture {
                 size,
                 _frame: None,
             })),
+            Capture::Scene(c) => c.next_frame(),
+        }
+    }
+
+    /// The viewer's latest input packet (only the test scene uses it).
+    pub fn note_input(&mut self, seq: u32) {
+        if let Capture::Scene(c) = self {
+            c.note_input(seq);
         }
     }
 
@@ -163,7 +186,7 @@ impl Capture {
     /// Desktop switches seen (lock screen, UAC), for the report.
     pub fn desktop_switches(&self) -> u64 {
         match self {
-            Capture::Wgc(_) => 0,
+            Capture::Wgc(_) | Capture::Scene(_) => 0,
             Capture::Dda(c) => c.switches,
         }
     }

@@ -2,7 +2,11 @@
 //!
 //! `glass connect [HOST[:PORT]] [--pin PIN] [--seconds S] [--windowed]
 //!                [--keys pc|labelled] [--view mac|fit|space|larger] [--colour 444|420]
-//!                [--log FILE]`
+//!                [--log FILE] [--scorecard]`
+//!
+//! `--scorecard` (ADR 0033): the host streams its test scene instead of its
+//! screen; this viewer scores it against SPEC §0's targets (about 35 s) and
+//! prints the scorecard, which goes into the session log too.
 //!
 //! View modes (M3c): Ctrl+Alt+Shift+R while viewing cycles the host's own
 //! screen and three "fit to this PC" sizes; the last one is remembered per
@@ -49,6 +53,7 @@ pub fn connect(args: &[String]) -> Res<()> {
         full_colour: false,
         clipboard: true,
         hook_shortcuts: false,
+        scorecard: false,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -58,6 +63,7 @@ pub fn connect(args: &[String]) -> Res<()> {
             "--seconds" => seconds = Some(val()?.parse::<f64>()?),
             "--log" => log = Some(val()?.clone()),
             "--windowed" => opts.windowed = true,
+            "--scorecard" => opts.scorecard = true,
             "--no-clipboard" => opts.clipboard = false,
             "--hook-shortcuts" => opts.hook_shortcuts = true,
             "--colour" | "--color" => {
@@ -122,7 +128,10 @@ pub fn connect(args: &[String]) -> Res<()> {
     let modes_file = default_dir().unwrap_or_default().join("view-modes.txt");
     // --view wins; otherwise the view last used with this host.
     let mode = view.unwrap_or_else(|| saved_mode(&modes_file, &addr));
-    let prep = viewer::prepare(mode, opts.full_colour)?;
+    let mut prep = viewer::prepare(mode, opts.full_colour)?;
+    if opts.scorecard {
+        prep.hello.caps |= glass_core::protocol::CAP_SCORECARD;
+    }
     let hello = prep.hello;
 
     let mut fixed_pin = pin;

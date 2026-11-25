@@ -35,6 +35,7 @@ mod nvenc_sys;
 mod pipe;
 mod play;
 mod present;
+mod scene;
 pub mod service;
 mod slog;
 mod sound;
@@ -856,7 +857,7 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
         events: event,
         host_os: glass_core::protocol::HOST_OS_WINDOWS,
         // 4:4:4 switchable mid-session; view modes need a virtual display (M7).
-        host_caps: glass_core::protocol::HOST_CAP_444,
+        host_caps: glass_core::protocol::HOST_CAP_444 | glass_core::protocol::HOST_CAP_SCORECARD,
     };
     let mut listener = if a.local {
         HostListener::bind_on(std::net::Ipv4Addr::LOCALHOST, a.port, device.clone(), opts)?
@@ -1078,7 +1079,32 @@ pub(crate) fn media_session<V: ViewerLink>(
     // monitor goes dark meanwhile (the user's choice).
     let mut virt: Option<vscreen::Session> = None;
     let mut virt_note = String::new();
-    if vdisplay::installed() {
+    // The scorecard (ADR 0033): the test scene at the viewer's size and
+    // refresh instead of this screen; nothing here changes.
+    let scorecard = session.viewer().caps & glass_core::protocol::CAP_SCORECARD != 0;
+    if scorecard {
+        let v = session.viewer();
+        let (sw, sh) = if v.display_w > 0 && v.display_h > 0 {
+            (v.display_w as u32, v.display_h as u32)
+        } else {
+            (w, h)
+        };
+        let hz = if v.refresh_hz > 0 {
+            v.refresh_hz as u32
+        } else {
+            fps
+        };
+        *cap = capture::Capture::Scene(Box::new(scene::SceneSource::new(&gpu.device, sw, sh, hz)?));
+        (w, h) = cap.size();
+        fps = hz;
+        say(&format!(
+            "Scorecard: showing the test scene at {w}x{h}, {fps} Hz."
+        ));
+        virt_note = format!(
+            "scorecard: the test scene at {w}x{h} @ {fps} Hz instead of this PC's screen (ADR 0033)"
+        );
+    }
+    if vdisplay::installed() && !scorecard {
         let v = session.viewer();
         match vscreen::viewer_size(v.display_w, v.display_h, v.scale_pct, v.refresh_hz) {
             None => virt_note = "virtual display: not used (the viewer didn't say its size)".into(),
@@ -1125,7 +1151,7 @@ pub(crate) fn media_session<V: ViewerLink>(
             },
         }
     }
-    if a.match_res && virt.is_none() {
+    if a.match_res && virt.is_none() && !scorecard {
         let v = session.viewer();
         if let Some(cur) = display::current(&mon.name) {
             let best = display::best(
@@ -1167,7 +1193,7 @@ pub(crate) fn media_session<V: ViewerLink>(
         a,
         (w, h),
         fps,
-        switched.is_some() || virt.is_some(),
+        switched.is_some() || virt.is_some() || scorecard,
         blocking,
         stop,
         end,
@@ -1182,6 +1208,11 @@ pub(crate) fn media_session<V: ViewerLink>(
             *cap = c;
         }
         say("This PC's monitor is back.");
+    }
+    if scorecard {
+        if let Ok(c) = capture_again(gpu, mon, a.desktops) {
+            *cap = c;
+        }
     }
     let (mut report, blocked_by, blocked_us) = session_result?;
     if !virt_note.is_empty() {
@@ -1546,6 +1577,7 @@ fn run_session<V: ViewerLink>(
             cursor::Change::None => {}
         }
         let mut got = false;
+        cap.note_input(session.input_seq());
         while let Some(frame) = cap.next_frame()? {
             let arrival = clock::now_us();
             if frame.size != (w, h) {

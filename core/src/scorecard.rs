@@ -23,7 +23,9 @@ use crate::stats::StatRing;
 
 pub const WARMUP_US: u64 = 3_500_000;
 /// The barcode (warm-up only): 16 bits of the scene's age in ms, one
-/// `BAR_CELL` square each, black = 1, top left.
+/// `BAR_CELL` square each, black = 1, top left; a second row holds the
+/// value inverted, and a reading counts only if the rows agree (m5-test37:
+/// a blurry 4:4:4 warm-up misread).
 pub const BAR_BITS: u32 = 16;
 pub const BAR_CELL: u32 = 16;
 pub const CARDS: usize = 6;
@@ -217,14 +219,15 @@ impl Scene {
     }
 
     /// The barcode's grey squares for `age_ms` (BAR_BITS squares of
-    /// BAR_CELL pixels in a row, bit 0 leftmost): `BAR_BITS * BAR_CELL`
-    /// wide, `BAR_CELL` tall.
+    /// BAR_CELL pixels in a row, bit 0 leftmost; below them the inverse):
+    /// `BAR_BITS * BAR_CELL` wide, `2 * BAR_CELL` tall.
     pub fn barcode_gray(age_ms: u16) -> Vec<u8> {
-        let (w, h) = ((BAR_BITS * BAR_CELL) as usize, BAR_CELL as usize);
-        let mut out = vec![PAPER; w * h];
-        for y in 0..h {
+        let (w, c) = ((BAR_BITS * BAR_CELL) as usize, BAR_CELL as usize);
+        let mut out = vec![PAPER; w * c * 2];
+        for y in 0..c * 2 {
+            let v = if y < c { age_ms } else { !age_ms };
             for x in 0..w {
-                if (age_ms >> (x / BAR_CELL as usize)) & 1 == 1 {
+                if (v >> (x / c)) & 1 == 1 {
                     out[y * w + x] = INK;
                 }
             }
@@ -235,24 +238,28 @@ impl Scene {
     /// Reads the barcode from decoded limited-range luma, if it's there
     /// (every square clearly dark or light).
     pub fn read_barcode(y_plane: &[u8], stride: usize) -> Option<u16> {
-        let mut v = 0u16;
         let c = BAR_CELL as usize;
         let (ink, paper) = (video_y(INK) as u32, video_y(PAPER) as u32);
-        for bit in 0..BAR_BITS as usize {
-            let mut sum = 0u32;
-            for y in c / 4..c * 3 / 4 {
-                for x in bit * c + c / 4..bit * c + c * 3 / 4 {
-                    sum += *y_plane.get(y * stride + x)? as u32;
+        let row = |top: usize| -> Option<u16> {
+            let mut v = 0u16;
+            for bit in 0..BAR_BITS as usize {
+                let mut sum = 0u32;
+                for y in top + c / 4..top + c * 3 / 4 {
+                    for x in bit * c + c / 4..bit * c + c * 3 / 4 {
+                        sum += *y_plane.get(y * stride + x)? as u32;
+                    }
+                }
+                let mean = sum / ((c / 2) * (c / 2)) as u32;
+                if mean < ink + 30 {
+                    v |= 1 << bit;
+                } else if mean <= paper - 30 {
+                    return None;
                 }
             }
-            let mean = sum / ((c / 2) * (c / 2)) as u32;
-            if mean < ink + 30 {
-                v |= 1 << bit;
-            } else if mean <= paper - 30 {
-                return None;
-            }
-        }
-        Some(v)
+            Some(v)
+        };
+        let v = row(0)?;
+        (row(c)? == !v).then_some(v)
     }
 
     /// What a host shows at scene time `t_us` for a viewer at `fps`:
@@ -311,7 +318,7 @@ impl Scene {
                 }
             }
             if let Some(bar) = &bar {
-                if y < BAR_CELL && bw <= w {
+                if y < 2 * BAR_CELL && bw <= w {
                     let src = &bar[y as usize * bw..(y as usize + 1) * bw];
                     for (d, &v) in dst[..bw].iter_mut().zip(src) {
                         *d = self.y_of[v as usize];
@@ -355,10 +362,10 @@ struct Card {
 pub struct Scorecard {
     pub scene: Scene,
     fps: u32,
-    /// Scene time 0 on the viewer's clock: the earliest of capture time
-    /// minus the barcode's age (a frame captured later than it was drawn
-    /// only overestimates).
+    /// Scene time 0 on the viewer's clock: the median of capture time minus
+    /// the barcode's age over the warm-up's frames (robust to a stray one).
     t0: Option<u64>,
+    starts: Vec<u64>,
     cards: [Card; CARDS + 1],
     /// Capture time -> luma PSNR of decoded still pictures (a few dozen).
     psnr: Vec<(u64, f64)>,
@@ -374,6 +381,7 @@ impl Scorecard {
             scene: Scene::new(width, height),
             fps: fps.max(1),
             t0: None,
+            starts: Vec::with_capacity(1024),
             cards: [Card::default(); CARDS + 1],
             psnr: Vec::with_capacity(256),
             motion_shown: Vec::with_capacity(4096),
@@ -410,9 +418,12 @@ impl Scorecard {
         }
         let warming = self.scene_time(capture_us).is_none_or(|t| t < WARMUP_US);
         if let Some(age) = Scene::read_barcode(y_plane, stride).filter(|_| warming) {
-            let est = capture_us.saturating_sub(age as u64 * 1000);
-            if self.t0.is_none_or(|t0| est < t0) {
-                self.t0 = Some(est);
+            if self.starts.len() < 1024 {
+                self.starts
+                    .push(capture_us.saturating_sub(age as u64 * 1000));
+                let mut s = self.starts.clone();
+                s.sort_unstable();
+                self.t0 = Some(s[s.len() / 2]);
             }
             return;
         }
@@ -626,14 +637,19 @@ mod tests {
         let mut sc = Scorecard::new(w, h, fps);
         let t0 = 1_000_000u64;
         let mut y = vec![0u8; (w * h) as usize];
-        // Warm-up frames: one captured 3 ms after it was drawn, one on time.
+        // Warm-up frames: one captured late, one far off, two on time.
         let warm = sc.scene.offset(Phase::Still { card: 0 });
-        sc.scene
-            .fill_video_y(warm, None, Some(1200), &mut y, w as usize);
-        sc.picture(t0 + 1_203_000, &y, w as usize);
-        sc.scene
-            .fill_video_y(warm, None, Some(1500), &mut y, w as usize);
-        sc.picture(t0 + 1_500_000, &y, w as usize);
+        for (age, at) in [
+            (1200, 1_203_000),
+            (900, 5_000_000),
+            (1500, 1_500_000),
+            (1600, 1_600_000),
+            (1700, 1_700_000),
+        ] {
+            sc.scene
+                .fill_video_y(warm, None, Some(age), &mut y, w as usize);
+            sc.picture(t0 + at, &y, w as usize);
+        }
         assert_eq!(sc.scene_time(t0 + 2_000_000), Some(2_000_000));
         // Each card: a blurry first frame, then the exact picture 100 ms on.
         for card in 1..=CARDS {

@@ -145,6 +145,30 @@ fn forget(what: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// `glass-cli results NAME|ADDRESS[:PORT]`: a paired machine's newest
 /// session logs (a results-only connection, v16: no session starts there),
 /// printed and saved to `%LOCALAPPDATA%\Glass\fetched\<name>.txt`.
+/// A Glass machine sharing on this network, by its name (Glass's own
+/// discovery, as the app's list: names like QUIETPC aren't in DNS):
+/// (address, port, name as it says it). Looks for up to 3 s.
+#[cfg(windows)]
+pub(crate) type Found = (String, u16, String);
+
+/// See [`Found`].
+#[cfg(windows)]
+pub(crate) fn find_by_name(want: &str) -> Result<Option<Found>, Box<dyn std::error::Error>> {
+    win::browse::start()?;
+    let mut found = None;
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        found = win::browse::list()
+            .into_iter()
+            .find(|f| f.name.eq_ignore_ascii_case(want));
+        if found.is_some() {
+            break;
+        }
+    }
+    win::browse::stop();
+    Ok(found.map(|f| (f.address, f.port, f.name)))
+}
+
 #[cfg(windows)]
 fn results(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let want = args
@@ -157,23 +181,8 @@ fn results(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             glass_core::protocol::DEFAULT_PORT,
             want.clone(),
         ),
-        _ => {
-            win::browse::start()?;
-            let mut found = None;
-            for _ in 0..30 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                found = win::browse::list()
-                    .into_iter()
-                    .find(|f| f.name.eq_ignore_ascii_case(want));
-                if found.is_some() {
-                    break;
-                }
-            }
-            win::browse::stop();
-            let f = found
-                .ok_or_else(|| format!("{want} isn't sharing on this network (try its address)"))?;
-            (f.address, f.port, f.name)
-        }
+        _ => find_by_name(want)?
+            .ok_or_else(|| format!("{want} isn't sharing on this network (try its address)"))?,
     };
     let text = glass_core::net::Client::fetch_results(&device()?, &addr, port)
         .map_err(|e| format!("{name}: {e:?}"))?;

@@ -139,7 +139,7 @@ impl SceneSource {
                 for v in Scene::barcode_gray(age) {
                     self.bgra.extend_from_slice(&[v, v, v, 255]);
                 }
-                self.put(BAR_BITS * BAR_CELL, BAR_CELL);
+                self.put(BAR_BITS * BAR_CELL, 2 * BAR_CELL);
             }
         }
         self.drawn = Some(want);

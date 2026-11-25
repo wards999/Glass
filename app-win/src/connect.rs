@@ -123,7 +123,19 @@ pub fn connect(args: &[String]) -> Res<()> {
     if addr.is_empty() {
         return Err("no address given".into());
     }
-    let (host, port) = parse_address(&addr)?;
+    let (mut host, mut port) = parse_address(&addr)?;
+    // A name (not an address) that DNS doesn't know: Glass's own discovery,
+    // as `results` and the app's list (m5-test37: "QUIETPC" didn't resolve).
+    if host.parse::<std::net::Ipv4Addr>().is_err()
+        && std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), port))
+            .map(|mut a| !a.any(|a| a.is_ipv4()))
+            .unwrap_or(true)
+    {
+        if let Some((a, p, name)) = crate::find_by_name(&host)? {
+            println!("Found {name} at {a}:{p}.");
+            (host, port) = (a, p);
+        }
+    }
     let err = |e: ConnectError| -> Box<dyn Error> { format!("{host}:{port}: {e}").into() };
     let modes_file = default_dir().unwrap_or_default().join("view-modes.txt");
     // --view wins; otherwise the view last used with this host.

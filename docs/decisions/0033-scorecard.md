@@ -15,8 +15,11 @@ so both hosts draw the same pixels and any viewer scores them the same way.
   age in ms), six changes of a grey text-heavy test card 2 s apart, 10 s of
   the card scrolling 3 rows a frame at the viewer's refresh, 10 s of a still
   card whose 64-pixel marker changes with every input packet.
-- **Clock:** the viewer finds scene time 0 as the earliest capture time minus
-  the barcode's age. Input packets can't mark the start: heartbeats send them
+- **Clock:** the viewer finds scene time 0 as the median of capture time
+  minus the barcode's age over the warm-up's frames; a second barcode row
+  holds the inverse, and a reading counts only if both agree (m5-test37: in
+  QUIETPC's blurry 4:4:4 warm-up a misread, taken as the earliest, put every
+  card against the wrong one: 15.6 dB). Input packets can't mark the start: heartbeats send them
   anyway.
 - **Sharpness:** the viewer copies each decoded still picture's luma back and
   computes PSNR against the original (the card is grey, so BT.601 and

@@ -413,9 +413,15 @@ private final class HostSessionRun {
             : "Session with \u{201C}\(s.peerName)\u{201D} (\(s.peerAddress)) ended after \(String(format: "%.1f", secs)) s (\(reason))")
         out.append("  streamed: " + history.joined(separator: " -> "))
         if no444 { out.append("  NOTE: the encoder produced 4:2:0 when asked for 4:4:4, so this session switched to 4:2:0.") }
-        out.append(String(format: "  frames sent %ld (%.1f fps), IDRs %ld (idle re-sends %ld), viewer keyframe requests %ld, not sent (viewer not ready) %ld | still-picture quality frames %ld (%.0f KB, QP cap %@)",
-                          t.frames, Double(t.frames) / secs, t.idrs, t.idleIDRs, Int(counters.keyframe_requests), t.notSent, t.refines,
-                          Double(t.refineBytes) / 1024, t.qpCapTaken.map { $0 ? "taken" : "not taken: bitrate raised only" } ?? "not tried")
+        let qpCap: String
+        switch t.qpCapTaken {
+        case .some(true): qpCap = "QP cap taken"
+        case .some(false): qpCap = "QP cap not taken, bitrate raised only"
+        case .none: qpCap = "none sent"
+        }
+        out.append(String(format: "  frames sent %ld (%.1f fps), IDRs %ld (idle re-sends %ld), viewer keyframe requests %ld, not sent (viewer not ready) %ld",
+                          t.frames, Double(t.frames) / secs, t.idrs, t.idleIDRs, Int(counters.keyframe_requests), t.notSent)
+                   + " | still-picture quality frames \(t.refines) (\(t.refineBytes / 1024) KB, \(qpCap))")
         out.append(String(format: "  bitrate %.1f Mbps avg | %ld packets", Double(t.bytes) * 8 / secs / 1e6, Int(counters.packets_sent)))
         out.append(String(format: "  FEC (M4): %llu parity packets (%.1f%% of packets) | the viewer's latest reported loss %.2f%% | NACKs answered %llu (%llu packets resent)",
                           counters.parity_packets,

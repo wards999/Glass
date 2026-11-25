@@ -76,3 +76,20 @@ keyframe, never did (m5-test27's floor hid it: the blurry frames before were
 sharp enough). The viewer now uses FFmpeg's own HEVC decoder on NVDEC (same
 GPU, CUDA frames, no frame threads): 6 of 6, each at once. This also takes a
 frame of delay off every 4:4:4 picture, and the jump at the end of a scroll.
+
+## Addendum (m5-test32): the quality frame is a correction, not a keyframe
+m5-test29/30: stills sharp after ~0.5 s (300 ms wait, then a full keyframe
+at QP 20 to encode on QUIETPC's RTX 2060 and send over the eero mesh hop).
+The quality frame is now an ordinary frame at a fixed QP: it corrects the
+picture the viewer has. `nvenc-test --image` (grainy 2560x1440, PSNR against
+the original): 4:4:4 keyframe QP 20 2241 KB / 36.9 dB → correction QP 18
+1920 KB / 37.2 dB; 4:2:0 1450 KB / 40.2 dB → 1098 KB / 40.4 dB. As sharp,
+15-25 % smaller (less than hoped: the blurry picture before it is a poor
+reference); encode time unchanged (11 ms / 7 ms on the RTX 4070). The wait
+is now 200 ms. Losing it costs nothing extra: the viewer asks for a
+keyframe after any loss, as before.
+
+Also: the host's results split encode times into 4:4:4, 4:2:0 and quality
+frames, and the viewer's say, per colour, how many pictures were decoded and
+shown and how often two or more were dropped at once: m5-test30's card
+animations went missing in 4:4:4 only, with the network and queue clean.

@@ -85,17 +85,20 @@ const PROFILE_FREXT: nv::GUID = guid(
     [0x9c, 0xbd, 0xb6, 0x16, 0xbd, 0x62, 0x13, 0x41],
 );
 
-/// The QP of a still picture's keyframe for a link of `limit_bps` (0: no
-/// limit): near photo quality where there's room (QUIETPC22, a grainy
-/// 2560x1440 test picture in 4:4:4: 26.2 dB at the encoder's own rate
-/// control, 31.4 dB at QP 20, 2.2 MB once), coarser on a squeezed link so
-/// the one frame doesn't take long to arrive.
+/// The QP of a still picture's quality frame for a link of `limit_bps` (0:
+/// no limit): near photo quality where there's room, coarser on a squeezed
+/// link so the one frame doesn't take long to arrive. A correction of the
+/// picture the viewer has, not a keyframe (QUIETPC22, a grainy 2560x1440
+/// test picture, PSNR against the original: 4:4:4 keyframe at QP 20
+/// 2241 KB / 36.9 dB, correction at QP 18 1920 KB / 37.2 dB; 4:2:0
+/// 1450 KB / 40.2 dB and 1098 KB / 40.4 dB): two steps finer than the
+/// keyframe was, as sharp, 15-25 % smaller.
 pub fn still_qp(limit_bps: i64) -> u32 {
     match limit_bps {
-        0 => 20,
-        l if l >= 60_000_000 => 20,
-        l if l >= 20_000_000 => 24,
-        _ => 28,
+        0 => 18,
+        l if l >= 60_000_000 => 18,
+        l if l >= 20_000_000 => 22,
+        _ => 26,
     }
 }
 
@@ -385,9 +388,11 @@ impl Nvenc {
         self.encode_last(pts_us, true, on_packet)
     }
 
-    /// The still picture as one keyframe at a fixed high quality (constant
-    /// QP), then rate control as it was: neither change resets the encoder
-    /// or forces another keyframe (FFmpeg did both: m5-test23's blur cycle).
+    /// The still picture once more at a fixed high quality (constant QP),
+    /// then rate control as it was: neither change resets the encoder or
+    /// forces a keyframe (FFmpeg did both: m5-test23's blur cycle). An
+    /// ordinary frame, not a keyframe: it only corrects the picture the
+    /// viewer already has, so it's smaller and quicker to encode and send.
     pub fn encode_last_quality(
         &mut self,
         pts_us: i64,
@@ -406,7 +411,7 @@ impl Nvenc {
         }
         let r = self
             .reconfigure()
-            .and_then(|()| self.encode_last(pts_us, true, on_packet));
+            .and_then(|()| self.encode_last(pts_us, false, on_packet));
         self.config.rcParams = saved;
         let back = self.reconfigure();
         r.and(back)
@@ -729,11 +734,13 @@ pub fn self_test(args: &[String]) -> Res<()> {
         out.extend_from_slice(d);
     });
     step("after a bitrate change (no keyframe)", r, &mut got)?;
+    let t = std::time::Instant::now();
     let r = enc.encode_last_quality(4, still_qp(0), |d, k, _| {
         got.push((d.len(), k));
         out.extend_from_slice(d);
     });
-    step("still picture, quality keyframe", r, &mut got)?;
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    step(&format!("still picture, quality ({ms:.1} ms)"), r, &mut got)?;
     let r = enc.encode_last(5, false, |d, k, _| {
         got.push((d.len(), k));
         out.extend_from_slice(d);

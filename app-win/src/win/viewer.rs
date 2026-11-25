@@ -279,12 +279,25 @@ impl Shared {
     }
 }
 
+#[derive(Default, Clone, Copy)]
+struct ModeCount {
+    decoded: u64,
+    shown: u64,
+    bursts: u64,
+    most_dropped: u64,
+}
+
 #[derive(Default)]
 struct Report {
     frames: u64,
     bytes: u64,
     presented: u64,
     superseded: u64,
+    /// By colour ([4:2:0, 4:4:4]): pictures decoded, shown, and shown after
+    /// dropping two or more decoded ones at once (a burst that arrived
+    /// together: a short animation can vanish that way), the most dropped
+    /// at once (m5-test30: card animations missing in 4:4:4 only).
+    by_mode: [ModeCount; 2],
     decode_errors: u64,
     last_error: Option<String>,
     /// What was shown, in order ("fit to this PC 2560x1440 4:4:4 (NVDEC)").
@@ -635,6 +648,15 @@ fn session_report(sh: &Shared, r: &Report, head: &ReportHead, reason: &str) -> S
         r.superseded,
         r.decode_errors
     );
+    for (name, m) in [("4:2:0", r.by_mode[0]), ("4:4:4", r.by_mode[1])] {
+        if m.decoded > 0 {
+            let _ = writeln!(
+                out,
+                "  in {name}: decoded {}, shown {} | shown after dropping 2+ at once: {} (most at once {})",
+                m.decoded, m.shown, m.bursts, m.most_dropped
+            );
+        }
+    }
     let _ = writeln!(
         out,
         "  packets {} | lost frames {} | skipped {} | late {} | dup {} | bad {} | rejected {} | queue full {} | keyframe requests {}",
@@ -1077,6 +1099,7 @@ fn render_loop(
 
         // Decode everything waiting; show only the newest picture.
         let mut newest: Option<(Pic, u64, u32)> = None;
+        let mut dropped = 0u64;
         let mut timeout = Duration::from_millis(20);
         loop {
             match c.wait_frame(timeout) {
@@ -1102,7 +1125,9 @@ fn render_loop(
                             errors_in_row = 0;
                             if newest.is_some() {
                                 r.superseded += 1;
+                                dropped += 1;
                             }
+                            r.by_mode[(info.chroma == CHROMA_444) as usize].decoded += 1;
                             newest = Some((pic, capture, meta.input_seq));
                         }
                         Ok(None) => {}
@@ -1133,6 +1158,12 @@ fn render_loop(
         }
 
         if let Some((pic, capture, input_seq)) = newest {
+            let m = &mut r.by_mode[(info.chroma == CHROMA_444) as usize];
+            m.shown += 1;
+            if dropped >= 2 {
+                m.bursts += 1;
+                m.most_dropped = m.most_dropped.max(dropped);
+            }
             r.wait.push(pres.wait_ready(100) as u32);
             match &pic {
                 Pic::Hw(p) => pres.draw(p)?,

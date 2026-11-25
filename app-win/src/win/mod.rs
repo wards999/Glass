@@ -343,8 +343,10 @@ impl Drop for FineTimer {
 /// Still-picture refinement: this long after the last change (m5-test25:
 /// 200 ms sent 122 quality keyframes in 3.5 minutes of scrolling, ~430 KB
 /// each across QUIETPC's eero mesh hop; input -> screen went from ~35 to
-/// 49 ms p50; 400 ms in m5-test27 felt slow to sharpen)...
-const REFINE_AFTER_US: u64 = 300_000;
+/// 49 ms p50; 400 ms in m5-test27 felt slow to sharpen; 300 ms in
+/// m5-test29 sharpened in ~0.5 s; 200 ms now the quality frame is a
+/// correction, not a keyframe)...
+const REFINE_AFTER_US: u64 = 200_000;
 /// ...after changes worth it (bytes of real changes since the last one)...
 const REFINE_MIN_CHANGE: usize = 100_000;
 /// ...one high-quality keyframe of the last picture (m5-test22: three
@@ -404,8 +406,15 @@ fn lan_ip() -> Option<std::net::IpAddr> {
 struct HostRun {
     frame_id: u32,
     encode: StatRing, // capture arrival -> encoded packet out
-    send: StatRing,   // packetise + send_to for one frame
-    size: StatRing,   // bytes per frame
+    /// The same, by colour (the current one in `chroma444`), and for the
+    /// still-picture quality frames alone: which of them keeps up with
+    /// motion (m5-test30: card animations missing in 4:4:4 only).
+    encode_444: StatRing,
+    encode_420: StatRing,
+    refine_encode: StatRing,
+    chroma444: bool,
+    send: StatRing, // packetise + send_to for one frame
+    size: StatRing, // bytes per frame
     intervals: IntervalTracker,
     idrs: u32,
     idle_idrs: u32,
@@ -513,6 +522,10 @@ impl HostRun {
             wifi: wlan::WifiWatch::start(),
             frame_id: 0,
             encode: StatRing::new(),
+            encode_444: StatRing::new(),
+            encode_420: StatRing::new(),
+            refine_encode: StatRing::new(),
+            chroma444: false,
             send: StatRing::new(),
             size: StatRing::new(),
             intervals: IntervalTracker::default(),
@@ -579,6 +592,11 @@ impl HostRun {
                     self.big.truncate(5);
                 }
                 self.encode.push(encode_us);
+                if self.chroma444 {
+                    self.encode_444.push(encode_us);
+                } else {
+                    self.encode_420.push(encode_us);
+                }
                 self.send.push(clock::now_us().saturating_sub(out) as u32);
                 self.size.push(data.len() as u32);
                 self.idrs += key as u32;
@@ -1269,6 +1287,7 @@ fn run_session<V: ViewerLink>(
     }
     let mut enc = make(chroma444)?;
     let mut run = HostRun::new();
+    run.chroma444 = chroma444;
     run.encoder = format!(
         "{} {}",
         enc.describe(),
@@ -1456,6 +1475,7 @@ fn run_session<V: ViewerLink>(
                     Ok(e) => {
                         enc = e;
                         chroma444 = want;
+                        run.chroma444 = want;
                         run.encoder = format!(
                             "{}, then {} {}",
                             run.encoder,
@@ -1589,6 +1609,8 @@ fn run_session<V: ViewerLink>(
                     bytes += data.len();
                     run.on_packet(session, now, input_seq, data, key)
                 })?;
+                run.refine_encode
+                    .push(clock::now_us().saturating_sub(now) as u32);
                 run.refine_bytes += bytes as u64;
             }
         }
@@ -1673,7 +1695,7 @@ fn host_report<V: ViewerLink>(
     if let Some(c) = session.counters() {
         let _ = writeln!(
             r,
-            "  frames sent {} ({:.1} fps), IDRs {} (idle re-sends {}), viewer keyframe requests {}, not sent (viewer not ready) {}, skipped {} | still-picture quality keyframes {} ({:.0} KB) | encoders: {}",
+            "  frames sent {} ({:.1} fps), IDRs {} (idle re-sends {}), viewer keyframe requests {}, not sent (viewer not ready) {}, skipped {} | still-picture quality frames {} ({:.0} KB) | encoders: {}",
             c.frames_sent,
             c.frames_sent as f64 / secs,
             run.idrs,
@@ -1759,7 +1781,7 @@ fn host_report<V: ViewerLink>(
     } else {
         let _ = writeln!(
             r,
-            "  frames encoded {} ({:.1} fps), IDRs {} (idle re-sends {}), skipped {} | still-picture quality keyframes {} ({:.0} KB) | encoders: {}",
+            "  frames encoded {} ({:.1} fps), IDRs {} (idle re-sends {}), skipped {} | still-picture quality frames {} ({:.0} KB) | encoders: {}",
             run.frame_id,
             run.frame_id as f64 / secs,
             run.idrs,
@@ -1771,6 +1793,15 @@ fn host_report<V: ViewerLink>(
         );
     }
     let _ = writeln!(r, "{}", fmt_line("encode", &run.encode.summary()));
+    for (name, ring) in [
+        ("  in 4:4:4", &run.encode_444),
+        ("  in 4:2:0", &run.encode_420),
+        ("  quality frames", &run.refine_encode),
+    ] {
+        if ring.summary().total > 0 {
+            let _ = writeln!(r, "{}", fmt_line(name, &ring.summary()));
+        }
+    }
     let _ = writeln!(r, "{}", fmt_line("send (packetise)", &run.send.summary()));
     let _ = writeln!(
         r,

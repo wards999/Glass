@@ -516,12 +516,14 @@ private final class Pipeline {
         self.run = run
         let o = run.runner.options
         let s = run.s
-        source = run.scorecard
-            ? SceneSource(width: display.width, height: display.height, fps: display.fps, queue: captureQ,
-                          inputSeq: { s.inputSeq })
-            : o.testPattern
-            ? TestPatternSource(width: display.width, height: display.height, fps: display.fps, queue: captureQ)
-            : ScreenSource(display: display, queue: captureQ, bgra: chroma444)
+        if run.scorecard {
+            source = SceneSource(width: display.width, height: display.height, fps: display.fps, queue: captureQ,
+                                 inputSeq: { s.inputSeq })
+        } else if o.testPattern {
+            source = TestPatternSource(width: display.width, height: display.height, fps: display.fps, queue: captureQ)
+        } else {
+            source = ScreenSource(display: display, queue: captureQ, bgra: chroma444)
+        }
         encoder = try HEVCEncoder(.init(width: display.width, height: display.height, fps: display.fps,
                                         bitrate: o.mbps * 1_000_000, chroma444: chroma444))
         converter = chroma444 ? Converter(width: display.width, height: display.height) : nil

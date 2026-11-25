@@ -1,4 +1,5 @@
 import AppKit
+import CGlassCore
 import CVirtualDisplay
 import CoreGraphics
 import CoreMedia

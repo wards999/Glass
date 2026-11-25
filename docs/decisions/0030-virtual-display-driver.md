@@ -75,3 +75,16 @@ Now:
 - Measured on QUIETPC22: a size it has, 0.6 s to switch (2560×1440 @
   165 Hz); a new size as administrator, 5.5 s (1470×956 @ 60 Hz); both
   capture methods got frames; the real monitor came back every time.
+
+## Addendum (m5-test39): view modes on a PC host
+The PC host ignored the viewer's view mode: the virtual display was always
+the viewer's size (the Mac's 1470x956), and a game saw that odd shape. Each
+view mode is now the virtual display at its own size, always at the
+viewer's refresh: Fit (the viewer's screen as it looks), More space (all
+its pixels), Larger (a third bigger), and this PC's own screen: its own
+resolution and shape (2560x1440, 16:9), letterboxed on the viewer, for
+games. At the viewer's refresh (60 Hz on the Air) each game frame is one
+Mac refresh. The host now offers view modes (`HOST_CAP_VIEW_MODES`) when the
+virtual display is installed; switching makes the virtual display again at
+the new size within the session (the PC's monitor comes on for a moment),
+keeping the colour.

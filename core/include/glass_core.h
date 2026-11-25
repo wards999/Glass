@@ -598,7 +598,9 @@
 
 /**
  * The barcode (warm-up only): 16 bits of the scene's age in ms, one
- * `BAR_CELL` square each, black = 1, top left.
+ * `BAR_CELL` square each, black = 1, top left; a second row holds the
+ * value inverted, and a reading counts only if the rows agree (m5-test37:
+ * a blurry 4:4:4 warm-up misread).
  */
 #define GLASS_BAR_BITS 16
 

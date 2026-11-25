@@ -857,7 +857,14 @@ pub fn host_with(args: &[String], ui: HostUi) -> Res<()> {
         events: event,
         host_os: glass_core::protocol::HOST_OS_WINDOWS,
         // 4:4:4 switchable mid-session; view modes need a virtual display (M7).
-        host_caps: glass_core::protocol::HOST_CAP_444 | glass_core::protocol::HOST_CAP_SCORECARD,
+        // View modes need the virtual display (each is one at another size).
+        host_caps: glass_core::protocol::HOST_CAP_444
+            | glass_core::protocol::HOST_CAP_SCORECARD
+            | if vdisplay::installed() {
+                glass_core::protocol::HOST_CAP_VIEW_MODES
+            } else {
+                0
+            },
     };
     let mut listener = if a.local {
         HostListener::bind_on(std::net::Ipv4Addr::LOCALHOST, a.port, device.clone(), opts)?
@@ -1075,9 +1082,8 @@ pub(crate) fn media_session<V: ViewerLink>(
     let mut fps = mon.refresh_hz;
     let mut switched = None;
     // The virtual display, if installed (ADR 0030): the only screen while
-    // viewed, at the size the viewer's screen looks like; the PC's own
-    // monitor goes dark meanwhile (the user's choice).
-    let mut virt: Option<vscreen::Session> = None;
+    // viewed, at the size the view mode asks for; the PC's own monitor goes
+    // dark meanwhile (the user's choice).
     let mut virt_note = String::new();
     // The scorecard (ADR 0033): the test scene at the viewer's size and
     // refresh instead of this screen; nothing here changes.
@@ -1104,18 +1110,92 @@ pub(crate) fn media_session<V: ViewerLink>(
             "scorecard: the test scene at {w}x{h} @ {fps} Hz instead of this PC's screen (ADR 0033)"
         );
     }
-    if vdisplay::installed() && !scorecard {
-        let v = session.viewer();
-        match vscreen::viewer_size(v.display_w, v.display_h, v.scale_pct, v.refresh_hz) {
-            None => virt_note = "virtual display: not used (the viewer didn't say its size)".into(),
-            Some((vw, vh, hz)) => match vscreen::Session::start(vw, vh, hz, gpu, a.desktops) {
-                Ok(vs) => {
-                    let found = capture::monitors()?.into_iter().find(|m| m.name == vs.name);
-                    match found.map(|nm| capture_again(gpu, &nm, a.desktops).map(|c| (nm, c))) {
-                        Some(Ok((nm, c))) => {
-                            *cap = c;
+    // View modes (the viewer's Ctrl+Alt+Shift+R or menu): each one is the
+    // virtual display at another size, rebuilt when the viewer switches.
+    let modes = vdisplay::installed() && !scorecard;
+    let mut mode = session.viewer().mode;
+    let mut chroma_pref: Option<bool> = None;
+    let (base_w, base_h, base_fps) = (w, h, fps);
+    let mut report = String::new();
+    let mut blocked_by: Vec<String> = Vec::new();
+    let mut blocked_us = 0u64;
+    loop {
+        (w, h, fps) = (base_w, base_h, base_fps);
+        let mut virt: Option<vscreen::Session> = None;
+        if modes {
+            let v = session.viewer();
+            match vscreen::size_for(mode, &v, (mon.width, mon.height)) {
+                None => {
+                    virt_note = "virtual display: not used (the viewer didn't say its size)".into()
+                }
+                Some((vw, vh, hz)) => match vscreen::Session::start(vw, vh, hz, gpu, a.desktops) {
+                    Ok(vs) => {
+                        let found = capture::monitors()?.into_iter().find(|m| m.name == vs.name);
+                        match found.map(|nm| capture_again(gpu, &nm, a.desktops).map(|c| (nm, c))) {
+                            Some(Ok((nm, c))) => {
+                                *cap = c;
+                                (w, h) = cap.size();
+                                fps = nm.refresh_hz.max(1);
+                                *remap.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(inject::Rect {
+                                        left: nm.left,
+                                        top: nm.top,
+                                        width: nm.width as i32,
+                                        height: nm.height as i32,
+                                    });
+                                say(&format!(
+                                    "Virtual display: {w}x{h} at {fps} Hz for the viewer ({}); this PC's monitor is off while viewed.",
+                                    vscreen::mode_label(mode)
+                                ));
+                                virt_note = format!(
+                                    "virtual display: {w}x{h} @ {fps} Hz, {} (the viewer's {}x{} at {}%), this PC's monitor off while viewed",
+                                    vscreen::mode_label(mode),
+                                    v.display_w,
+                                    v.display_h,
+                                    v.scale_pct
+                                );
+                                virt = Some(vs);
+                            }
+                            other => {
+                                drop(vs);
+                                let why = match other {
+                                    Some(Err(e)) => e.to_string(),
+                                    _ => "its screen wasn't found".into(),
+                                };
+                                virt_note = format!(
+                                    "virtual display: not used ({why}); this PC's own screen instead"
+                                );
+                                *cap = capture_again(gpu, mon, a.desktops)?;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        virt_note =
+                            format!("virtual display: not used ({e}); this PC's own screen instead")
+                    }
+                },
+            }
+        }
+        if a.match_res && virt.is_none() && !scorecard && switched.is_none() {
+            let v = session.viewer();
+            if let Some(cur) = display::current(&mon.name) {
+                let best = display::best(
+                    &display::modes(&mon.name),
+                    v.display_w as u32,
+                    v.display_h as u32,
+                    cur,
+                );
+                if let Some(m) = best {
+                    if display::switch(&mon.name, m) {
+                        switched = Some(cur);
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        let now = capture::monitors()?
+                            .into_iter()
+                            .find(|x| x.name == mon.name);
+                        if let Some(nm) = now {
+                            *cap = capture::Capture::start(gpu, &nm, a.desktops)?;
                             (w, h) = cap.size();
-                            fps = nm.refresh_hz.max(1);
+                            fps = nm.refresh_hz;
                             *remap.lock().unwrap_or_else(|e| e.into_inner()) = Some(inject::Rect {
                                 left: nm.left,
                                 top: nm.top,
@@ -1123,100 +1203,78 @@ pub(crate) fn media_session<V: ViewerLink>(
                                 height: nm.height as i32,
                             });
                             say(&format!(
-                                "Virtual display: {w}x{h} at {fps} Hz for the viewer; this PC's monitor is off while viewed."
+                                "Matched the viewer: this screen is {}x{} for now (was {}x{}).",
+                                w, h, cur.width, cur.height
                             ));
-                            virt_note = format!(
-                                "virtual display: {w}x{h} @ {fps} Hz (the viewer's {}x{} at {}%), this PC's monitor off while viewed",
-                                v.display_w, v.display_h, v.scale_pct
-                            );
-                            virt = Some(vs);
                         }
-                        other => {
-                            drop(vs);
-                            let why = match other {
-                                Some(Err(e)) => e.to_string(),
-                                _ => "its screen wasn't found".into(),
-                            };
-                            virt_note = format!(
-                                "virtual display: not used ({why}); this PC's own screen instead"
-                            );
-                            *cap = capture_again(gpu, mon, a.desktops)?;
-                        }
-                    }
-                }
-                Err(e) => {
-                    virt_note =
-                        format!("virtual display: not used ({e}); this PC's own screen instead")
-                }
-            },
-        }
-    }
-    if a.match_res && virt.is_none() && !scorecard {
-        let v = session.viewer();
-        if let Some(cur) = display::current(&mon.name) {
-            let best = display::best(
-                &display::modes(&mon.name),
-                v.display_w as u32,
-                v.display_h as u32,
-                cur,
-            );
-            if let Some(m) = best {
-                if display::switch(&mon.name, m) {
-                    switched = Some(cur);
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                    let now = capture::monitors()?
-                        .into_iter()
-                        .find(|x| x.name == mon.name);
-                    if let Some(nm) = now {
-                        *cap = capture::Capture::start(gpu, &nm, a.desktops)?;
-                        (w, h) = cap.size();
-                        fps = nm.refresh_hz;
-                        *remap.lock().unwrap_or_else(|e| e.into_inner()) = Some(inject::Rect {
-                            left: nm.left,
-                            top: nm.top,
-                            width: nm.width as i32,
-                            height: nm.height as i32,
-                        });
-                        say(&format!(
-                            "Matched the viewer: this screen is {}x{} for now (was {}x{}).",
-                            w, h, cur.width, cur.height
-                        ));
                     }
                 }
             }
         }
-    }
-    let session_result = run_session(
-        gpu,
-        cap,
-        session,
-        a,
-        (w, h),
-        fps,
-        switched.is_some() || virt.is_some() || scorecard,
-        blocking,
-        stop,
-        end,
-    );
-    if let Some(vs) = virt.take() {
-        // The PC's own screens back (even if the session failed), and
-        // capture on them for whatever comes next.
-        drop(vs);
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        *remap.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        if let Ok(c) = capture_again(gpu, mon, a.desktops) {
-            *cap = c;
+        let session_result = run_session(
+            gpu,
+            cap,
+            session,
+            a,
+            (w, h),
+            fps,
+            View {
+                mode: if virt.is_some() {
+                    mode
+                } else {
+                    glass_core::protocol::MODE_HOST_SCREEN
+                },
+                switchable: modes,
+                chroma444: chroma_pref,
+            },
+            switched.is_some() || virt.is_some() || scorecard,
+            blocking,
+            stop,
+            end,
+        );
+        if let Some(vs) = virt.take() {
+            // The PC's own screens back (even if the session failed), and
+            // capture on them for whatever comes next.
+            drop(vs);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            *remap.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            if let Ok(c) = capture_again(gpu, mon, a.desktops) {
+                *cap = c;
+            }
+            say("This PC's monitor is back.");
         }
-        say("This PC's monitor is back.");
-    }
-    if scorecard {
-        if let Ok(c) = capture_again(gpu, mon, a.desktops) {
-            *cap = c;
+        if scorecard {
+            if let Ok(c) = capture_again(gpu, mon, a.desktops) {
+                *cap = c;
+            }
         }
-    }
-    let (mut report, blocked_by, blocked_us) = session_result?;
-    if !virt_note.is_empty() {
-        let _ = writeln!(report, "  {virt_note}");
+        let (r, by, us, next) = session_result?;
+        report.push_str(&r);
+        if !virt_note.is_empty() {
+            let _ = writeln!(report, "  {virt_note}");
+        }
+        for b in by {
+            if !blocked_by.contains(&b) {
+                blocked_by.push(b);
+            }
+        }
+        blocked_us += us;
+        match next {
+            Some((m, c)) if session.connected() => {
+                say(&format!(
+                    "The viewer switched the view to {}.",
+                    vscreen::mode_label(m)
+                ));
+                let _ = writeln!(
+                    report,
+                    "  view changed to {} (the virtual display made again at its size)\n",
+                    vscreen::mode_label(m)
+                );
+                mode = m;
+                chroma_pref = Some(c);
+            }
+            _ => break,
+        }
     }
     if let Some(orig) = switched {
         display::restore(&mon.name);
@@ -1254,6 +1312,19 @@ pub(crate) fn media_session<V: ViewerLink>(
     Ok(report)
 }
 
+/// The view a run of the session shows: the mode it tells the viewer,
+/// whether the viewer can switch (a virtual display), and the colour to
+/// keep from the run before (`None`: what the viewer asked for).
+struct View {
+    mode: u8,
+    switchable: bool,
+    chroma444: Option<bool>,
+}
+
+/// A run's report, what blocked input (names, µs), and the view and colour
+/// the viewer switched to, if that's why it ended.
+type RunEnd = (String, Vec<String>, u64, Option<(u8, bool)>);
+
 #[allow(clippy::too_many_arguments)]
 fn run_session<V: ViewerLink>(
     gpu: &d3d::Gpu,
@@ -1262,11 +1333,12 @@ fn run_session<V: ViewerLink>(
     a: &Args,
     (w, h): (u32, u32),
     fps: u32,
+    view: View,
     resized: bool,
     blocking: &AtomicU8,
     stop: &std::sync::atomic::AtomicBool,
     end: &std::sync::atomic::AtomicBool,
-) -> Res<(String, Vec<String>, u64)> {
+) -> Res<RunEnd> {
     // Keep the newest frame captured while waiting: a still screen sends
     // nothing new, so it's the viewer's first picture (m3f-test13: nothing
     // showed until something changed on the host). The service's capture
@@ -1306,13 +1378,17 @@ fn run_session<V: ViewerLink>(
         width: w as u16,
         height: h as u16,
         fps: fps as u16,
-        mode: glass_core::protocol::MODE_HOST_SCREEN,
+        mode: view.mode,
     };
     // Colour: what the viewer asked for if it can decode 4:4:4 (M3d);
     // otherwise 4:2:0. `--chroma` only sets what Welcome announced.
     let v = session.viewer();
     let can_444 = v.caps & glass_core::protocol::CAP_HEVC_444 != 0;
-    let mut chroma444 = can_444 && v.caps & glass_core::protocol::CAP_PREFER_420 == 0;
+    let mut chroma444 = can_444
+        && view
+            .chroma444
+            .unwrap_or(v.caps & glass_core::protocol::CAP_PREFER_420 == 0);
+    let mut next_view: Option<(u8, bool)> = None;
     if chroma444 != a.chroma444 || resized || session.announce_stream() {
         session.send_stream_change(info(chroma444))?;
     }
@@ -1497,10 +1573,14 @@ fn run_session<V: ViewerLink>(
             }
         }
         run.send_hz = send_hz;
-        // The viewer switched colour (4:2:0 <-> 4:4:4); view modes need a
-        // virtual display, which a PC host doesn't have yet (M7).
-        if let Some((_mode, allow)) = session.take_mode_request() {
+        // The viewer switched view (a virtual display at another size: the
+        // caller makes it again) or colour (4:2:0 <-> 4:4:4).
+        if let Some((mode, allow)) = session.take_mode_request() {
             let want = allow && can_444;
+            if view.switchable && mode != view.mode {
+                next_view = Some((mode, want));
+                break;
+            }
             if want != chroma444 {
                 match make(want) {
                     Ok(e) => {
@@ -1688,7 +1768,7 @@ fn run_session<V: ViewerLink>(
     if let Some(since) = blocked_since {
         run.blocked_us += clock::now_us() - since;
     }
-    Ok((r, run.blocked_by, run.blocked_us))
+    Ok((r, run.blocked_by, run.blocked_us, next_view))
 }
 
 /// A session's results so far: at the end (`ended`: why), or for the

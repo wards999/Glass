@@ -198,7 +198,14 @@ pub fn run(
         ask: None,
         events: event,
         host_os: glass_core::protocol::HOST_OS_WINDOWS,
-        host_caps: glass_core::protocol::HOST_CAP_444 | glass_core::protocol::HOST_CAP_SCORECARD,
+        // View modes need the virtual display (each is one at another size).
+        host_caps: glass_core::protocol::HOST_CAP_444
+            | glass_core::protocol::HOST_CAP_SCORECARD
+            | if super::vdisplay::installed() {
+                glass_core::protocol::HOST_CAP_VIEW_MODES
+            } else {
+                0
+            },
     };
     let mut listener = if a.local {
         HostListener::bind_on(std::net::Ipv4Addr::LOCALHOST, a.port, device.clone(), opts)?

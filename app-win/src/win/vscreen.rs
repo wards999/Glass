@@ -346,6 +346,50 @@ pub fn viewer_size(w: u16, h: u16, scale_pct: u16, hz: u16) -> Option<(u32, u32,
     Some((even(w as u32).max(640), even(h as u32).max(480), hz))
 }
 
+/// The virtual display for view `mode` (W, H, Hz), always at the viewer's
+/// refresh: Fit is the viewer's screen as it looks (its scaling), More
+/// space all its pixels, Larger a third bigger than Fit; the host's own
+/// screen is this PC's own size and shape (`own`), for games: they keep
+/// their 16:9 and the viewer letterboxes it, and at the viewer's refresh
+/// each game frame is one refresh there (SPEC §0 B).
+pub fn size_for(
+    mode: u8,
+    v: &glass_core::net::ViewerHello,
+    own: (u32, u32),
+) -> Option<(u32, u32, u32)> {
+    use glass_core::protocol::{MODE_FIT, MODE_FIT_LARGER, MODE_FIT_MORE_SPACE};
+    let scale = v.scale_pct.max(100);
+    match mode {
+        MODE_FIT => viewer_size(v.display_w, v.display_h, v.scale_pct, v.refresh_hz),
+        MODE_FIT_MORE_SPACE => viewer_size(v.display_w, v.display_h, 100, v.refresh_hz),
+        MODE_FIT_LARGER => viewer_size(
+            v.display_w,
+            v.display_h,
+            (scale as u32 * 4 / 3).min(u16::MAX as u32) as u16,
+            v.refresh_hz,
+        ),
+        _ => {
+            let hz = if v.refresh_hz == 0 {
+                60
+            } else {
+                (v.refresh_hz as u32).clamp(30, 240)
+            };
+            Some((own.0 & !1, own.1 & !1, hz))
+        }
+    }
+}
+
+/// The view mode's name for messages and the results.
+pub fn mode_label(mode: u8) -> &'static str {
+    use glass_core::protocol::{MODE_FIT, MODE_FIT_LARGER, MODE_FIT_MORE_SPACE};
+    match mode {
+        MODE_FIT => "Fit",
+        MODE_FIT_MORE_SPACE => "More space",
+        MODE_FIT_LARGER => "Larger",
+        _ => "this PC's own screen (for games)",
+    }
+}
+
 /// `glass-cli vdisplay try [W H HZ] [--seconds S] [--dda]` (`--dda`: as the
 /// service, which needs the virtual display on its own GPU): a session's switch
 /// without a viewer, to see what Windows says: the virtual display on as

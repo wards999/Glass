@@ -376,10 +376,12 @@ pub fn self_test(args: &[String]) -> Res<()> {
     let mut dec = CudaDecoder::new(&gpu.device)?;
     let mut shown = 0;
     for (k, w) in aus.windows(2).enumerate() {
+        let t = std::time::Instant::now();
         let got = dec.decode(&data[w[0]..w[1]])?.is_some();
+        let ms = t.elapsed().as_secs_f64() * 1e3;
         shown += got as usize;
         println!(
-            "access unit {k}: {:>8} bytes -> {}",
+            "access unit {k}: {:>8} bytes -> {} ({ms:.2} ms)",
             w[1] - w[0],
             if got { "picture out" } else { "nothing yet" }
         );

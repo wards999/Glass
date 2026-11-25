@@ -1097,11 +1097,20 @@ fn render_loop(
             }
         }
 
-        // Decode everything waiting; show only the newest picture.
+        // Decode what's waiting; show the newest picture, but at least once
+        // a refresh: 4:4:4 decodes wait for the GPU, and with frames coming
+        // as fast as one decodes the queue never emptied, so up to 57 went
+        // by unshown and card animations vanished (m5-test32: 209 such
+        // bursts in 4:4:4, 12 in 4:2:0). The rest wait in the queue.
         let mut newest: Option<(Pic, u64, u32)> = None;
         let mut dropped = 0u64;
         let mut timeout = Duration::from_millis(20);
+        let drain_start = clock::now_us();
+        let refresh_us = 1_000_000 / info.fps.max(30) as u64;
         loop {
+            if newest.is_some() && clock::now_us().saturating_sub(drain_start) >= refresh_us {
+                break;
+            }
             match c.wait_frame(timeout) {
                 Wait::Frame(meta, data) => {
                     let t0 = clock::now_us();

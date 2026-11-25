@@ -2196,6 +2196,12 @@ void glass_clip_free(GLASS_ClipHandle *h);
 uint16_t glass_keymap_hid_to_mac(uint8_t hid, bool iso);
 
 /**
+ * The QP of a still picture's quality frame for a link of `limit_bps`
+ * (0: no limit); see `ratecontrol::still_qp`.
+ */
+uint32_t glass_still_qp(int64_t limit_bps);
+
+/**
  * Builds an Annex-B access unit from VideoToolbox output: the `prefix_count`
  * (at most 4) raw NALs in `prefix` (VPS/SPS/PPS on keyframes), then the
  * 4-byte length-prefixed NALs in `sample`. Returns bytes written, or -1 if

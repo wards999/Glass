@@ -134,7 +134,9 @@ public final class HostRunner {
 /// Stats that live across view-mode changes within one session.
 private final class Totals {
     let encode = Stats(), delivery = Stats(), vtEncode = Stats(), send = Stats(), interval = Stats()
-    var frames = 0, idrs = 0, notSent = 0, idleIDRs = 0, bytes = 0, refines = 0
+    var frames = 0, idrs = 0, notSent = 0, idleIDRs = 0, bytes = 0, refines = 0, refineBytes = 0
+    /// Whether the encoder took the quality frames' QP cap.
+    var qpCapTaken: Bool?
     /// Captured frames dropped because a newer one arrived while encoding.
     var stale = 0
     var frameId: UInt32 = 0
@@ -411,8 +413,9 @@ private final class HostSessionRun {
             : "Session with \u{201C}\(s.peerName)\u{201D} (\(s.peerAddress)) ended after \(String(format: "%.1f", secs)) s (\(reason))")
         out.append("  streamed: " + history.joined(separator: " -> "))
         if no444 { out.append("  NOTE: the encoder produced 4:2:0 when asked for 4:4:4, so this session switched to 4:2:0.") }
-        out.append(String(format: "  frames sent %ld (%.1f fps), IDRs %ld (idle re-sends %ld), viewer keyframe requests %ld, not sent (viewer not ready) %ld | still-picture refinement passes %ld",
-                          t.frames, Double(t.frames) / secs, t.idrs, t.idleIDRs, Int(counters.keyframe_requests), t.notSent, t.refines))
+        out.append(String(format: "  frames sent %ld (%.1f fps), IDRs %ld (idle re-sends %ld), viewer keyframe requests %ld, not sent (viewer not ready) %ld | still-picture quality frames %ld (%.0f KB, QP cap %@)",
+                          t.frames, Double(t.frames) / secs, t.idrs, t.idleIDRs, Int(counters.keyframe_requests), t.notSent, t.refines,
+                          Double(t.refineBytes) / 1024, t.qpCapTaken.map { $0 ? "taken" : "not taken: bitrate raised only" } ?? "not tried")
         out.append(String(format: "  bitrate %.1f Mbps avg | %ld packets", Double(t.bytes) * 8 / secs / 1e6, Int(counters.packets_sent)))
         out.append(String(format: "  FEC (M4): %llu parity packets (%.1f%% of packets) | the viewer's latest reported loss %.2f%% | NACKs answered %llu (%llu packets resent)",
                           counters.parity_packets,
@@ -519,7 +522,7 @@ private final class Pipeline {
             if lastCapture > 0, captureUs > lastCapture { t.interval.push(UInt32(clamping: captureUs - lastCapture)) }
             lastCapture = captureUs
             lastFrame = pb
-            refinesLeft = 3
+            refinesLeft = 1
             if pending != nil { t.stale += 1 }
             pending = (pb, captureUs)
             let kick = !busy
@@ -542,18 +545,21 @@ private final class Pipeline {
                 self.lock.withLock { self.lastCapture = now }
                 self.encodeAndSend(pb, now, force: true)
             } else {
-                // Still for 150 ms: the same picture again, up to 3 times,
-                // 60 ms apart, so detail a squeezed bitrate left out arrives.
+                // Still for 200 ms: the picture once more at high quality, at
+                // most every 0.5 s (as the PC host, ADR 0032; three passes at
+                // the normal budget never sharpened photos there).
                 let now = GlassClock.nowUs()
                 let go: Bool = self.lock.withLock {
-                    guard self.refinesLeft > 0, now &- last >= 150_000, now &- self.lastRefine >= 60_000 else { return false }
+                    guard self.refinesLeft > 0, now &- last >= 200_000, now &- self.lastRefine >= 500_000 else { return false }
                     self.refinesLeft -= 1
                     return true
                 }
                 if go {
                     self.lastRefine = now
                     t.refines += 1
-                    self.encodeAndSend(pb, now, force: false)
+                    let ours = self.run.runner.options.mbps * 1_000_000
+                    let limit = t.rateNow > 0 && t.rateNow < ours ? t.rateNow : 0
+                    self.encodeAndSend(pb, now, force: false, qualityQP: Int(glass_still_qp(Int64(limit))))
                 }
             }
         }
@@ -599,7 +605,8 @@ private final class Pipeline {
         }
     }
 
-    private func encodeAndSend(_ pb: CVPixelBuffer, _ captureUs: UInt64, force: Bool) {
+    /// `qualityQP`: a still picture's quality frame (see `encodeQuality`).
+    private func encodeAndSend(_ pb: CVPixelBuffer, _ captureUs: UInt64, force: Bool, qualityQP: Int? = nil) {
         let t = run.totals
         let s = run.s
         let arrival = GlassClock.nowUs()
@@ -626,7 +633,7 @@ private final class Pipeline {
         count += 1
         let measure = probe != nil && (key || count % 10 == 0)
         do {
-            try encoder.encode(frame, ptsUs: captureUs, keyframe: key) { data, isKey, _ in
+            func output(_ data: UnsafeRawBufferPointer, _ isKey: Bool, _: UInt64) {
                 let now = GlassClock.nowUs()
                 t.frameId &+= 1
                 let f = GLASS_OutFrame(frame_id: t.frameId, flags: isKey ? 1 : 0, capture_ts_us: captureUs,
@@ -640,6 +647,7 @@ private final class Pipeline {
                     t.frames += 1
                     t.bytes += data.count
                     if isKey { t.idrs += 1 }
+                    if qualityQP != nil { t.refineBytes += data.count }
                 } else if r == 0 {
                     t.notSent += 1
                 } else {
@@ -658,6 +666,12 @@ private final class Pipeline {
                         }
                     }
                 }
+            }
+            if let qp = qualityQP, !key {
+                try encoder.encodeQuality(frame, ptsUs: captureUs, maxQP: qp, output: output)
+                t.qpCapTaken = encoder.qpCapTaken
+            } else {
+                try encoder.encode(frame, ptsUs: captureUs, keyframe: key, output: output)
             }
             if t.producedChroma == nil { t.producedChroma = encoder.producedChroma }
         } catch {

@@ -38,6 +38,23 @@ pub const MIN_BPS: f64 = 8e6;
 /// At or above this it's no limit (bits/s).
 pub const MAX_BPS: f64 = 200e6;
 
+/// The QP of a still picture's quality frame (a correction of the picture
+/// the viewer has, encoded once the screen stops changing) for a link of
+/// `limit_bps` (0: no limit): near photo quality where there's room,
+/// coarser on a squeezed link so the one frame doesn't take long to arrive.
+/// QUIETPC22, a grainy 2560x1440 test picture, PSNR against the original:
+/// 4:4:4 keyframe at QP 20 2241 KB / 36.9 dB, correction at QP 18
+/// 1920 KB / 37.2 dB; 4:2:0 1450 KB / 40.2 dB and 1098 KB / 40.4 dB.
+/// Both hosts use it (the Mac's encoder as a QP cap).
+pub fn still_qp(limit_bps: i64) -> u32 {
+    match limit_bps {
+        0 => 18,
+        l if l >= 60_000_000 => 18,
+        l if l >= 20_000_000 => 22,
+        _ => 26,
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct VideoRateControl {
     /// The limit (bits/s), or `None`: no limit.
@@ -164,6 +181,14 @@ impl VideoRateControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn still_qp_coarser_on_a_squeezed_link() {
+        assert_eq!(still_qp(0), 18);
+        assert_eq!(still_qp(80_000_000), 18);
+        assert_eq!(still_qp(40_000_000), 22);
+        assert_eq!(still_qp(10_000_000), 26);
+    }
 
     /// Runs `ticks` ticks; `delay(i)` and `rate(i, limit)` give each tick's
     /// first-packet time and what arrived under the current limit.

@@ -1719,6 +1719,13 @@ pub extern "C" fn glass_keymap_hid_to_mac(hid: u8, iso: bool) -> u16 {
     keymap::hid_to_mac(hid, iso).unwrap_or(0xFFFF)
 }
 
+/// The QP of a still picture's quality frame for a link of `limit_bps`
+/// (0: no limit); see `ratecontrol::still_qp`.
+#[no_mangle]
+pub extern "C" fn glass_still_qp(limit_bps: i64) -> u32 {
+    crate::ratecontrol::still_qp(limit_bps)
+}
+
 /// Builds an Annex-B access unit from VideoToolbox output: the `prefix_count`
 /// (at most 4) raw NALs in `prefix` (VPS/SPS/PPS on keyframes), then the
 /// 4-byte length-prefixed NALs in `sample`. Returns bytes written, or -1 if

@@ -85,22 +85,7 @@ const PROFILE_FREXT: nv::GUID = guid(
     [0x9c, 0xbd, 0xb6, 0x16, 0xbd, 0x62, 0x13, 0x41],
 );
 
-/// The QP of a still picture's quality frame for a link of `limit_bps` (0:
-/// no limit): near photo quality where there's room, coarser on a squeezed
-/// link so the one frame doesn't take long to arrive. A correction of the
-/// picture the viewer has, not a keyframe (QUIETPC22, a grainy 2560x1440
-/// test picture, PSNR against the original: 4:4:4 keyframe at QP 20
-/// 2241 KB / 36.9 dB, correction at QP 18 1920 KB / 37.2 dB; 4:2:0
-/// 1450 KB / 40.2 dB and 1098 KB / 40.4 dB): two steps finer than the
-/// keyframe was, as sharp, 15-25 % smaller.
-pub fn still_qp(limit_bps: i64) -> u32 {
-    match limit_bps {
-        0 => 18,
-        l if l >= 60_000_000 => 18,
-        l if l >= 20_000_000 => 22,
-        _ => 26,
-    }
-}
+pub use glass_core::ratecontrol::still_qp;
 
 type CreateInstance = unsafe extern "C" fn(*mut nv::NV_ENCODE_API_FUNCTION_LIST) -> nv::NVENCSTATUS;
 type MaxVersion = unsafe extern "C" fn(*mut u32) -> nv::NVENCSTATUS;

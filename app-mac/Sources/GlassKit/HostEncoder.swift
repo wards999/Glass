@@ -38,13 +38,45 @@ public final class HEVCEncoder {
     public private(set) var producedChroma: Int?
     private var session: VTCompressionSession?
 
+    /// The bitrate rate control aims at now.
+    public private(set) var bitrate: Int
+    /// Whether the encoder took the quality frame's QP cap (nil: not tried).
+    public private(set) var qpCapTaken: Bool?
+
     /// Changes the bitrate from the next frame (M5 rate control): the
     /// average, and the 1.5x-per-second cap with it. No keyframe needed.
     public func setBitrate(_ bps: Int) {
+        bitrate = bps
+        applyRates(bps)
+    }
+
+    private func applyRates(_ bps: Int) {
         guard let session else { return }
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: bps))
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
                              value: [NSNumber(value: bps * 3 / 16), NSNumber(value: 1)] as CFArray)
+    }
+
+    /// The still picture once more at high quality: an ordinary frame that
+    /// corrects the picture the viewer has, not a keyframe. VideoToolbox has
+    /// no per-frame constant QP in a rate-controlled session, so for this
+    /// one frame the bitrate goes up eightfold (at least 400 Mbps) and, where
+    /// the encoder takes it, QP is capped at `maxQP`; then both go back.
+    /// The PC host does the same with NVENC's constant QP (ADR 0032).
+    public func encodeQuality(_ pb: CVPixelBuffer, ptsUs: UInt64, maxQP: Int, output: Output) throws {
+        guard let session else { return }
+        let normal = bitrate
+        applyRates(max(normal * 8, 400_000_000))
+        let st = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxAllowedFrameQP,
+                                      value: NSNumber(value: maxQP))
+        qpCapTaken = st == noErr
+        defer {
+            applyRates(normal)
+            if st == noErr {
+                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxAllowedFrameQP, value: NSNumber(value: 51))
+            }
+        }
+        try encode(pb, ptsUs: ptsUs, keyframe: false, output: output)
     }
     private var out: UnsafeMutableRawPointer
     private var outCap: Int
@@ -53,6 +85,7 @@ public final class HEVCEncoder {
 
     public init(_ config: Config) throws {
         self.config = config
+        bitrate = config.bitrate
         outCap = 4 << 20
         out = .allocate(byteCount: outCap, alignment: 16)
         sampleCap = 4 << 20

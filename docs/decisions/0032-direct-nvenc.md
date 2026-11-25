@@ -93,3 +93,15 @@ Also: the host's results split encode times into 4:4:4, 4:2:0 and quality
 frames, and the viewer's say, per colour, how many pictures were decoded and
 shown and how often two or more were dropped at once: m5-test30's card
 animations went missing in 4:4:4 only, with the network and queue clean.
+
+## Addendum (m5-test34): the Mac host's quality frame
+The Mac host still sent three passes at the normal budget 150 ms after a
+change, which never sharpened photos on the PC host. It now sends one
+quality frame, as the PC does: 200 ms after the last change, at most every
+0.5 s, an ordinary frame (not a keyframe). VideoToolbox has no per-frame
+constant QP in a rate-controlled session, so for that frame the bitrate goes
+up eightfold (at least 400 Mbps) and QP is capped with
+`kVTCompressionPropertyKey_MaxAllowedFrameQP` where the encoder takes it
+(the results say whether it did); both go back after. The QP for either
+host comes from `ratecontrol::still_qp` in core (`glass_still_qp`).
+Not yet measured on the Mac.
